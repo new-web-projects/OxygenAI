@@ -11,6 +11,7 @@ function noSetup(
   source: TradeAnalysis["source"],
   providerId: string,
   modelId: string,
+  persisted: boolean,
   reason?: string
 ): TradeAnalysis {
   return {
@@ -28,6 +29,7 @@ function noSetup(
     model: modelId,
     indicatorsUsed: indicators,
     generatedAt: new Date().toISOString(),
+    persisted,
   };
 }
 
@@ -43,12 +45,13 @@ export function buildTradeAnalysis(
   reasoning: ProviderReasoning,
   source: TradeAnalysis["source"],
   providerId: string,
-  modelId: string
+  modelId: string,
+  persisted: boolean
 ): TradeAnalysis {
   const { direction, confidence } = reasoning;
 
   if (!direction || indicators.atr14 === null) {
-    return noSetup(indicators, reasoning, source, providerId, modelId);
+    return noSetup(indicators, reasoning, source, providerId, modelId, persisted);
   }
 
   const entry = indicators.lastClose;
@@ -65,6 +68,7 @@ export function buildTradeAnalysis(
       source,
       providerId,
       modelId,
+      persisted,
       "Internal consistency check failed on the computed setup — suppressed rather than returned."
     );
   }
@@ -88,5 +92,6 @@ export function buildTradeAnalysis(
     model: modelId,
     indicatorsUsed: indicators,
     generatedAt: new Date().toISOString(),
+    persisted,
   };
 }
