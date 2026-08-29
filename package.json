@@ -6,7 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "test": "tsx --test lib/indicators.test.ts",
+    "test": "tsx --test lib/indicators.test.ts lib/providers/index.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
