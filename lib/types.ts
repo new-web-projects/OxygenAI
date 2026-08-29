@@ -39,5 +39,8 @@ export const TradeAnalysisSchema = z.object({
   model: z.string(),
   indicatorsUsed: IndicatorBundleSchema,
   generatedAt: z.string(),
+  // Whether this request actually read/wrote the database (DATABASE_URL
+  // configured and reachable) or ran on ephemeral synthetic data.
+  persisted: z.boolean(),
 });
 export type TradeAnalysis = z.infer<typeof TradeAnalysisSchema>;
