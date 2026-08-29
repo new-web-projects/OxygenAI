@@ -30,11 +30,19 @@ naming outside of comments explaining this exact distinction.
   (any OpenAI-compatible endpoint — your choice of model, per blueprint
   §4.1), `gemmaProvider.ts` (Gemma 4 via `@google/genai`), and
   `grokProvider.ts` (Grok via a plain `fetch` to xAI).
-- `infra/migrations/0001_init.sql` — the full database schema (38 tables),
-  applied and verified against a real PostgreSQL 16 + pgvector instance.
-  See `infra/migrations/README.md`.
+- `infra/migrations/` — the full database schema (38 tables, plus a
+  0002 fix — see below), applied and verified against a real PostgreSQL 16
+  + pgvector instance. See `infra/migrations/README.md`.
+- `lib/db/` — the route is now actually wired to that schema. When
+  `DATABASE_URL` is set: instruments and OHLCV bars are read from and
+  written to Postgres (persisted once per symbol, not regenerated every
+  request), found signals are saved to `trading_signals`, and providers/
+  models are upserted into `ai_providers`/`ai_models` on demand. Falls
+  back to the old ephemeral synthetic-data path — cleanly, not a crash —
+  if `DATABASE_URL` is unset, or set but unreachable.
 - One route (`POST /api/analyze`) and one page running the whole pipeline
-  end to end, with correct fallback-to-mock for all three real providers.
+  end to end, with correct fallback-to-mock for all three real providers
+  and correct fallback-to-ephemeral for the database.
 
 ## Status against the blueprint
 
@@ -51,7 +59,7 @@ now:
 | §6 Deterministic trading engine | **Partial.** SMA/RSI/ATR only, of MACD/Stochastic/ADX/Bollinger/VWAP. No regime-awareness classifier, no market-structure/S-R detection. |
 | §7 RAG & knowledge system | **Not built.** |
 | §8 Memory architecture | **Not built** at the app level (schema exists; nothing reads/writes it yet). |
-| §9 Database | **Schema real and verified.** App not wired to it — still synthetic in-memory data. |
+| §9 Database | **Schema real and verified, and now wired to the app.** `market_instruments`/`market_data`/`trading_signals`/`ai_providers`/`ai_models` are read/written for real when `DATABASE_URL` is set — verified against a live instance, not asserted (see below). Underlying bar data is still synthetic; `technical_indicators`, `memories`, RAG tables, and the rest of the 38 remain unused by the app. |
 | §10 API architecture | **1 of ~7 endpoints** (`/api/analyze`, roughly `/api/ai/analyze`). |
 | Passage 2 (admin panel, charting, voice, security, error center, backtesting, compliance) | **Not built** — this is nearly all of Passage 2. |
 | Passage 3 (infra, CI, broader testing) | **Not built.** |
@@ -91,6 +99,25 @@ $ npx next start, then POST /api/analyze for each provider:
     custom → 200, correctly fell back to source: mock (no CUSTOM_AI_* set)
     grok   → 200, correctly fell back to source: mock (no XAI_API_KEY set)
     gemma  → 200, correctly fell back to source: mock (no GOOGLE_AI_API_KEY set)
+
+Database wiring, verified against a real PostgreSQL 16 + pgvector instance
+(not just written — checked with direct SQL, not inferred from the API
+response):
+    2x POST /api/analyze {symbol: HDFCBANK} with DATABASE_URL set
+      → both 200, persisted: true, identical entry price both times
+      → market_data row count for HDFCBANK: 60 (not 120 — the 2nd call
+        read existing bars, it did not regenerate and re-insert)
+      → market_instruments: 1 row · ai_providers: 1 row · ai_models: 1 row
+        (the 0002 unique-constraint fix confirmed working — no duplicates
+        despite two separate seed-model calls)
+      → trading_signals: 2 rows (one per SETUP_FOUND call, as intended —
+        each analysis is its own signal event, not deduplicated)
+    POST /api/analyze with DATABASE_URL unset
+      → 200, persisted: false, unchanged old behavior — confirms the
+        no-DB path still works exactly as before this change
+    POST /api/analyze with DATABASE_URL pointed at a closed port
+      → 200, persisted: false — server log shows the caught
+        ECONNREFUSED and the fall-through, not a 500
   POST /api/analyze {}                                     → 400 (validation works)
 $ grep -rln "gemini" **/*.ts **/*.tsx                       → only explanatory comments/test names
 $ database: see infra/migrations/README.md for the full log
@@ -103,7 +130,8 @@ anything in the code.
 ## If you want to keep going
 
 Roughly in priority order: (1) get one real provider live-tested with a
-real key, (2) wire the API route to the database instead of synthetic
-data, (3) build the multi-provider comparison UI once two providers are
+real key, (2) swap the synthetic bar generator for a real market-data
+vendor now that persistence exists to actually store what it returns,
+(3) build the multi-provider comparison UI once two providers are
 confirmed live, (4) fill out the indicator list, (5) everything else in
 the status table above.
