@@ -129,6 +129,7 @@ function ResultCard({ result }: { result: TradeAnalysis }) {
         <span>provider: {result.provider}</span>
         <span>model: {result.model}</span>
         <span>rr: {result.riskReward ?? "n/a"}</span>
+        <span>persisted: {result.persisted ? "yes" : "no"}</span>
       </div>
     </div>
   );
