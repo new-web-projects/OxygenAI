@@ -59,7 +59,9 @@ export default function Home() {
             className="rounded-md border border-[#232830] bg-[#12151B] px-2 py-2 text-sm outline-none focus:border-[#4FD1C5]"
           >
             <option value="mock">Mock (offline)</option>
-            <option value="gemini">Gemma 4</option>
+            <option value="custom">Custom AI</option>
+            <option value="gemma">Gemma 4</option>
+            <option value="grok">Grok</option>
           </select>
           <button
             type="submit"
