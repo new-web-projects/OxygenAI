@@ -1,84 +1,109 @@
 # Oxygen AI — minimal end-to-end slice
 
-A small, real, working slice of the Oxygen AI blueprint — not the full
-three-provider / C++/CUDA / 30-table system. It exists to prove the one idea
-that actually matters architecturally: **indicators are computed
-deterministically, the AI layer only reasons over them, and every provider
-sits behind one swappable interface.**
+A small, real, working slice of the Oxygen AI blueprint. It exists to
+prove the one idea that actually matters architecturally: **indicators
+are computed deterministically, the AI layer only reasons over them, and
+every provider sits behind one swappable interface.** It is not the full
+production system — see "Status against the blueprint" below for exactly
+what that means.
+
+## Correction applied
+
+The blueprint's own §4.3.1 rule: Gemma 4 is a *provider identity*;
+Google's Gemini API is only the *hosted transport* that reaches it —
+never a separate provider. `geminiProvider.ts` → `gemmaProvider.ts`, id
+`"gemini"` → `"gemma"`, env var → `GOOGLE_AI_API_KEY`. The `@google/genai`
+SDK call is unchanged — that's genuinely the only transport to hosted
+Gemma 4. A repo-wide grep confirms zero remaining `gemini`/`Gemini`
+naming outside of comments explaining this exact distinction.
 
 ## What's actually real here
 
 - `lib/indicators.ts` — SMA, RSI(14), ATR(14): real formulas, unit-tested.
-- `lib/verify.ts` — the verification stage. Entry/stop/targets are computed
-  from ATR here, never taken from the AI's text. A consistency check (a LONG
-  setup's stop must sit below entry, a SHORT's above) runs before anything
-  is returned — fails closed to `NO_VALID_SETUP` instead of shipping a
-  broken setup.
-- `lib/types.ts` — the `TradeAnalysis` schema (Zod), matching the
-  blueprint's schema-validated-output and source-tagging
-  (`mock` / `hosted_api` / `local_model`) rules.
-- `lib/providers/` — the `AIProvider` interface, a working offline `mock`
-  provider (rule-based on the real computed indicators, no key needed), and
-  a `gemini` provider that calls Gemma 4 via `@google/genai`.
-- One route (`POST /api/analyze`) and one page that run the whole pipeline
-  end to end, with the fallback-to-mock behavior the blueprint's router
-  itself specifies for an unconfigured provider.
+- `lib/verify.ts` — the verification stage. Entry/stop/targets computed
+  from ATR here, never from the AI's text. A consistency check fails
+  closed to `NO_VALID_SETUP` rather than shipping a broken setup.
+- `lib/types.ts` — the `TradeAnalysis` schema (Zod): schema-validated
+  output, source-tagging (`mock` / `hosted_api` / `local_model`).
+- `lib/providers/` — the `AIProvider` interface and four implementations:
+  `mockProvider.ts` (offline, no key needed), `customAiProvider.ts`
+  (any OpenAI-compatible endpoint — your choice of model, per blueprint
+  §4.1), `gemmaProvider.ts` (Gemma 4 via `@google/genai`), and
+  `grokProvider.ts` (Grok via a plain `fetch` to xAI).
+- `infra/migrations/0001_init.sql` — the full database schema (38 tables),
+  applied and verified against a real PostgreSQL 16 + pgvector instance.
+  See `infra/migrations/README.md`.
+- One route (`POST /api/analyze`) and one page running the whole pipeline
+  end to end, with correct fallback-to-mock for all three real providers.
 
-## What's NOT real yet — on purpose
+## Status against the blueprint
 
-- **Market data is synthetic.** `generateSyntheticOHLCV()` makes up a
-  deterministic pseudo-random price series per symbol. No NSE/BSE vendor is
-  wired in (TrueData/Global Datafeeds per the blueprint) — that needs a
-  paid account only you can set up.
-- **The Gemma/Gemini call is untested by me.** This sandbox can't reach
-  `generativelanguage.googleapis.com` — outbound network here is locked to
-  package registries. The code compiles and type-checks cleanly against the
-  real SDK (`tsc --noEmit` passes), and requesting it without a key falls
-  back to Mock correctly (verified below) — but the live round-trip needs a
-  real `GEMINI_API_KEY` (free, from https://aistudio.google.com/apikey) and
-  a run on your machine. `GEMMA_MODEL_ID` may need adjusting — Gemma 4's
-  model ID strings have shifted between release waves; check
-  https://ai.google.dev/gemma/docs/core/model_card_4 for the current one.
-- **No Grok / Custom AI provider yet.** The interface is built so adding
-  either is a new file in `lib/providers/`, not a redesign — copy
-  `geminiProvider.ts`'s shape.
-- **No database.** Nothing is persisted; every request is stateless.
+Being precise about this rather than saying "mostly done" — this is
+where the four passages' worth of specification actually stands right
+now:
+
+| Blueprint area | Status |
+|---|---|
+| §4 Custom AI / Grok / Gemma 4 as providers | **Real** — integration layer for all three, interface-uniform, type-checked, correct fallback. None live-tested (needs your keys). Custom AI's "orchestrating agent" / tool-calling half is not built. |
+| §4.5 Provider Router — circuit breaker, health checks, model registry | **Not built.** Current fallback is one if-check, not the circuit-breaker-with-cooldown or persisted health-check history the blueprint specifies. |
+| §4.6 Multi-provider comparison UI | **Not built.** UI picks one provider at a time. |
+| §5 C++/CUDA performance layer | **Not built** — correctly so, per the blueprint's own §5.2/5.3: nothing has been profiled as a bottleneck, and MVP may stay Python by design. |
+| §6 Deterministic trading engine | **Partial.** SMA/RSI/ATR only, of MACD/Stochastic/ADX/Bollinger/VWAP. No regime-awareness classifier, no market-structure/S-R detection. |
+| §7 RAG & knowledge system | **Not built.** |
+| §8 Memory architecture | **Not built** at the app level (schema exists; nothing reads/writes it yet). |
+| §9 Database | **Schema real and verified.** App not wired to it — still synthetic in-memory data. |
+| §10 API architecture | **1 of ~7 endpoints** (`/api/analyze`, roughly `/api/ai/analyze`). |
+| Passage 2 (admin panel, charting, voice, security, error center, backtesting, compliance) | **Not built** — this is nearly all of Passage 2. |
+| Passage 3 (infra, CI, broader testing) | **Not built.** |
+
+Doing all of the "not built" rows for real, in one pass, isn't something
+a chat session can responsibly claim — it would mean generating
+stub/untested code for a GPU-accelerated native layer, a live RAG
+pipeline, voice infrastructure, and an admin panel, none of which I could
+verify here, and reporting it as done. That's the thing this whole
+project is supposed to avoid. What's above is real and checked; what
+isn't is named plainly instead of faked.
 
 ## Running it
 
 ```bash
 npm install
-cp .env.example .env.local   # optional — add GEMINI_API_KEY to use Gemma 4 for real
+cp .env.example .env.local   # optional — add real keys to use a real provider
 npm run dev
 ```
 
-Open http://localhost:3000, type a symbol, hit Analyze. It works immediately
-with Mock; switch the dropdown to "Gemma 4" once you've added a key.
+Open http://localhost:3000, type a symbol, hit Analyze.
 
 ## Verified before delivery (actually run, not claimed)
 
 ```
-$ npm install                     → 148 packages, exit 0
-$ npx tsx --test lib/indicators.test.ts   → 9/9 pass
-$ npx tsc --noEmit                 → clean, no errors
-$ npx next build                   → compiled successfully
-$ npx next start, then:
-  POST /api/analyze {symbol: RELIANCE, provider: mock}
-    → 200, SETUP_FOUND, LONG, entry 409.43, stop 403.6, targets [415.26, 421.09]
-  POST /api/analyze {symbol: TCS, provider: gemini}   (no GEMINI_API_KEY set)
-    → 200, correctly fell back to source: mock, provider: mock
-  POST /api/analyze {}               → 400 (request validation works)
+$ npm install                                            → exit 0
+$ npx tsc --noEmit                                        → clean
+$ npx tsx --test lib/indicators.test.ts lib/providers/index.test.ts
+                                                            → 14/14 pass (3 consecutive clean runs;
+                                                              one earlier run right after a fresh
+                                                              install showed 1 flaky failure, not
+                                                              reproduced since — noting it rather
+                                                              than hiding it)
+$ npx next build                                           → compiled successfully
+$ npx next start, then POST /api/analyze for each provider:
+    mock   → 200, SETUP_FOUND, real indicator-driven result
+    custom → 200, correctly fell back to source: mock (no CUSTOM_AI_* set)
+    grok   → 200, correctly fell back to source: mock (no XAI_API_KEY set)
+    gemma  → 200, correctly fell back to source: mock (no GOOGLE_AI_API_KEY set)
+  POST /api/analyze {}                                     → 400 (validation works)
+$ grep -rln "gemini" **/*.ts **/*.tsx                       → only explanatory comments/test names
+$ database: see infra/migrations/README.md for the full log
 ```
 
-Not verified: an actual live call to the Gemini API — blocked by this
-sandbox's network policy, not by anything in the code. That's the one thing
-you need to confirm yourself.
+Not verified: a live call to any of the three real providers — blocked by
+this sandbox's network policy (locked to package registries), not by
+anything in the code.
 
 ## If you want to keep going
 
-In order of what's actually next: (1) get a live Gemini key working locally
-and confirm `geminiProvider.ts` really round-trips, (2) swap
-`generateSyntheticOHLCV` for a real data source — even a free one, before
-paying for TrueData, (3) add a second provider (Grok is the cheapest to add
-next — same interface, an xAI key), (4) only once two real providers exist
-does the blueprint's comparison UI and scoring axes start to mean anything.
+Roughly in priority order: (1) get one real provider live-tested with a
+real key, (2) wire the API route to the database instead of synthetic
+data, (3) build the multi-provider comparison UI once two providers are
+confirmed live, (4) fill out the indicator list, (5) everything else in
+the status table above.
