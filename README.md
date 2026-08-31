@@ -1,137 +1,159 @@
-# Oxygen AI — minimal end-to-end slice
+# Oxygen AI — minimal slice
 
-A small, real, working slice of the Oxygen AI blueprint. It exists to
-prove the one idea that actually matters architecturally: **indicators
-are computed deterministically, the AI layer only reasons over them, and
-every provider sits behind one swappable interface.** It is not the full
-production system — see "Status against the blueprint" below for exactly
-what that means.
+Two services now, matching Passage 1 §3's architecture diagram instead of
+approximating it with a Next.js monolith:
 
-## Correction applied
+```
+apps/api/   FastAPI (Python) — the API Gateway Layer. All backend logic:
+            deterministic indicators, verification, provider orchestration,
+            comparison scoring, database access.
+(repo root) Next.js (TypeScript/React) — the Web UI. Calls apps/api/
+            directly over HTTP. No backend logic of its own.
+```
 
-The blueprint's own §4.3.1 rule: Gemma 4 is a *provider identity*;
-Google's Gemini API is only the *hosted transport* that reaches it —
-never a separate provider. `geminiProvider.ts` → `gemmaProvider.ts`, id
-`"gemini"` → `"gemma"`, env var → `GOOGLE_AI_API_KEY`. The `@google/genai`
-SDK call is unchanged — that's genuinely the only transport to hosted
-Gemma 4. A repo-wide grep confirms zero remaining `gemini`/`Gemini`
-naming outside of comments explaining this exact distinction.
+## Architecture correction applied this pass
 
-## What's actually real here
+Passage 1 §3 specifies a distinct **API Gateway Layer — FastAPI (Python)**,
+separate from the Next.js web UI. Earlier passes built all backend logic
+as TypeScript inside Next.js API routes instead — a pragmatic
+simplification for a single-service demo, but a real deviation from the
+blueprint, and one that was flagged plainly rather than left implicit
+once it came under review.
 
-- `lib/indicators.ts` — SMA, RSI(14), ATR(14): real formulas, unit-tested.
-- `lib/verify.ts` — the verification stage. Entry/stop/targets computed
-  from ATR here, never from the AI's text. A consistency check fails
-  closed to `NO_VALID_SETUP` rather than shipping a broken setup.
-- `lib/types.ts` — the `TradeAnalysis` schema (Zod): schema-validated
-  output, source-tagging (`mock` / `hosted_api` / `local_model`).
-- `lib/providers/` — the `AIProvider` interface and four implementations:
-  `mockProvider.ts` (offline, no key needed), `customAiProvider.ts`
-  (any OpenAI-compatible endpoint — your choice of model, per blueprint
-  §4.1), `gemmaProvider.ts` (Gemma 4 via `@google/genai`), and
-  `grokProvider.ts` (Grok via a plain `fetch` to xAI).
-- `infra/migrations/` — the full database schema (38 tables, plus a
-  0002 fix — see below), applied and verified against a real PostgreSQL 16
-  + pgvector instance. See `infra/migrations/README.md`.
-- `lib/db/` — the route is now actually wired to that schema. When
-  `DATABASE_URL` is set: instruments and OHLCV bars are read from and
-  written to Postgres (persisted once per symbol, not regenerated every
-  request), found signals are saved to `trading_signals`, and providers/
-  models are upserted into `ai_providers`/`ai_models` on demand. Falls
-  back to the old ephemeral synthetic-data path — cleanly, not a crash —
-  if `DATABASE_URL` is unset, or set but unreachable.
-- One route (`POST /api/analyze`) and one page running the whole pipeline
-  end to end, with correct fallback-to-mock for all three real providers
-  and correct fallback-to-ephemeral for the database.
-
-## Status against the blueprint
-
-Being precise about this rather than saying "mostly done" — this is
-where the four passages' worth of specification actually stands right
-now:
-
-| Blueprint area | Status |
-|---|---|
-| §4 Custom AI / Grok / Gemma 4 as providers | **Real** — integration layer for all three, interface-uniform, type-checked, correct fallback. None live-tested (needs your keys). Custom AI's "orchestrating agent" / tool-calling half is not built. |
-| §4.5 Provider Router — circuit breaker, health checks, model registry | **Not built.** Current fallback is one if-check, not the circuit-breaker-with-cooldown or persisted health-check history the blueprint specifies. |
-| §4.6 Multi-provider comparison UI | **Not built.** UI picks one provider at a time. |
-| §5 C++/CUDA performance layer | **Not built** — correctly so, per the blueprint's own §5.2/5.3: nothing has been profiled as a bottleneck, and MVP may stay Python by design. |
-| §6 Deterministic trading engine | **Partial.** SMA/RSI/ATR only, of MACD/Stochastic/ADX/Bollinger/VWAP. No regime-awareness classifier, no market-structure/S-R detection. |
-| §7 RAG & knowledge system | **Not built.** |
-| §8 Memory architecture | **Not built** at the app level (schema exists; nothing reads/writes it yet). |
-| §9 Database | **Schema real and verified, and now wired to the app.** `market_instruments`/`market_data`/`trading_signals`/`ai_providers`/`ai_models` are read/written for real when `DATABASE_URL` is set — verified against a live instance, not asserted (see below). Underlying bar data is still synthetic; `technical_indicators`, `memories`, RAG tables, and the rest of the 38 remain unused by the app. |
-| §10 API architecture | **1 of ~7 endpoints** (`/api/analyze`, roughly `/api/ai/analyze`). |
-| Passage 2 (admin panel, charting, voice, security, error center, backtesting, compliance) | **Not built** — this is nearly all of Passage 2. |
-| Passage 3 (infra, CI, broader testing) | **Not built.** |
-
-Doing all of the "not built" rows for real, in one pass, isn't something
-a chat session can responsibly claim — it would mean generating
-stub/untested code for a GPU-accelerated native layer, a live RAG
-pipeline, voice infrastructure, and an admin panel, none of which I could
-verify here, and reporting it as done. That's the thing this whole
-project is supposed to avoid. What's above is real and checked; what
-isn't is named plainly instead of faked.
+This pass migrates it: `apps/api/` is a real FastAPI service, ported
+function-for-function from the previous TypeScript implementation
+(indicators, verification, scoring, provider routing, comparison
+isolation, database access). `app/api/analyze/route.ts` is deleted — the
+browser now calls FastAPI directly (`POST /api/ai/analyze`), exactly as
+the architecture diagram shows, with CORS configured for the Next.js
+origin. The Next.js app's `lib/` now holds only what a frontend
+legitimately needs: rendering types, no backend logic, no database
+driver, no AI SDKs.
 
 ## Running it
 
 ```bash
+# Terminal 1 — backend
+cd apps/api
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+cp .env.example .env.local   # optional — add real provider keys / DATABASE_URL
+.venv/bin/uvicorn app.main:app --reload --port 8000
+
+# Terminal 2 — frontend
 npm install
-cp .env.example .env.local   # optional — add real keys to use a real provider
-npm run dev
+npm run build && npm start   # or `npm run dev` for local development
 ```
 
-Open http://localhost:3000, type a symbol, hit Analyze.
+Open http://localhost:3000. Note: `NEXT_PUBLIC_API_BASE_URL` is inlined
+into the frontend at **build** time, not read at runtime (standard
+Next.js behavior for `NEXT_PUBLIC_*` vars) — if you point the backend
+somewhere other than `localhost:8000`, set it before `npm run build`,
+not just before `npm start`. Verified explicitly this pass, not assumed
+— see below.
+
+## Status against the blueprint
+
+| Blueprint area | Status |
+|---|---|
+| §3 API Gateway Layer — FastAPI (Python), separate from the web UI | **Real, as of this pass.** `apps/api/` is a working FastAPI service; the Next.js app has no backend logic left. |
+| §4 Custom AI / Grok / Gemma 4 as providers | **Real** — all three ported to Python, interface-uniform, correct fallback. Custom AI displays as "Oxygen AI" in the UI (a branding choice, not a blueprint requirement — checked both passages, neither specifies it). None live-tested (needs your keys). Custom AI's "orchestrating agent" / tool-calling half is not built. |
+| §4.5 Provider Router — circuit breaker, health checks, model registry | **Not built.** Current fallback is one check, not the circuit-breaker-with-cooldown or persisted health-check history the blueprint specifies. |
+| §4.6 Multi-provider comparison | **Real**, now in Python using the blueprint's own literal mechanism — `asyncio.gather(..., return_exceptions=True)` (Passage 1 §4.5), not a JS equivalent of it. 5 of 8 scoring axes computed for real; 3 render as the blueprint's own specified "not enough data yet" placeholder. Persists to the corrected `ai_comparisons`/`ai_comparison_results` schema. UI has a Compare mode with a side-by-side grid; still missing several Passage 4 §3.6 details (Key evidence, Market data used, Data freshness, the 6 footer actions, active-model badge). |
+| §5 C++/CUDA performance layer | **Not built** — correctly so, per §5.2/5.3: nothing has been profiled as a bottleneck, and MVP may stay in the higher-level language by design. |
+| §6 Deterministic trading engine | **Partial**, now genuinely Python + the specified baseline. SMA/RSI/ATR only, of MACD/Stochastic/ADX/Bollinger/VWAP. No regime-awareness classifier, no market-structure/S-R detection. |
+| §7 RAG & knowledge system | **Not built.** |
+| §8 Memory architecture | **Not built** at the app level (schema exists; nothing reads/writes it). |
+| §9 Database | **Schema real and verified, wired to the app** — now from Python via `asyncpg`, not `pg` from Node. Same schema, same verified behavior, reconfirmed against FastAPI directly this pass. |
+| §10 API architecture | `POST /api/ai/analyze` — corrected to the blueprint's actual path (was `/api/analyze`), handling both single and multi-provider modes. Still 1 of ~7 named endpoints. |
+| Admin panel, charting, voice, security, error center, backtesting, compliance (Passage 2) | **Not built.** |
+| Infra, CI, broader testing (Passage 3) | **Not built.** |
 
 ## Verified before delivery (actually run, not claimed)
 
+**Python backend:**
 ```
-$ npm install                                            → exit 0
-$ npx tsc --noEmit                                        → clean
-$ npx tsx --test lib/indicators.test.ts lib/providers/index.test.ts
-                                                            → 14/14 pass (3 consecutive clean runs;
-                                                              one earlier run right after a fresh
-                                                              install showed 1 flaky failure, not
-                                                              reproduced since — noting it rather
-                                                              than hiding it)
-$ npx next build                                           → compiled successfully
-$ npx next start, then POST /api/analyze for each provider:
-    mock   → 200, SETUP_FOUND, real indicator-driven result
-    custom → 200, correctly fell back to source: mock (no CUSTOM_AI_* set)
-    grok   → 200, correctly fell back to source: mock (no XAI_API_KEY set)
-    gemma  → 200, correctly fell back to source: mock (no GOOGLE_AI_API_KEY set)
-
-Database wiring, verified against a real PostgreSQL 16 + pgvector instance
-(not just written — checked with direct SQL, not inferred from the API
-response):
-    2x POST /api/analyze {symbol: HDFCBANK} with DATABASE_URL set
-      → both 200, persisted: true, identical entry price both times
-      → market_data row count for HDFCBANK: 60 (not 120 — the 2nd call
-        read existing bars, it did not regenerate and re-insert)
-      → market_instruments: 1 row · ai_providers: 1 row · ai_models: 1 row
-        (the 0002 unique-constraint fix confirmed working — no duplicates
-        despite two separate seed-model calls)
-      → trading_signals: 2 rows (one per SETUP_FOUND call, as intended —
-        each analysis is its own signal event, not deduplicated)
-    POST /api/analyze with DATABASE_URL unset
-      → 200, persisted: false, unchanged old behavior — confirms the
-        no-DB path still works exactly as before this change
-    POST /api/analyze with DATABASE_URL pointed at a closed port
-      → 200, persisted: false — server log shows the caught
-        ECONNREFUSED and the fall-through, not a 500
-  POST /api/analyze {}                                     → 400 (validation works)
-$ grep -rln "gemini" **/*.ts **/*.tsx                       → only explanatory comments/test names
-$ database: see infra/migrations/README.md for the full log
+$ pip install -r requirements.txt          → clean install, all imports resolve
+$ mypy app --ignore-missing-imports        → 1 real error found (int/float
+                                              mismatch in the synthetic-data
+                                              generator) — fixed, then clean
+$ pytest tests/ -v                          → 28/28 pass
+$ uvicorn app.main:app --port 8000, then:
+   GET  /health                             → 200
+   POST /api/ai/analyze {provider: mock}    → 200, real indicator-driven result
+   POST /api/ai/analyze {}                  → 400, same {error, details} shape
+                                               the Next.js/Zod version returned
+   POST /api/ai/analyze {providers:[mock,grok,gemma]}
+                                              → 200, mock ok / grok+gemma
+                                               unavailable with independent
+                                               reasons — isolation confirmed
+   POST /api/ai/analyze {providers:[mock,custom,grok]}
+                                              → custom's unavailable reason
+                                               correctly names its own three
+                                               missing env vars, distinct
+                                               from grok's
 ```
 
-Not verified: a live call to any of the three real providers — blocked by
-this sandbox's network policy (locked to package registries), not by
-anything in the code.
+**Database, from Python via asyncpg (fresh Postgres 16 + pgvector instance):**
+```
+   2x single-analyze calls, same symbol      → market_data stayed at 60 rows,
+                                               not 120 — bars genuinely reused
+   comparison call                            → ai_comparisons.provider_set
+                                               correct jsonb; ai_comparison_results
+                                               has exactly 3 rows (mock+grok+gemma,
+                                               all seeded so the FK holds);
+                                               trading_signals has exactly 3 rows
+                                               total across all calls in this
+                                               session, matching how many actually
+                                               found a setup — not one per call
+```
+
+**Cross-language check, beyond what was asked:** generated the same
+symbol's synthetic bars in both the old TypeScript version and the new
+Python port and diffed them directly. They differ — not a bug in either,
+but a genuine finding: the LCG multiplies numbers that exceed
+`Number.MAX_SAFE_INTEGER`, so JavaScript's float64 arithmetic silently
+loses precision on every step (confirmed: `2147483647 * 1103515245` —
+JS gives `...698600`, Python's arbitrary-precision integers give the
+exact `...698515`). Both sequences are internally deterministic; neither
+represents real data; the TypeScript version is deleted as of this pass,
+so the divergence has no live consequence — recorded here because it
+was checked, not assumed away.
+
+**Integration — both services running together, real cross-origin request:**
+```
+   OPTIONS /api/ai/analyze, Origin: http://localhost:3000
+                                              → 200, access-control-allow-origin:
+                                               http://localhost:3000 present
+   POST    /api/ai/analyze, Origin: http://localhost:3000
+                                              → 200, same CORS header present
+                                               on the actual response too
+                                               (browsers check both)
+   NEXT_PUBLIC_API_BASE_URL build-time inlining
+                                              → proved explicitly: rebuilt with
+                                               a distinctive test value, grepped
+                                               the compiled client bundle,
+                                               confirmed it appears there —
+                                               not inferred from reading code
+$ npm run build (frontend)                   → compiled successfully, 2 routes
+                                               (down from 3 — /api/analyze is gone)
+```
+
+**Bug found and fixed during this pass, in both languages:** the
+"deterministic for the same symbol" test compared full bar objects
+including `timestamp`, which is anchored to wall-clock `now()` and can
+legitimately differ by microseconds between two separate calls.
+JavaScript's millisecond-resolution `Date.now()` made this pass reliably
+by luck; Python's microsecond-resolution `datetime.now()` exposed it
+directly. Fixed in both: the test now compares OHLCV fields only.
+
+Not verified: a live call to any of the three real providers — blocked
+by this sandbox's network policy, not by anything in the code.
 
 ## If you want to keep going
 
 Roughly in priority order: (1) get one real provider live-tested with a
 real key, (2) swap the synthetic bar generator for a real market-data
-vendor now that persistence exists to actually store what it returns,
-(3) build the multi-provider comparison UI once two providers are
-confirmed live, (4) fill out the indicator list, (5) everything else in
-the status table above.
+vendor, (3) fill out the indicator list, (4) the remaining Passage 4
+§3.6 comparison-UI details (footer actions, evidence, freshness, model
+badge), (5) circuit breaker + persisted health checks for the provider
+router, (6) everything else in the status table above.

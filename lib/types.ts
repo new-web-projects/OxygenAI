@@ -1,46 +1,57 @@
-import { z } from "zod";
+/**
+ * Frontend-only type definitions. Runtime validation (formerly Zod here)
+ * now happens once, server-side, in apps/api/app/schemas.py (Pydantic) --
+ * the actual API Gateway per Passage 1 §3. These are plain TypeScript
+ * types for rendering the response the frontend receives over HTTP; they
+ * describe the same contract, they don't re-validate it.
+ */
 
-export const OHLCVBarSchema = z.object({
-  timestamp: z.string(),
-  open: z.number(),
-  high: z.number(),
-  low: z.number(),
-  close: z.number(),
-  volume: z.number(),
-});
-export type OHLCVBar = z.infer<typeof OHLCVBarSchema>;
+export interface IndicatorBundle {
+  sma20: number | null;
+  sma50: number | null;
+  rsi14: number | null;
+  atr14: number | null;
+  lastClose: number;
+  trend: "up" | "down" | "flat";
+}
 
-export const IndicatorBundleSchema = z.object({
-  sma20: z.number().nullable(),
-  sma50: z.number().nullable(),
-  rsi14: z.number().nullable(),
-  atr14: z.number().nullable(),
-  lastClose: z.number(),
-  trend: z.enum(["up", "down", "flat"]),
-});
-export type IndicatorBundle = z.infer<typeof IndicatorBundleSchema>;
+export interface TradeAnalysis {
+  status: "SETUP_FOUND" | "NO_VALID_SETUP";
+  direction: "LONG" | "SHORT" | null;
+  entry: number | null;
+  stopLoss: number | null;
+  targets: number[];
+  confidence: number | null;
+  riskReward: number | null;
+  reasoningSummary: string;
+  supportingEvidence: string[];
+  source: "mock" | "hosted_api" | "local_model";
+  provider: string;
+  model: string;
+  indicatorsUsed: IndicatorBundle;
+  generatedAt: string;
+  persisted: boolean;
+}
 
-// The one object every provider must produce, and the one object the API
-// route ever returns. Mirrors the blueprint's TradeAnalysis contract:
-// schema-validated, allowed to legitimately say NO_VALID_SETUP, and always
-// carries a source tag so the caller knows whether a real model produced it.
-export const TradeAnalysisSchema = z.object({
-  status: z.enum(["SETUP_FOUND", "NO_VALID_SETUP"]),
-  direction: z.enum(["LONG", "SHORT"]).nullable(),
-  entry: z.number().nullable(),
-  stopLoss: z.number().nullable(),
-  targets: z.array(z.number()),
-  confidence: z.number().min(0).max(100).nullable(),
-  riskReward: z.number().nullable(),
-  reasoningSummary: z.string(),
-  supportingEvidence: z.array(z.string()),
-  source: z.enum(["mock", "hosted_api", "local_model"]),
-  provider: z.string(),
-  model: z.string(),
-  indicatorsUsed: IndicatorBundleSchema,
-  generatedAt: z.string(),
-  // Whether this request actually read/wrote the database (DATABASE_URL
-  // configured and reachable) or ran on ephemeral synthetic data.
-  persisted: z.boolean(),
-});
-export type TradeAnalysis = z.infer<typeof TradeAnalysisSchema>;
+export interface ScoreBreakdown {
+  dataCompleteness: number | null;
+  indicatorAgreement: number | null;
+  riskRewardQuality: number | null;
+  ruleCompliance: number | null;
+  explanationConsistency: number | null;
+  historicalValidation: "not_enough_data";
+  predictionOutcome: "not_enough_data";
+  confidenceCalibration: "not_enough_data";
+}
+
+export type ComparisonSlot =
+  | { outcome: "ok"; providerId: string; analysis: TradeAnalysis; scores: ScoreBreakdown }
+  | { outcome: "unavailable"; providerId: string; reason: string };
+
+export interface ComparisonResponse {
+  mode: "multi";
+  symbol: string;
+  results: ComparisonSlot[];
+  persisted: boolean;
+  generatedAt: string;
+}

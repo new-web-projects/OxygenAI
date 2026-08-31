@@ -1,0 +1,11 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+asyncpg==0.30.0
+httpx==0.28.1
+google-genai==1.0.0
+
+# dev/test only
+pytest==8.3.4
+pytest-asyncio==0.25.0
+mypy==1.13.0
