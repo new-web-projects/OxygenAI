@@ -16,8 +16,10 @@ from ..db.comparisons import build_scores_record, save_comparison
 from ..db.market_data import get_or_create_instrument, get_recent_bars, insert_bars
 from ..db.signals import get_or_seed_model, save_signal
 from ..indicators import compute_indicators, generate_synthetic_ohlcv
+from ..providers.base import AnalysisContext
 from ..providers.registry import resolve_provider
 from ..schemas import AnalyzeRequest, ComparisonResponse, TradeAnalysis, now_iso
+from ..utils import compute_freshness
 from ..verify import build_trade_analysis
 
 router = APIRouter()
@@ -65,14 +67,23 @@ async def analyze(body: AnalyzeRequest):
     indicators = compute_indicators(bars)
     last_bars = [{"timestamp": b.timestamp, "close": b.close} for b in bars[-5:]]
 
+    # Data freshness (Passage 4 §3.6): a property of the underlying bars,
+    # not of any one provider's reasoning — computed once, shared by
+    # every slot in both modes below.
+    data_timestamp = bars[-1].timestamp
+    is_stale = compute_freshness(data_timestamp)
+
     # ---- Multi-provider comparison mode ----
     if body.providers:
         validation_error = validate_provider_set(body.providers)
         if validation_error:
             raise HTTPException(status_code=400, detail=validation_error)
 
-        results = await run_comparison(body.providers, symbol, indicators, last_bars, resolve_model_id)
+        results = await run_comparison(
+            body.providers, symbol, indicators, last_bars, resolve_model_id, persisted, data_timestamp, is_stale
+        )
 
+        comparison_id: str | None = None
         if persisted and instrument_id:
             try:
                 signal_id_by_provider: dict[str, str | None] = {}
@@ -88,7 +99,7 @@ async def analyze(body: AnalyzeRequest):
                         )
                     else:
                         signal_id_by_provider[slot.providerId] = None
-                await save_comparison(
+                comparison_id = await save_comparison(
                     body.providers,
                     build_scores_record(results),
                     signal_id_by_provider,
@@ -107,9 +118,10 @@ async def analyze(body: AnalyzeRequest):
             results=results,
             persisted=persisted,
             generatedAt=now_iso(),
+            comparisonId=comparison_id,
         )
 
-    # ---- Single-provider mode (unchanged contract) ----
+    # ---- Single-provider mode (unchanged contract, plus freshness) ----
     provider = resolve_provider(body.provider)
     if provider.id == "mock":
         source = "mock"
@@ -120,10 +132,10 @@ async def analyze(body: AnalyzeRequest):
     model_id = resolve_model_id(provider.id)
 
     try:
-        from ..providers.base import AnalysisContext
-
         reasoning = await provider.reason(AnalysisContext(symbol=symbol, indicators=indicators, last_bars=last_bars))
-        analysis: TradeAnalysis = build_trade_analysis(indicators, reasoning, source, provider.id, model_id, persisted)
+        analysis: TradeAnalysis = build_trade_analysis(
+            indicators, reasoning, source, provider.id, model_id, persisted, data_timestamp, is_stale
+        )
 
         if persisted and instrument_id and analysis.status == "SETUP_FOUND":
             try:

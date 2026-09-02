@@ -39,7 +39,14 @@ async def test_isolation_one_unconfigured_provider_does_not_take_down_the_others
     # slots should come back "unavailable", not raise and take mock down
     # with them.
     results = await run_comparison(
-        ["mock", "grok", "gemma"], "ISOTEST", indicators, last_bars, lambda pid: f"{pid}-model"
+        ["mock", "grok", "gemma"],
+        "ISOTEST",
+        indicators,
+        last_bars,
+        lambda pid: f"{pid}-model",
+        False,
+        bars[-1].timestamp,
+        False,
     )
 
     assert len(results) == 3
@@ -55,7 +62,16 @@ async def test_isolation_two_unconfigured_providers_each_get_independent_reasons
     indicators = compute_indicators(bars)
     last_bars = [{"timestamp": b.timestamp, "close": b.close} for b in bars[-5:]]
 
-    results = await run_comparison(["grok", "gemma"], "ISOTEST2", indicators, last_bars, lambda pid: f"{pid}-model")
+    results = await run_comparison(
+        ["grok", "gemma"],
+        "ISOTEST2",
+        indicators,
+        last_bars,
+        lambda pid: f"{pid}-model",
+        False,
+        bars[-1].timestamp,
+        False,
+    )
 
     assert len(results) == 2
     for r in results:
@@ -63,3 +79,30 @@ async def test_isolation_two_unconfigured_providers_each_get_independent_reasons
         assert len(r.reason) > 0
 
     assert results[0].reason != results[1].reason
+
+
+@pytest.mark.asyncio
+async def test_ok_slots_carry_the_shared_persisted_and_freshness_values():
+    # Regression check for the bug fixed alongside this feature: every
+    # slot used to hardcode persisted=False regardless of the actual
+    # request-level value.
+    bars = generate_synthetic_ohlcv("ISOTEST3", 60)
+    indicators = compute_indicators(bars)
+    last_bars = [{"timestamp": b.timestamp, "close": b.close} for b in bars[-5:]]
+
+    results = await run_comparison(
+        ["mock", "grok"],
+        "ISOTEST3",
+        indicators,
+        last_bars,
+        lambda pid: f"{pid}-model",
+        True,
+        bars[-1].timestamp,
+        False,
+    )
+
+    mock_slot = next(r for r in results if r.providerId == "mock")
+    assert mock_slot.outcome == "ok"
+    assert mock_slot.analysis.persisted is True
+    assert mock_slot.analysis.dataTimestamp == bars[-1].timestamp
+    assert mock_slot.analysis.isStale is False

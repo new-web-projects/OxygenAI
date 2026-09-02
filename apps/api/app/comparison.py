@@ -35,13 +35,27 @@ def validate_provider_set(providers: list[str]) -> str | None:
     return None
 
 
-async def _run_one(provider_id: str, symbol: str, indicators: IndicatorBundle, last_bars: list[dict], model_id: str) -> ComparisonSlotOk:
+async def _run_one(
+    provider_id: str,
+    symbol: str,
+    indicators: IndicatorBundle,
+    last_bars: list[dict],
+    model_id: str,
+    persisted: bool,
+    data_timestamp: str,
+    is_stale: bool,
+) -> ComparisonSlotOk:
     provider = get_provider_strict(provider_id)
     reasoning = await provider.reason(
         AnalysisContext(symbol=symbol, indicators=indicators, last_bars=last_bars)
     )
     source = "mock" if provider_id == "mock" else "hosted_api"
-    analysis = build_trade_analysis(indicators, reasoning, source, provider_id, model_id, False)
+    # persisted/data_timestamp/is_stale are properties of the shared
+    # underlying bars every provider in this comparison reasons over —
+    # not per-provider, so the same values apply to every slot.
+    analysis = build_trade_analysis(
+        indicators, reasoning, source, provider_id, model_id, persisted, data_timestamp, is_stale
+    )
     return ComparisonSlotOk(providerId=provider_id, analysis=analysis, scores=score_analysis(analysis))
 
 
@@ -51,10 +65,15 @@ async def run_comparison(
     indicators: IndicatorBundle,
     last_bars: list[dict],
     resolve_model_id,
+    persisted: bool,
+    data_timestamp: str,
+    is_stale: bool,
 ) -> list[ComparisonSlot]:
     settled = await asyncio.gather(
         *[
-            _run_one(pid, symbol, indicators, last_bars, resolve_model_id(pid))
+            _run_one(
+                pid, symbol, indicators, last_bars, resolve_model_id(pid), persisted, data_timestamp, is_stale
+            )
             for pid in provider_ids
         ],
         return_exceptions=True,

@@ -21,6 +21,8 @@ def make_analysis(**overrides) -> TradeAnalysis:
         indicatorsUsed=BASE_INDICATORS,
         generatedAt=now_iso(),
         persisted=False,
+        dataTimestamp=now_iso(),
+        isStale=False,
     )
     defaults.update(overrides)
     return TradeAnalysis(**defaults)

@@ -47,6 +47,18 @@ class TradeAnalysis(BaseModel):
     indicatorsUsed: IndicatorBundle
     generatedAt: str
     persisted: bool
+    # Passage 4 §3.6's "Data freshness" field: the underlying market
+    # data's own timestamp (the last bar used), plus a stale/live flag —
+    # distinct from generatedAt, which is when the analysis was computed,
+    # not when the price data itself is as-of.
+    dataTimestamp: str
+    isStale: bool
+    # Passage 4 §3.6's "Market data used" field also names timeframe —
+    # a fixed literal for now since "1d" is the only timeframe this
+    # system computes anywhere; typed this way (not a bare str) so
+    # adding a second timeframe later is a type-checked change, not a
+    # silent one.
+    timeframe: Literal["1d"] = "1d"
 
 
 class ScoreBreakdown(BaseModel):
@@ -82,6 +94,12 @@ class ComparisonResponse(BaseModel):
     results: list[ComparisonSlot]
     persisted: bool
     generatedAt: str
+    # The ai_comparisons row's id, when persisted — the frontend needs
+    # this to submit a rating or a preferred-provider choice against the
+    # comparison later (Passage 4 §3.6's remaining footer actions; not
+    # implemented this pass, but the response needs to carry the id now
+    # so that step doesn't require touching this contract again).
+    comparisonId: Optional[str] = None
 
 
 class AnalyzeRequest(BaseModel):

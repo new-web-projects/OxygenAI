@@ -21,6 +21,8 @@ def _no_setup(
     provider_id: str,
     model_id: str,
     persisted: bool,
+    data_timestamp: str,
+    is_stale: bool,
     reason: str | None = None,
 ) -> TradeAnalysis:
     return TradeAnalysis(
@@ -39,6 +41,8 @@ def _no_setup(
         indicatorsUsed=indicators,
         generatedAt=now_iso(),
         persisted=persisted,
+        dataTimestamp=data_timestamp,
+        isStale=is_stale,
     )
 
 
@@ -49,12 +53,16 @@ def build_trade_analysis(
     provider_id: str,
     model_id: str,
     persisted: bool,
+    data_timestamp: str,
+    is_stale: bool,
 ) -> TradeAnalysis:
     direction = reasoning.direction
     confidence = reasoning.confidence
 
     if not direction or indicators.atr14 is None:
-        return _no_setup(indicators, reasoning, source, provider_id, model_id, persisted)
+        return _no_setup(
+            indicators, reasoning, source, provider_id, model_id, persisted, data_timestamp, is_stale
+        )
 
     entry = indicators.lastClose
     atr_value = indicators.atr14
@@ -71,6 +79,8 @@ def build_trade_analysis(
             provider_id,
             model_id,
             persisted,
+            data_timestamp,
+            is_stale,
             reason="Internal consistency check failed on the computed setup — suppressed rather than returned.",
         )
 
@@ -94,4 +104,6 @@ def build_trade_analysis(
         indicatorsUsed=indicators,
         generatedAt=now_iso(),
         persisted=persisted,
+        dataTimestamp=data_timestamp,
+        isStale=is_stale,
     )
