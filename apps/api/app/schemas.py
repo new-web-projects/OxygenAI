@@ -108,5 +108,25 @@ class AnalyzeRequest(BaseModel):
     providers: Optional[list[str]] = Field(default=None, min_length=2, max_length=3)
 
 
+class RateComparisonRequest(BaseModel):
+    """
+    Passage 4 §3.6's two mutating footer actions, on one endpoint since
+    both write to the same ai_comparisons row: User rating (1-5, shared
+    across the whole comparison) and Select preferred result (per
+    column — the id of whichever provider the user picked). Either can
+    be sent alone; at least one must be present.
+    """
+
+    rating: Optional[int] = Field(default=None, ge=1, le=5)
+    preferredProviderId: Optional[str] = None
+
+
+class ComparisonFeedback(BaseModel):
+    comparisonId: str
+    providerSet: list[str]
+    userChoiceProviderId: Optional[str]
+    userRating: Optional[int]
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")

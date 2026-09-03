@@ -31,6 +31,9 @@ export interface TradeAnalysis {
   indicatorsUsed: IndicatorBundle;
   generatedAt: string;
   persisted: boolean;
+  dataTimestamp: string;
+  isStale: boolean;
+  timeframe: "1d";
 }
 
 export interface ScoreBreakdown {
@@ -54,4 +57,14 @@ export interface ComparisonResponse {
   results: ComparisonSlot[];
   persisted: boolean;
   generatedAt: string;
+  comparisonId: string | null;
+}
+
+// Passage 4 §3.6's mutating footer actions — User rating and Select
+// preferred result — both PATCH /api/ai/comparisons/{id}.
+export interface ComparisonFeedback {
+  comparisonId: string;
+  providerSet: string[];
+  userChoiceProviderId: string | null;
+  userRating: number | null;
 }

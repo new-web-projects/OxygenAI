@@ -15,7 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from .routers import analyze
+from .routers import analyze, comparisons
 
 app = FastAPI(title="Oxygen AI API Gateway", version="0.1.0")
 
@@ -47,3 +47,4 @@ async def health():
 
 
 app.include_router(analyze.router)
+app.include_router(comparisons.router)

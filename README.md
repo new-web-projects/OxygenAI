@@ -58,13 +58,13 @@ not just before `npm start`. Verified explicitly this pass, not assumed
 | §3 API Gateway Layer — FastAPI (Python), separate from the web UI | **Real, as of this pass.** `apps/api/` is a working FastAPI service; the Next.js app has no backend logic left. |
 | §4 Custom AI / Grok / Gemma 4 as providers | **Real** — all three ported to Python, interface-uniform, correct fallback. Custom AI displays as "Oxygen AI" in the UI (a branding choice, not a blueprint requirement — checked both passages, neither specifies it). None live-tested (needs your keys). Custom AI's "orchestrating agent" / tool-calling half is not built. |
 | §4.5 Provider Router — circuit breaker, health checks, model registry | **Not built.** Current fallback is one check, not the circuit-breaker-with-cooldown or persisted health-check history the blueprint specifies. |
-| §4.6 Multi-provider comparison | **Real**, now in Python using the blueprint's own literal mechanism — `asyncio.gather(..., return_exceptions=True)` (Passage 1 §4.5), not a JS equivalent of it. 5 of 8 scoring axes computed for real; 3 render as the blueprint's own specified "not enough data yet" placeholder. Persists to the corrected `ai_comparisons`/`ai_comparison_results` schema. UI has a Compare mode with a side-by-side grid; still missing several Passage 4 §3.6 details (Key evidence, Market data used, Data freshness, the 6 footer actions, active-model badge). |
+| §4.6 Multi-provider comparison | **Real and now complete against §3.6.** Isolation via `asyncio.gather(..., return_exceptions=True)` (Passage 1 §4.5). 5 of 8 scoring axes computed for real; 3 render as the blueprint's own specified "not enough data yet" placeholder. Persists to the corrected `ai_comparisons`/`ai_comparison_results` schema. UI has all 6 §3.6 footer actions: Copy, Key evidence, Market data used, Data freshness, active-model badge (display-only, done previous pass); User rating and Select preferred (**this pass** — `PATCH /api/ai/comparisons/{id}`, backed by a new `user_rating` column, the existing `user_choice_provider_id`). Only "Why they disagree" remains, correctly deferred — Post-MVP per the blueprint's own classification. |
 | §5 C++/CUDA performance layer | **Not built** — correctly so, per §5.2/5.3: nothing has been profiled as a bottleneck, and MVP may stay in the higher-level language by design. |
 | §6 Deterministic trading engine | **Partial**, now genuinely Python + the specified baseline. SMA/RSI/ATR only, of MACD/Stochastic/ADX/Bollinger/VWAP. No regime-awareness classifier, no market-structure/S-R detection. |
 | §7 RAG & knowledge system | **Not built.** |
 | §8 Memory architecture | **Not built** at the app level (schema exists; nothing reads/writes it). |
-| §9 Database | **Schema real and verified, wired to the app** — now from Python via `asyncpg`, not `pg` from Node. Same schema, same verified behavior, reconfirmed against FastAPI directly this pass. |
-| §10 API architecture | `POST /api/ai/analyze` — corrected to the blueprint's actual path (was `/api/analyze`), handling both single and multi-provider modes. Still 1 of ~7 named endpoints. |
+| §9 Database | **Schema real and verified, wired to the app** — from Python via `asyncpg`. 3 migrations applied (0001 core schema, 0002 the ai_models unique-constraint fix, 0003 the user_rating column). |
+| §10 API architecture | `POST /api/ai/analyze` (single + multi mode) and `PATCH /api/ai/comparisons/{id}` (rating + preference, new this pass). 2 of ~7 named endpoints. |
 | Admin panel, charting, voice, security, error center, backtesting, compliance (Passage 2) | **Not built.** |
 | Infra, CI, broader testing (Passage 3) | **Not built.** |
 
@@ -146,14 +146,103 @@ JavaScript's millisecond-resolution `Date.now()` made this pass reliably
 by luck; Python's microsecond-resolution `datetime.now()` exposed it
 directly. Fixed in both: the test now compares OHLCV fields only.
 
-Not verified: a live call to any of the three real providers — blocked
-by this sandbox's network policy, not by anything in the code.
+**Frontend §3.6 completion pass — Key evidence, Market data used, Data
+freshness, active-model badge, Copy buttons:**
+```
+Backend additions this pass: dataTimestamp/isStale/timeframe on
+TradeAnalysis, comparisonId on ComparisonResponse — mypy clean, 32/32
+pytest pass (4 new tests, including a regression test for a real bug
+found below).
+
+Bug found and fixed: multi-provider slots hardcoded persisted=False
+regardless of whether the request was actually DB-backed — caught while
+threading the new freshness fields through comparison.py, confirmed live
+(mock slot showed persisted:false even with DATABASE_URL set, before the
+fix) and with a new regression test.
+
+Second bug found and fixed: a fresh synthetic-data generation read as
+"stale" immediately. Root cause: the generator's last bar is always
+dated ~1 day before generation time by construction, and the freshness
+threshold was exactly 1 day, so a few microseconds of processing time
+pushed it over on every single call. Fixed by setting the threshold to 2
+days (correct for daily bars, where "yesterday" is the normal freshest
+value, not staleness) — confirmed live before and after the fix, not
+just in the unit test.
+
+$ mypy app --ignore-missing-imports        → clean (after both fixes)
+$ pytest tests/ -q                          → 32/32 pass
+$ npx tsc --noEmit                          → clean
+$ npx next build                            → compiled successfully
+$ Live check, single mode: response has all 17 fields the new JSX
+  reads, including dataTimestamp/isStale/timeframe — confirmed via raw
+  JSON, not just type-checked in isolation
+$ Live check, compare mode: comparisonId is a real UUID (previously
+  computed but never returned); "ok" slot carries model/
+  supportingEvidence/dataTimestamp/isStale/timeframe; "unavailable" slot
+  is exactly {outcome, providerId, reason}
+$ Manually traced formatAnalysisAsText (the Copy button's output)
+  against real captured API data, line by line — output is well-formed
+```
+
+Not verified this pass, same limitation as before: actual pixel-rendered
+output in a browser — no browser is available in this sandbox. Verified
+instead: the type contract end-to-end (`tsc` ties the JSX directly to
+the response shape), the real API response contains every field the JSX
+reads, and a manual trace of the formatting logic against real captured
+data. That's a different, narrower claim than "confirmed visually," and
+is reported as such rather than blurred together.
+
+Not verified, unchanged: a live call to any of the three real providers
+— blocked by this sandbox's network policy, not by anything in the code.
+
+## §3.6 completed — User rating and Select preferred
+
+```
+Migration: infra/migrations/0003_add_comparison_rating.sql — adds
+ai_comparisons.user_rating (smallint, 1-5). Applied and verified against
+a live Postgres, same as 0001/0002.
+
+New endpoint: PATCH /api/ai/comparisons/{id} — accepts rating and/or
+preferredProviderId, at least one required. Both write to the same
+ai_comparisons row via COALESCE (one field updateable without disturbing
+the other) — verified live, not just via the unit test: rated a real
+comparison 5/5, then sent a separate call setting only the preference,
+confirmed the rating survived via a fresh GET-equivalent read.
+
+Real design bug caught and fixed before it shipped: the initial
+implementation would have returned userChoiceProviderId as the raw
+internal ai_providers.id (a UUID) -- every other providerId in this API
+is a name string ("grok", "mock"). Fixed by joining to ai_providers in
+the read path; UPDATE...RETURNING can't join, so the update re-fetches
+through the same enriched read afterward.
+
+Validation: selecting a provider that wasn't part of the comparison
+correctly 400s (checked against provider_set, not just "does this
+provider exist anywhere"); an unknown comparisonId 404s; an empty body
+400s; no DATABASE_URL configured 503s cleanly rather than crashing --
+all four confirmed live, not just asserted.
+
+CORS confirmed specifically for PATCH (a different method than the
+GET/POST already checked) -- preflight response lists PATCH among
+access-control-allow-methods, and the actual PATCH response carries the
+same origin header.
+
+$ mypy app --ignore-missing-imports        → clean
+$ pytest tests/ -q                          → 38/38 pass (6 new)
+$ npx tsc --noEmit                          → clean
+$ npx next build                            → compiled successfully
+$ Full live loop: create comparison → rate 5/5 → prefer "grok" → confirmed
+  via direct SQL: user_rating=5, preferred=grok, provider_set=["mock","grok"]
+```
 
 ## If you want to keep going
 
 Roughly in priority order: (1) get one real provider live-tested with a
 real key, (2) swap the synthetic bar generator for a real market-data
-vendor, (3) fill out the indicator list, (4) the remaining Passage 4
-§3.6 comparison-UI details (footer actions, evidence, freshness, model
-badge), (5) circuit breaker + persisted health checks for the provider
-router, (6) everything else in the status table above.
+vendor, (3) fill out the indicator list, (4) circuit breaker + persisted
+health checks for the provider router, (5) a new frontend surface (Admin
+Panel is the natural first one — Passage 4 §8's own roadmap rationale
+sequences it early, ahead of things that need it to be testable
+against), (6) everything else in the status table above. §3.6 is now
+fully implemented — Passage 4's comparison-UI recovery has nothing
+outstanding except the explicitly-deferred "Why they disagree."
