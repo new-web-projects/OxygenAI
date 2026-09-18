@@ -1,2 +1,0 @@
-/usr/bin/ar qc liboxygen_core.a CMakeFiles/oxygen_core.dir/src/indicators.cpp.o
-/usr/bin/ranlib liboxygen_core.a

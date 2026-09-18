@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/oxygen_native_tests.dir/tests/test_indicators.cpp.o -o oxygen_native_tests  liboxygen_core.a 

@@ -1,5 +1,0 @@
-/workspaces/OxygenAI/native/build/CMakeFiles/oxygen_core.dir
-/workspaces/OxygenAI/native/build/CMakeFiles/oxygen_native_tests.dir
-/workspaces/OxygenAI/native/build/CMakeFiles/test.dir
-/workspaces/OxygenAI/native/build/CMakeFiles/edit_cache.dir
-/workspaces/OxygenAI/native/build/CMakeFiles/rebuild_cache.dir
