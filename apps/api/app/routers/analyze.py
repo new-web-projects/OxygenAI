@@ -1,24 +1,44 @@
 """
-Port of app/api/analyze/route.ts. This is the API Gateway endpoint the
-blueprint's architecture diagram (Passage 1 §3) shows the Web/Mobile UI
-calling directly over HTTPS — no Next.js intermediary.
+POST /api/ai/analyze — Passage 1 §3's architecture diagram: the endpoint
+the Web/Mobile UI calls directly over HTTPS, no Next.js intermediary.
+
+Rewired this pass to close the same integration gap `comparison.py` had:
+this router previously called `compute_indicators()` for the four base
+indicators and `provider.reason()` directly, so the full indicator
+library, the regime classifier, market structure, the Risk Engine, and
+the circuit breaker built this pass were all present in the codebase but
+unreachable from the one endpoint that actually serves requests. Single-
+provider mode now runs the same `run_engine()` pipeline and
+`execute_provider()` path multi-provider mode uses, so both modes share
+one deterministic-engine call and one execution path rather than two
+that could silently drift apart.
+
+Model resolution now goes through `providers.model_registry.
+configured_model_id`, which is registry-aware (Grok's retired-slug
+redirects, §3.2/G02) rather than the router's own hardcoded per-provider
+defaults from before this pass.
 """
 
 from __future__ import annotations
 
-import os
+import time
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 
 from ..comparison import run_comparison, validate_provider_set
 from ..db.client import is_db_configured
 from ..db.comparisons import build_scores_record, save_comparison
 from ..db.market_data import get_or_create_instrument, get_recent_bars, insert_bars
 from ..db.signals import get_or_seed_model, save_signal
-from ..indicators import compute_indicators, generate_synthetic_ohlcv
+from ..engine.pipeline import run_engine
+from ..errors import MarketDataUnavailableError, ProviderUnavailableError, ValidationError
+from ..indicators import generate_synthetic_ohlcv
+from ..observability import get_logger
 from ..providers.base import AnalysisContext
-from ..providers.registry import resolve_provider
-from ..schemas import AnalyzeRequest, ComparisonResponse, TradeAnalysis, now_iso
+from ..providers.circuit_breaker import CircuitBreakerOpen
+from ..providers.model_registry import configured_model_id
+from ..providers.registry import execute_provider, resolve_provider
+from ..schemas import AnalyzeRequest, ComparisonResponse, ComparisonSlotOk, TradeAnalysis, now_iso
 from ..utils import compute_freshness
 from ..verify import build_trade_analysis
 
@@ -26,15 +46,7 @@ router = APIRouter()
 
 BARS_NEEDED = 60
 
-
-def resolve_model_id(provider_id: str) -> str:
-    if provider_id == "gemma":
-        return os.environ.get("GEMMA_MODEL_ID", "gemma-4-4b-it")
-    if provider_id == "grok":
-        return os.environ.get("GROK_MODEL_ID", "grok-4.6")
-    if provider_id == "custom":
-        return os.environ.get("CUSTOM_AI_MODEL_ID", "unset")
-    return "mock-v1"
+logger = get_logger("routers.analyze")
 
 
 async def get_or_refresh_bars(symbol: str):
@@ -56,7 +68,9 @@ async def get_or_refresh_bars(symbol: str):
         await insert_bars(instrument_id, bars)
         return bars, instrument_id, True
     except Exception as err:  # noqa: BLE001 — deliberate: any DB failure degrades, never crashes the request
-        print(f"DB path failed, falling back to ephemeral synthetic data: {err}")
+        logger.warning(
+            "DB path failed, falling back to ephemeral synthetic data", extra={"error": str(err)}
+        )
         return generate_synthetic_ohlcv(symbol, BARS_NEEDED), None, False
 
 
@@ -64,7 +78,18 @@ async def get_or_refresh_bars(symbol: str):
 async def analyze(body: AnalyzeRequest):
     symbol = body.symbol.upper()
     bars, instrument_id, persisted = await get_or_refresh_bars(symbol)
-    indicators = compute_indicators(bars)
+
+    try:
+        engine_output = run_engine(
+            bars,
+            account_equity=body.accountEquity,
+            max_risk_per_trade_pct=body.maxRiskPerTradePct,
+        )
+    except ValueError as err:
+        # Passage 4 §6.2: 409 — market data problems are a conflict, not
+        # a client input-validation error.
+        raise MarketDataUnavailableError(str(err)) from err
+
     last_bars = [{"timestamp": b.timestamp, "close": b.close} for b in bars[-5:]]
 
     # Data freshness (Passage 4 §3.6): a property of the underlying bars,
@@ -74,14 +99,32 @@ async def analyze(body: AnalyzeRequest):
     is_stale = compute_freshness(data_timestamp)
 
     # ---- Multi-provider comparison mode ----
-    if body.providers:
-        validation_error = validate_provider_set(body.providers)
+    if body.is_multi():
+        provider_list = body.providers or []
+        validation_error = validate_provider_set(provider_list)
         if validation_error:
-            raise HTTPException(status_code=400, detail=validation_error)
+            raise ValidationError(validation_error)
 
+        started = time.perf_counter()
         results = await run_comparison(
-            body.providers, symbol, indicators, last_bars, resolve_model_id, persisted, data_timestamp, is_stale
+            provider_list,
+            symbol,
+            engine_output.indicators,
+            last_bars,
+            configured_model_id,
+            persisted,
+            data_timestamp,
+            is_stale,
+            risk_settings=engine_output.risk_settings,
+            regime_info=engine_output.regime,
+            structure_info=engine_output.structure,
         )
+        total_latency_ms = round((time.perf_counter() - started) * 1000, 2)
+        provider_latencies = [
+            slot.latencyMs
+            for slot in results
+            if isinstance(slot, ComparisonSlotOk) and slot.latencyMs is not None
+        ]
 
         comparison_id: str | None = None
         if persisted and instrument_id:
@@ -89,10 +132,10 @@ async def analyze(body: AnalyzeRequest):
                 signal_id_by_provider: dict[str, str | None] = {}
                 model_id_by_provider: dict[str, str] = {}
                 for slot in results:
-                    model_id_by_provider[slot.providerId] = resolve_model_id(slot.providerId)
+                    model_id_by_provider[slot.providerId] = configured_model_id(slot.providerId)
                     if slot.outcome == "ok" and slot.analysis.status == "SETUP_FOUND":
                         seeded = await get_or_seed_model(
-                            slot.providerId, resolve_model_id(slot.providerId), slot.providerId
+                            slot.providerId, model_id_by_provider[slot.providerId], slot.providerId
                         )
                         signal_id_by_provider[slot.providerId] = await save_signal(
                             instrument_id, seeded.model_db_id, slot.analysis
@@ -100,7 +143,7 @@ async def analyze(body: AnalyzeRequest):
                     else:
                         signal_id_by_provider[slot.providerId] = None
                 comparison_id = await save_comparison(
-                    body.providers,
+                    provider_list,
                     build_scores_record(results),
                     signal_id_by_provider,
                     model_id_by_provider,
@@ -110,7 +153,10 @@ async def analyze(body: AnalyzeRequest):
                 # computed — a failed write shouldn't turn a good
                 # response into a 503, same principle as the
                 # single-provider path below.
-                print(f"Failed to persist comparison (results still returned): {err}")
+                logger.warning(
+                    "Failed to persist comparison (results still returned)",
+                    extra={"error": str(err)},
+                )
 
         return ComparisonResponse(
             mode="multi",
@@ -119,31 +165,57 @@ async def analyze(body: AnalyzeRequest):
             persisted=persisted,
             generatedAt=now_iso(),
             comparisonId=comparison_id,
+            totalLatencyMs=total_latency_ms,
+            maxProviderLatencyMs=max(provider_latencies) if provider_latencies else None,
+            sumProviderLatencyMs=round(sum(provider_latencies), 2) if provider_latencies else None,
         )
 
-    # ---- Single-provider mode (unchanged contract, plus freshness) ----
-    provider = resolve_provider(body.provider)
-    if provider.id == "mock":
-        source = "mock"
-    elif provider.id == "custom" and os.environ.get("CUSTOM_AI_SOURCE_TAG") == "local_model":
-        source = "local_model"
-    else:
-        source = "hosted_api"
-    model_id = resolve_model_id(provider.id)
+    # ---- Single-provider mode ----
+    provider = resolve_provider(body.single_provider_id())
+    context = AnalysisContext(
+        symbol=symbol,
+        indicators=engine_output.indicators,
+        last_bars=last_bars,
+        regime=engine_output.regime.model_dump(),
+        structure=engine_output.structure.model_dump(),
+    )
 
     try:
-        reasoning = await provider.reason(AnalysisContext(symbol=symbol, indicators=indicators, last_bars=last_bars))
-        analysis: TradeAnalysis = build_trade_analysis(
-            indicators, reasoning, source, provider.id, model_id, persisted, data_timestamp, is_stale
-        )
-
-        if persisted and instrument_id and analysis.status == "SETUP_FOUND":
-            try:
-                seeded = await get_or_seed_model(provider.id, model_id, provider.display_name)
-                await save_signal(instrument_id, seeded.model_db_id, analysis)
-            except Exception as err:  # noqa: BLE001
-                print(f"Failed to persist signal (analysis still returned): {err}")
-
-        return analysis
+        # Passage 4 §6.2: "503 provider unavailable, fallback attempted
+        # first" — allow_fallback=True tries mock before giving up, so a
+        # transient failure of a real provider still returns a usable
+        # (if less specific) result rather than an outright error.
+        result = await execute_provider(provider.id, context, allow_fallback=True)
+    except CircuitBreakerOpen as err:
+        raise ProviderUnavailableError(str(err)) from err
     except Exception as err:  # noqa: BLE001
-        raise HTTPException(status_code=503, detail=f"Provider call failed: {err}") from err
+        raise ProviderUnavailableError(f"Provider call failed: {err}") from err
+
+    analysis: TradeAnalysis = build_trade_analysis(
+        engine_output.indicators,
+        result.reasoning,
+        result.source_tag,  # type: ignore[arg-type]
+        result.provider_id,
+        result.model_id,
+        persisted,
+        data_timestamp,
+        is_stale,
+        risk_settings=engine_output.risk_settings,
+        regime=engine_output.regime,
+        structure=engine_output.structure,
+        transport=result.source_tag,  # type: ignore[arg-type]
+        engine_warnings=engine_output.warnings,
+    )
+
+    if persisted and instrument_id and analysis.status == "SETUP_FOUND":
+        try:
+            seeded = await get_or_seed_model(
+                result.provider_id, result.model_id, provider.display_name
+            )
+            await save_signal(instrument_id, seeded.model_db_id, analysis)
+        except Exception as err:  # noqa: BLE001
+            logger.warning(
+                "Failed to persist signal (analysis still returned)", extra={"error": str(err)}
+            )
+
+    return analysis

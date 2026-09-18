@@ -4,8 +4,16 @@ pydantic==2.10.3
 asyncpg==0.30.0
 httpx==0.28.1
 google-genai==1.0.0
+numpy==2.2.1
 
 # dev/test only
 pytest==8.3.4
 pytest-asyncio==0.25.0
 mypy==1.13.0
+
+# Native performance layer (Passage 1 §5) — optional. Only needed to
+# compile native/ into the oxygen_native extension; the API runs
+# correctly without it via the pure-Python fallback in
+# app/engine/native_bridge.py. Building also requires system-level
+# cmake, a C++17 compiler, and make (see native/README.md).
+pybind11==2.13.6
