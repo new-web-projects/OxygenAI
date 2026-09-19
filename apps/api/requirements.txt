@@ -5,6 +5,8 @@ asyncpg==0.30.0
 httpx==0.28.1
 google-genai==1.0.0
 numpy==2.2.1
+bcrypt==4.2.1
+PyJWT==2.10.1
 
 # dev/test only
 pytest==8.3.4

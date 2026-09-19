@@ -17,19 +17,29 @@ Model resolution now goes through `providers.model_registry.
 configured_model_id`, which is registry-aware (Grok's retired-slug
 redirects, §3.2/G02) rather than the router's own hardcoded per-provider
 defaults from before this pass.
+
+Auth (this pass): accepts but does not require a bearer token
+(`security.dependencies.get_optional_user`). Passage 4 §6.2 states
+analyze requires JWT; making it mandatory here today would break the
+one endpoint the live, working frontend actually depends on, since that
+frontend has no login flow yet — a deliberate, disclosed interim step,
+not a claim that full enforcement is done. When a token is present, the
+request is attributed via a new `usage_logs` write (see `db/usage.py`);
+anonymous requests behave exactly as before this pass.
 """
 
 from __future__ import annotations
 
 import time
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
 from ..comparison import run_comparison, validate_provider_set
 from ..db.client import is_db_configured
 from ..db.comparisons import build_scores_record, save_comparison
 from ..db.market_data import get_or_create_instrument, get_recent_bars, insert_bars
 from ..db.signals import get_or_seed_model, save_signal
+from ..db.usage import record_usage
 from ..engine.pipeline import run_engine
 from ..errors import MarketDataUnavailableError, ProviderUnavailableError, ValidationError
 from ..indicators import generate_synthetic_ohlcv
@@ -39,6 +49,7 @@ from ..providers.circuit_breaker import CircuitBreakerOpen
 from ..providers.model_registry import configured_model_id
 from ..providers.registry import execute_provider, resolve_provider
 from ..schemas import AnalyzeRequest, ComparisonResponse, ComparisonSlotOk, TradeAnalysis, now_iso
+from ..security.dependencies import AuthenticatedUser, get_optional_user
 from ..utils import compute_freshness
 from ..verify import build_trade_analysis
 
@@ -75,7 +86,7 @@ async def get_or_refresh_bars(symbol: str):
 
 
 @router.post("/api/ai/analyze")
-async def analyze(body: AnalyzeRequest):
+async def analyze(body: AnalyzeRequest, user: AuthenticatedUser | None = Depends(get_optional_user)):
     symbol = body.symbol.upper()
     bars, instrument_id, persisted = await get_or_refresh_bars(symbol)
 
@@ -207,15 +218,24 @@ async def analyze(body: AnalyzeRequest):
         engine_warnings=engine_output.warnings,
     )
 
-    if persisted and instrument_id and analysis.status == "SETUP_FOUND":
+    if persisted and instrument_id:
         try:
             seeded = await get_or_seed_model(
                 result.provider_id, result.model_id, provider.display_name
             )
-            await save_signal(instrument_id, seeded.model_db_id, analysis)
+            if analysis.status == "SETUP_FOUND":
+                await save_signal(instrument_id, seeded.model_db_id, analysis)
+            if user is not None:
+                # Passage 1 §3's auth requirement, applied where it can be
+                # today: `/api/ai/analyze` accepts but does not require a
+                # token (see this file's module docstring). When one is
+                # present, the request is attributed here — the first
+                # write `usage_logs` has ever received.
+                await record_usage(user.id, seeded.provider_id, seeded.model_db_id)
         except Exception as err:  # noqa: BLE001
             logger.warning(
-                "Failed to persist signal (analysis still returned)", extra={"error": str(err)}
+                "Failed to persist signal/usage (analysis still returned)",
+                extra={"error": str(err)},
             )
 
     return analysis

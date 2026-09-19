@@ -23,6 +23,13 @@ called from the app that serves requests:
 * `routers.providers` — the restored `/api/ai/route` (Passage 4 §6.1 /
   G08a) and the generalised `/api/ai/providers`, `/api/ai/{id}/test`,
   `/api/ai/{id}/health` endpoints.
+* `routers.auth` — new this pass: register/login/logout/me, the
+  endpoints that make `config.AuthSettings` and `security/jwt.py` real
+  rather than unused scaffolding. `/api/ai/{id}/test` and
+  `/api/ai/{id}/health` now require the admin role; `/api/ai/route`
+  requires any authenticated user; `/api/ai/analyze` accepts but does
+  not require a token (see `routers/analyze.py`'s docstring for why
+  full enforcement there waits on a coordinated frontend phase).
 """
 
 from __future__ import annotations
@@ -34,6 +41,8 @@ from .config import load_env_files
 
 _loaded_env_files = load_env_files()
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
@@ -41,13 +50,33 @@ from .config import get_settings  # noqa: E402
 from .errors import install_error_handlers  # noqa: E402
 from .observability import RequestContextMiddleware, configure_logging, get_logger  # noqa: E402
 from .rate_limit import RateLimitMiddleware  # noqa: E402
-from .routers import analyze, comparisons, providers  # noqa: E402
+from .routers import analyze, auth, comparisons, providers  # noqa: E402
 
 settings = get_settings()
 configure_logging(level=settings.log_level, json_output=settings.log_json)
 logger = get_logger("startup")
 
-app = FastAPI(title="Oxygen AI API Gateway", version="0.2.0")
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    from .engine.native_bridge import load_native
+
+    native_status = load_native()
+    logger.info(
+        "oxygen-ai api starting",
+        extra={
+            "envFilesLoaded": _loaded_env_files,
+            "databaseConfigured": settings.database_configured,
+            "authConfigured": settings.auth.is_configured,
+            "corsAllowedOrigins": settings.cors_allowed_origins,
+            "nativeLayerAvailable": native_status.available,
+            "nativeLayerDetail": native_status.reason,
+        },
+    )
+    yield
+
+
+app = FastAPI(title="Oxygen AI API Gateway", version="0.3.0", lifespan=_lifespan)
 
 install_error_handlers(app)
 
@@ -63,23 +92,6 @@ app.add_middleware(
 )
 
 
-@app.on_event("startup")
-async def _log_startup_state() -> None:
-    from .engine.native_bridge import load_native
-
-    native_status = load_native()
-    logger.info(
-        "oxygen-ai api starting",
-        extra={
-            "envFilesLoaded": _loaded_env_files,
-            "databaseConfigured": settings.database_configured,
-            "corsAllowedOrigins": settings.cors_allowed_origins,
-            "nativeLayerAvailable": native_status.available,
-            "nativeLayerDetail": native_status.reason,
-        },
-    )
-
-
 @app.get("/health")
 async def health():
     from .db.client import is_db_configured
@@ -90,10 +102,12 @@ async def health():
         "status": "ok",
         "service": "oxygen-ai-api",
         "databaseConfigured": is_db_configured(),
+        "authConfigured": settings.auth.is_configured,
         "nativeLayerAvailable": status.available,
     }
 
 
+app.include_router(auth.router)
 app.include_router(analyze.router)
 app.include_router(comparisons.router)
 app.include_router(providers.router)

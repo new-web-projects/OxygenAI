@@ -21,15 +21,18 @@ Provider/model administrative endpoints.
                                     where a local runtime is configured
                                     (§4.4).
 
-Passage 4 §6.2 marks the test/health endpoints admin-only. Auth/RBAC is
-not yet wired into this service (tracked separately — see the delivery
-report), so these are open for now, same as every other endpoint. Not
-silently claiming an RBAC boundary that does not exist yet.
+Auth (this pass): `/route` requires any authenticated user;
+`/{id}/test` and `/{id}/health` require the admin role, per Passage 4
+§6.2's explicit "Both admin-only." `GET /providers` stays open — it
+returns configuration booleans and catalogue data (never a credential),
+and Passage 1 §10 doesn't mark it admin-only; the live frontend also
+never calls any endpoint in this router, so none of this changes
+existing behaviour for anyone using the product today.
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
 from ..errors import NotFoundError
 from ..providers.registry import (
@@ -38,6 +41,7 @@ from ..providers.registry import (
     provider_ids,
 )
 from ..schemas import HealthResponse, RouteDecisionResponse, RouteRequest, RouteResponse
+from ..security.dependencies import get_current_user, require_role
 
 router = APIRouter(prefix="/api/ai", tags=["providers"])
 
@@ -47,7 +51,7 @@ async def get_providers() -> list[dict]:
     return list_providers()
 
 
-@router.post("/route")
+@router.post("/route", dependencies=[Depends(get_current_user)])
 async def route(body: RouteRequest) -> RouteResponse:
     """
     Passage 4 §6.1 (G08a): "exposes the Provider Router's resolve() ...
@@ -84,7 +88,7 @@ async def route(body: RouteRequest) -> RouteResponse:
     return RouteResponse(mode="multi" if len(ids) > 1 else ids[0], decisions=decisions)
 
 
-@router.post("/{provider_id}/test")
+@router.post("/{provider_id}/test", dependencies=[Depends(require_role("admin"))])
 async def test_provider(provider_id: str) -> HealthResponse:
     if provider_id not in provider_ids():
         raise NotFoundError(f"Unknown provider id: {provider_id}")
@@ -100,6 +104,6 @@ async def test_provider(provider_id: str) -> HealthResponse:
     )
 
 
-@router.get("/{provider_id}/health")
+@router.get("/{provider_id}/health", dependencies=[Depends(require_role("admin"))])
 async def provider_health(provider_id: str) -> HealthResponse:
     return await test_provider(provider_id)
