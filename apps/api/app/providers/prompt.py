@@ -132,6 +132,30 @@ def _knowledge_block(context: AnalysisContext) -> str:
     return "\n".join(lines)
 
 
+def _tools_block() -> str:
+    """
+    Tool discovery — Passage 1 §4.8: "the tool registry is
+    provider-agnostic — any of Custom AI, Grok, or Gemma 4 can call the
+    same registered tools." This lists what's registered so a provider's
+    own native function-calling (Grok's Responses API, Gemma's native
+    function calling, confirmed in P1 §4.3) has something real to target
+    once wired into a multi-turn turn — not yet built in this codebase
+    (single-shot completion only, for every provider, as of this pass).
+    Informational for now; genuinely accurate about what exists and its
+    governance, not a claim that a tool call will happen this turn.
+    """
+    from ..tools.registry import get_tool_registry
+
+    tools = get_tool_registry().all()
+    if not tools:
+        return ""
+    lines = ["Tools registered in this system (informational — not callable in this turn):"]
+    for tool in tools:
+        note = f" [{tool.availability_note}]" if tool.availability_note else ""
+        lines.append(f"  - {tool.name}: {tool.description}{note}")
+    return "\n".join(lines)
+
+
 def build_prompt(context: AnalysisContext) -> str:
     regime = context.regime or {}
     sections = [
@@ -175,6 +199,10 @@ def build_prompt(context: AnalysisContext) -> str:
     knowledge_block = _knowledge_block(context)
     if knowledge_block:
         sections += ["", knowledge_block]
+
+    tools_block = _tools_block()
+    if tools_block:
+        sections += ["", tools_block]
 
     sections += [
         "",

@@ -49,6 +49,21 @@ class MockProvider:
         evidence: list[str] = []
         contradicting: list[str] = []
 
+        # Real tool call through the governed path (Passage 1 §4.8,
+        # Passage 4 §3.5/G05) — not a decorative example. This closes a
+        # genuine loop: routers/analyze.py persists the just-computed
+        # indicator bundle to technical_indicators before any provider
+        # runs, so the tool call below reads back exactly what this
+        # request itself computed. supports_tools=False above is
+        # deliberately unchanged: Grok/Gemma's own native function
+        # calling (§4.3) is what a real multi-turn agent loop would use
+        # for a provider-INITIATED call — this is the reference
+        # implementation of the same governed path, exercised end to
+        # end without needing live credentials to prove it works.
+        tool_note = await self._cross_check_via_tool_registry(context)
+        if tool_note:
+            evidence.append(tool_note)
+
         # Regime gating, mirroring what the classifier told the prompt.
         if regime == "high_volatility":
             return ProviderReasoning(
@@ -139,6 +154,36 @@ class MockProvider:
             supporting_evidence=[],
             contradicting_evidence=[f"rsi14 = {rsi14:.1f} is at an extreme"],
         )
+
+    async def _cross_check_via_tool_registry(self, context: AnalysisContext) -> str | None:
+        """
+        Calls the technical_indicator tool through the full governed
+        path (registry.execute -> permission/rate-limit/schema/timeout
+        checks -> DB-logged) rather than reading context.indicators a
+        second time by shortcut. A failure here — DB unavailable, tool
+        reports unavailable, anything at all — is swallowed and reported
+        as None: this is a cross-check that enriches the response when
+        it works, never a dependency the core reasoning needs.
+        """
+        try:
+            from ..tools.registry import get_tool_registry
+            from ..tools.schemas import ToolContext
+
+            registry = get_tool_registry()
+            outcome = await registry.execute(
+                "technical_indicator",
+                {"symbol": context.symbol},
+                ToolContext(provider_id="mock"),
+            )
+        except Exception:  # noqa: BLE001 — a cross-check must never break the core reasoning path
+            return None
+
+        if outcome.status != "ok" or not outcome.available or not outcome.output:
+            return None
+        count = len(outcome.output.get("indicators", {}))
+        if count == 0:
+            return None
+        return f"technical_indicator tool confirmed {count} persisted indicator value(s) for {context.symbol}"
 
 
 mock_provider = MockProvider()

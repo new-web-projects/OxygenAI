@@ -50,7 +50,7 @@ from .config import get_settings  # noqa: E402
 from .errors import install_error_handlers  # noqa: E402
 from .observability import RequestContextMiddleware, configure_logging, get_logger  # noqa: E402
 from .rate_limit import RateLimitMiddleware  # noqa: E402
-from .routers import analyze, auth, comparisons, providers  # noqa: E402
+from .routers import analyze, auth, comparisons, providers, tools  # noqa: E402
 
 settings = get_settings()
 configure_logging(level=settings.log_level, json_output=settings.log_json)
@@ -60,8 +60,13 @@ logger = get_logger("startup")
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     from .engine.native_bridge import load_native
+    from .tools.registry import get_tool_registry
 
     native_status = load_native()
+
+    tool_registry = get_tool_registry()
+    await tool_registry.seed_database()
+
     logger.info(
         "oxygen-ai api starting",
         extra={
@@ -71,6 +76,7 @@ async def _lifespan(app: FastAPI):
             "corsAllowedOrigins": settings.cors_allowed_origins,
             "nativeLayerAvailable": native_status.available,
             "nativeLayerDetail": native_status.reason,
+            "toolsRegistered": len(tool_registry.all()),
         },
     )
     yield
@@ -111,3 +117,4 @@ app.include_router(auth.router)
 app.include_router(analyze.router)
 app.include_router(comparisons.router)
 app.include_router(providers.router)
+app.include_router(tools.router)

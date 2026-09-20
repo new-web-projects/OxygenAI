@@ -37,6 +37,7 @@ from fastapi import APIRouter, Depends
 from ..comparison import run_comparison, validate_provider_set
 from ..db.client import is_db_configured
 from ..db.comparisons import build_scores_record, save_comparison
+from ..db.indicators_db import persist_indicator_bundle
 from ..db.market_data import get_or_create_instrument, get_recent_bars, insert_bars
 from ..db.signals import get_or_seed_model, save_signal
 from ..db.usage import record_usage
@@ -108,6 +109,17 @@ async def analyze(body: AnalyzeRequest, user: AuthenticatedUser | None = Depends
     # every slot in both modes below.
     data_timestamp = bars[-1].timestamp
     is_stale = compute_freshness(data_timestamp)
+
+    if persisted and instrument_id:
+        try:
+            # First write `technical_indicators` has ever received
+            # (Passage 4 §3.5/G05's Technical Indicator tool reads this
+            # back rather than recomputing — see db/indicators_db.py).
+            await persist_indicator_bundle(
+                instrument_id, data_timestamp, body.timeframe, engine_output.indicators
+            )
+        except Exception as err:  # noqa: BLE001 — best-effort, matches every other DB write here
+            logger.warning("Failed to persist indicators", extra={"error": str(err)})
 
     # ---- Multi-provider comparison mode ----
     if body.is_multi():
