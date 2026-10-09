@@ -50,7 +50,7 @@ from .config import get_settings  # noqa: E402
 from .errors import install_error_handlers  # noqa: E402
 from .observability import RequestContextMiddleware, configure_logging, get_logger  # noqa: E402
 from .rate_limit import RateLimitMiddleware  # noqa: E402
-from .routers import analyze, auth, comparisons, providers, tools  # noqa: E402
+from .routers import analyze, auth, comparisons, knowledge, providers, tools  # noqa: E402
 
 settings = get_settings()
 configure_logging(level=settings.log_level, json_output=settings.log_json)
@@ -118,3 +118,4 @@ app.include_router(analyze.router)
 app.include_router(comparisons.router)
 app.include_router(providers.router)
 app.include_router(tools.router)
+app.include_router(knowledge.router)

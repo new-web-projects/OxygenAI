@@ -8,6 +8,8 @@ numpy==2.2.1
 bcrypt==4.2.1
 PyJWT==2.10.1
 jsonschema==4.23.0
+pypdf==5.1.0
+python-multipart==0.0.20
 
 # dev/test only
 pytest==8.3.4

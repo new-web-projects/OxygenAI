@@ -74,7 +74,7 @@ class MockProvider:
                     "regime, stop distances widen faster than edge improves, so no "
                     "directional setup is proposed."
                 ),
-                supporting_evidence=[f"regime = {regime}"],
+                supporting_evidence=[f"regime = {regime}"] + evidence,
                 contradicting_evidence=[],
             )
 
@@ -86,7 +86,7 @@ class MockProvider:
                     "Trend is flat and/or RSI has insufficient history - no directional "
                     "edge to report."
                 ),
-                supporting_evidence=[],
+                supporting_evidence=evidence,
                 contradicting_evidence=[],
             )
 
@@ -151,7 +151,7 @@ class MockProvider:
                 "Trend direction is already extended on RSI (overbought in an uptrend, or "
                 "oversold in a downtrend) - no valid setup."
             ),
-            supporting_evidence=[],
+            supporting_evidence=evidence,
             contradicting_evidence=[f"rsi14 = {rsi14:.1f} is at an extreme"],
         )
 

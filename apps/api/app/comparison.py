@@ -106,6 +106,7 @@ async def _run_one(
     regime_info: RegimeInfo | None,
     structure_info: StructureInfo | None,
     knowledge_sources: list[str] | None,
+    knowledge_chunks: list[dict] | None = None,
 ) -> _SlotResult:
     started = time.perf_counter()
     context = AnalysisContext(
@@ -114,6 +115,7 @@ async def _run_one(
         last_bars=last_bars,
         regime=regime_info.model_dump() if regime_info else None,
         structure=structure_info.model_dump() if structure_info else None,
+        knowledge=knowledge_chunks or [],
     )
     result = await execute_provider(provider_id, context, allow_fallback=False)
     latency_ms = round((time.perf_counter() - started) * 1000, 2)
@@ -156,6 +158,7 @@ async def run_comparison(
     regime_info: RegimeInfo | None = None,
     structure_info: StructureInfo | None = None,
     knowledge_sources: list[str] | None = None,
+    knowledge_chunks: list[dict] | None = None,
 ) -> list[ComparisonSlot]:
     """
     Return type is unchanged from before this pass — `list[ComparisonSlot]`
@@ -170,6 +173,13 @@ async def run_comparison(
     existing call sites but is no longer the source of truth for model
     selection — `execute_provider` resolves the model through the
     registry itself, redirects included.
+
+    `knowledge_sources` (display strings for `TradeAnalysis.
+    knowledgeSources`) and `knowledge_chunks` (the raw retrieved chunks
+    `AnalysisContext.knowledge` carries into the prompt) are separate
+    parameters because they serve different consumers with different
+    shapes — one is response-facing summary text, the other is what a
+    provider actually reasons over.
     """
     settled = await asyncio.gather(
         *[
@@ -185,6 +195,7 @@ async def run_comparison(
                 regime_info=regime_info,
                 structure_info=structure_info,
                 knowledge_sources=knowledge_sources,
+                knowledge_chunks=knowledge_chunks,
             )
             for pid in provider_ids
         ],

@@ -238,3 +238,61 @@ async def test_mock_provider_cross_check_reports_the_persisted_indicator_count(s
             symbol,
         )
         await pool.execute("DELETE FROM market_instruments WHERE symbol = $1", symbol)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("forced_regime", ["high_volatility", "trending_up", "ranging", "unknown"])
+async def test_mock_provider_tool_evidence_survives_every_reasoning_branch(
+    seeded_registry, pool, monkeypatch, forced_regime
+):
+    """
+    Direct regression test for the bug this session's flaky-test
+    investigation actually found: three of `mock_provider.reason()`'s
+    return paths (high_volatility, flat-trend, and extended-RSI) each
+    had their own hardcoded `supporting_evidence` list that silently
+    discarded the tool cross-check note collected earlier in the same
+    call. It only showed up when a randomly-seeded synthetic symbol
+    happened to land in one of those branches — this test forces each
+    regime deterministically rather than depending on that luck.
+    """
+    import app.tools.registry as tools_registry_module
+
+    monkeypatch.setattr(tools_registry_module, "_registry", seeded_registry)
+
+    from app.db.indicators_db import persist_indicator_bundle
+    from app.db.market_data import get_or_create_instrument
+    from app.engine.pipeline import run_engine
+    from app.indicators import generate_synthetic_ohlcv
+    from app.providers.base import AnalysisContext
+    from app.providers.mock_provider import mock_provider
+
+    symbol = f"ZZT_REG_{uuid.uuid4().hex[:8].upper()}"
+    try:
+        bars = generate_synthetic_ohlcv(symbol, 90)
+        engine_output = run_engine(bars)
+        instrument_id = await get_or_create_instrument(symbol)
+        await persist_indicator_bundle(
+            instrument_id, bars[-1].timestamp, "1d", engine_output.indicators
+        )
+
+        regime_dict = engine_output.regime.model_dump()
+        regime_dict["regime"] = forced_regime  # force the branch under test
+
+        context = AnalysisContext(
+            symbol=symbol,
+            indicators=engine_output.indicators,
+            last_bars=[{"timestamp": b.timestamp, "close": b.close} for b in bars[-5:]],
+            regime=regime_dict,
+            structure=engine_output.structure.model_dump(),
+        )
+        reasoning = await mock_provider.reason(context)
+        assert any(
+            "technical_indicator tool confirmed" in e for e in reasoning.supporting_evidence
+        ), f"tool evidence missing for forced regime={forced_regime!r}: {reasoning.supporting_evidence}"
+    finally:
+        await pool.execute(
+            "DELETE FROM technical_indicators WHERE instrument_id IN "
+            "(SELECT id FROM market_instruments WHERE symbol = $1)",
+            symbol,
+        )
+        await pool.execute("DELETE FROM market_instruments WHERE symbol = $1", symbol)

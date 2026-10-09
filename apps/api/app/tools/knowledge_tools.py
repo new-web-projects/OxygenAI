@@ -2,55 +2,45 @@
 Knowledge retrieval tool — Passage 4 §3.5 (G05): "RAG query against
 knowledge_chunks / embeddings (P1 §7)."
 
-The full RAG pipeline (ingest -> chunk -> embed -> store -> retrieve ->
-rerank) is Phase 3 in the implementation plan and does not exist yet.
-Registering this tool now, with its real contract, rather than waiting
-for Phase 3 to also add the tool means: (a) the 15-tool registry is
-complete in this phase, matching G05's own count, and (b) once Phase 3
-lands, only this handler's body changes — the name, schema, and
-governance a provider already knows about stay identical.
-
-The table check below (are there any rows in knowledge_chunks at all)
-is deliberately the only thing this handler does — it does not attempt
-a partial/fake retrieval over an empty table, which would be
-indistinguishable from "your query matched nothing" and would hide the
-real reason (no ingestion pipeline exists yet) from whoever is reading
-the tool's output.
+Registered in Phase 2 as a real contract with a "not yet implemented"
+handler, exactly as that phase's own docstring said it would be:
+"once Phase 3 lands, only this handler's body changes — the name,
+schema, and governance a provider already knows about stay identical."
+This is that change — the handler now calls `rag.pipeline.retrieve`,
+the same function `routers/knowledge.py`'s search endpoint and
+`routers/analyze.py`'s knowledge-context enrichment both call, so all
+three retrieval call sites stay in sync by construction rather than by
+convention.
 """
 
 from __future__ import annotations
 
-from ..db.client import get_pool, is_db_configured
+from ..db.client import is_db_configured
+from ..rag.pipeline import retrieve
 from .schemas import ToolContext, ToolDefinition, ToolResult
 
 
 async def _knowledge_retrieval_handler(input_data: dict, context: ToolContext) -> ToolResult:
+    query = input_data["query"]
     if not is_db_configured():
         return ToolResult(
-            output={"query": input_data["query"], "results": []},
+            output={"query": query, "results": []},
             available=False,
             unavailable_reason="No database is configured — there is no knowledge base to query.",
         )
-    pool = await get_pool()
-    has_any = await pool.fetchval("SELECT 1 FROM knowledge_chunks LIMIT 1")
-    if not has_any:
+
+    top_k = int(input_data.get("topK", 5))
+    results = await retrieve(query, top_k=top_k)
+    if not results:
         return ToolResult(
-            output={"query": input_data["query"], "results": []},
+            output={"query": query, "results": []},
             available=False,
             unavailable_reason=(
-                "No knowledge has been ingested yet — the RAG ingestion pipeline "
-                "(Passage 1 §7) is not yet implemented."
+                "No knowledge has been ingested yet — upload a document via "
+                "POST /api/knowledge/upload first."
             ),
         )
-    # Reachable once Phase 3's ingestion pipeline has written rows;
-    # left as an explicit not-yet-implemented path rather than a partial
-    # retrieval implementation, since a real pgvector similarity query
-    # needs the same embedding model Phase 3 chooses for ingestion.
-    return ToolResult(
-        output={"query": input_data["query"], "results": []},
-        available=False,
-        unavailable_reason="Retrieval is not yet implemented even though chunks exist — Phase 3 work in progress.",
-    )
+    return ToolResult(output={"query": query, "results": results})
 
 
 KNOWLEDGE_RETRIEVAL_TOOL = ToolDefinition(
@@ -71,5 +61,5 @@ KNOWLEDGE_RETRIEVAL_TOOL = ToolDefinition(
     },
     handler=_knowledge_retrieval_handler,
     kind="read_only",
-    availability_note="Not yet available — RAG ingestion pipeline (Passage 1 §7) is a later implementation phase.",
+    timeout_seconds=15.0,  # embedding + vector search can run longer than the 10s default
 )

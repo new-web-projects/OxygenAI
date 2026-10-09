@@ -26,6 +26,15 @@ frontend has no login flow yet — a deliberate, disclosed interim step,
 not a claim that full enforcement is done. When a token is present, the
 request is attributed via a new `usage_logs` write (see `db/usage.py`);
 anonymous requests behave exactly as before this pass.
+
+RAG (Passage 1 §7, this pass): `AnalysisContext.knowledge` was always
+empty before this pass — the field existed but nothing ever populated
+it. Both modes now retrieve labelled knowledge chunks once per request
+(shared, the same way indicators/regime/structure are) via
+`rag.pipeline.retrieve`, gated on `AnalyzeRequest.useKnowledge` (already
+existed, was previously unused) and a configured database. A retrieval
+failure degrades to no knowledge context rather than failing the
+request, matching every other optional-enrichment path here.
 """
 
 from __future__ import annotations
@@ -49,6 +58,7 @@ from ..providers.base import AnalysisContext
 from ..providers.circuit_breaker import CircuitBreakerOpen
 from ..providers.model_registry import configured_model_id
 from ..providers.registry import execute_provider, resolve_provider
+from ..rag.pipeline import retrieve as retrieve_knowledge
 from ..schemas import AnalyzeRequest, ComparisonResponse, ComparisonSlotOk, TradeAnalysis, now_iso
 from ..security.dependencies import AuthenticatedUser, get_optional_user
 from ..utils import compute_freshness
@@ -121,6 +131,26 @@ async def analyze(body: AnalyzeRequest, user: AuthenticatedUser | None = Depends
         except Exception as err:  # noqa: BLE001 — best-effort, matches every other DB write here
             logger.warning("Failed to persist indicators", extra={"error": str(err)})
 
+    # RAG retrieval (Passage 1 §7) — fetched once, shared by every
+    # provider in both modes below, the same way indicators/regime/
+    # structure are computed once and shared. `useKnowledge` (an
+    # existing AnalyzeRequest field, previously unused — AnalysisContext.
+    # knowledge was always empty before this pass) lets a caller opt out;
+    # a missing/unconfigured database degrades to no knowledge context,
+    # never an error, matching every other optional-enrichment path here.
+    knowledge_chunks: list[dict] = []
+    knowledge_sources: list[str] = []
+    if body.useKnowledge and is_db_configured():
+        try:
+            knowledge_chunks = await retrieve_knowledge(
+                f"{symbol} trading analysis market outlook", top_k=5
+            )
+            knowledge_sources = [
+                f"{c['documentTitle']} ({c['sourceType']})" for c in knowledge_chunks
+            ]
+        except Exception as err:  # noqa: BLE001 — enrichment only, never blocks the response
+            logger.warning("Knowledge retrieval failed", extra={"error": str(err)})
+
     # ---- Multi-provider comparison mode ----
     if body.is_multi():
         provider_list = body.providers or []
@@ -141,6 +171,8 @@ async def analyze(body: AnalyzeRequest, user: AuthenticatedUser | None = Depends
             risk_settings=engine_output.risk_settings,
             regime_info=engine_output.regime,
             structure_info=engine_output.structure,
+            knowledge_sources=knowledge_sources,
+            knowledge_chunks=knowledge_chunks,
         )
         total_latency_ms = round((time.perf_counter() - started) * 1000, 2)
         provider_latencies = [
@@ -201,6 +233,7 @@ async def analyze(body: AnalyzeRequest, user: AuthenticatedUser | None = Depends
         last_bars=last_bars,
         regime=engine_output.regime.model_dump(),
         structure=engine_output.structure.model_dump(),
+        knowledge=knowledge_chunks,
     )
 
     try:
@@ -228,6 +261,7 @@ async def analyze(body: AnalyzeRequest, user: AuthenticatedUser | None = Depends
         structure=engine_output.structure,
         transport=result.source_tag,  # type: ignore[arg-type]
         engine_warnings=engine_output.warnings,
+        knowledge_sources=knowledge_sources,
     )
 
     if persisted and instrument_id:
