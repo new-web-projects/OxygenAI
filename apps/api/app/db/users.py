@@ -125,6 +125,18 @@ async def create_user(email: str, password_hash: str, role_name: str = DEFAULT_R
     )
 
 
+async def set_user_role(email: str, role_name: str) -> bool:
+    """Change a user's role by email. Returns False if no such user or role.
+    Used by the `app.cli` bootstrap commands — there is deliberately no
+    HTTP path that lets a user grant themselves a role."""
+    role_id = await get_role_id_by_name(role_name)
+    if role_id is None:
+        return False
+    pool = await get_pool()
+    result = await pool.execute("UPDATE users SET role_id = $1 WHERE email = $2", role_id, email)
+    return result != "UPDATE 0"
+
+
 async def create_session(
     user_id: str, token_hash: str, expires_at: datetime, ip: str | None, user_agent: str | None
 ) -> str:

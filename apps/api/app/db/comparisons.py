@@ -21,11 +21,19 @@ async def save_comparison(
     scores: dict,
     signal_id_by_provider: dict[str, str | None],
     model_id_by_provider: dict[str, str],
+    conversation_id: str | None = None,
 ) -> str:
+    """`conversation_id` (optional) attaches the comparison to its owner's
+    conversation — see `db/conversations.py`. None keeps the previous
+    anonymous behaviour (AUTH_REQUIRED=false local development)."""
     pool = await get_pool()
 
     comparison_row = await pool.fetchrow(
-        "INSERT INTO ai_comparisons (provider_set, scores) VALUES ($1, $2) RETURNING id",
+        """
+        INSERT INTO ai_comparisons (conversation_id, provider_set, scores)
+        VALUES ($1, $2, $3) RETURNING id
+        """,
+        conversation_id,
         json.dumps(provider_ids),
         json.dumps(scores),
     )
@@ -67,9 +75,11 @@ async def get_comparison(comparison_id: str) -> dict | None:
     # stores.
     row = await pool.fetchrow(
         """
-        SELECT ac.id, ac.provider_set, ap.name AS user_choice_provider_name, ac.user_rating
+        SELECT ac.id, ac.provider_set, ap.name AS user_choice_provider_name, ac.user_rating,
+               c.user_id AS owner_user_id
         FROM ai_comparisons ac
         LEFT JOIN ai_providers ap ON ap.id = ac.user_choice_provider_id
+        LEFT JOIN conversations c ON c.id = ac.conversation_id
         WHERE ac.id = $1
         """,
         comparison_id,
@@ -81,6 +91,8 @@ async def get_comparison(comparison_id: str) -> dict | None:
         "providerSet": json.loads(row["provider_set"]),
         "userChoiceProviderId": row["user_choice_provider_name"],
         "userRating": row["user_rating"],
+        # None for a comparison with no conversation (anonymous/dev mode).
+        "ownerUserId": str(row["owner_user_id"]) if row["owner_user_id"] else None,
     }
 
 

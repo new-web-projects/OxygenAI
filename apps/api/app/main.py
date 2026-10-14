@@ -23,13 +23,18 @@ called from the app that serves requests:
 * `routers.providers` — the restored `/api/ai/route` (Passage 4 §6.1 /
   G08a) and the generalised `/api/ai/providers`, `/api/ai/{id}/test`,
   `/api/ai/{id}/health` endpoints.
-* `routers.auth` — new this pass: register/login/logout/me, the
-  endpoints that make `config.AuthSettings` and `security/jwt.py` real
-  rather than unused scaffolding. `/api/ai/{id}/test` and
-  `/api/ai/{id}/health` now require the admin role; `/api/ai/route`
-  requires any authenticated user; `/api/ai/analyze` accepts but does
-  not require a token (see `routers/analyze.py`'s docstring for why
-  full enforcement there waits on a coordinated frontend phase).
+* `routers.auth` — register/login/logout/me, the endpoints that make
+  `config.AuthSettings` and `security/jwt.py` real rather than unused
+  scaffolding. `/api/ai/{id}/test` and `/api/ai/{id}/health` require the
+  admin role; `/api/ai/route` requires any authenticated user.
+
+Phase 1 of the Passage 1 + Passage 4 continuation (authentication and
+gateway security): `/api/ai/analyze` and the comparison-feedback endpoint
+now REQUIRE a JWT (Passage 4 §6.2) unless `AUTH_REQUIRED=false` is set
+explicitly for local development; knowledge upload/delete are admin-only
+and search/list need a login; rate-limit identity is the user (or a
+validated client IP) instead of a spoofable header; unhandled-error
+responses carry CORS headers so a browser can read the error id.
 """
 
 from __future__ import annotations
@@ -67,12 +72,24 @@ async def _lifespan(app: FastAPI):
     tool_registry = get_tool_registry()
     await tool_registry.seed_database()
 
+    if not settings.auth.auth_required:
+        logger.warning(
+            "AUTH_REQUIRED=false — /api/ai/analyze accepts anonymous requests. "
+            "Local development only; Passage 4 §6.2 requires JWT in any shared deployment."
+        )
+    elif not settings.auth.is_configured:
+        logger.warning(
+            "AUTH_REQUIRED is on but JWT_SECRET is not set — nobody can log in, so every "
+            "authenticated endpoint will return 401. Set JWT_SECRET (see apps/api/.env.example)."
+        )
+
     logger.info(
         "oxygen-ai api starting",
         extra={
             "envFilesLoaded": _loaded_env_files,
             "databaseConfigured": settings.database_configured,
             "authConfigured": settings.auth.is_configured,
+            "authRequired": settings.auth.auth_required,
             "corsAllowedOrigins": settings.cors_allowed_origins,
             "nativeLayerAvailable": native_status.available,
             "nativeLayerDetail": native_status.reason,
@@ -84,7 +101,7 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(title="Oxygen AI API Gateway", version="0.3.0", lifespan=_lifespan)
 
-install_error_handlers(app)
+install_error_handlers(app, allowed_origins=settings.cors_allowed_origins)
 
 app.add_middleware(RateLimitMiddleware, settings=settings.rate_limit)
 app.add_middleware(RequestContextMiddleware)
@@ -109,6 +126,7 @@ async def health():
         "service": "oxygen-ai-api",
         "databaseConfigured": is_db_configured(),
         "authConfigured": settings.auth.is_configured,
+        "authRequired": settings.auth.auth_required,
         "nativeLayerAvailable": status.available,
     }
 

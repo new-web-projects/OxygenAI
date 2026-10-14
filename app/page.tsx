@@ -1,7 +1,16 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
-import type { ComparisonFeedback, ComparisonResponse, ComparisonSlot, TradeAnalysis } from "@/lib/types";
+import { useEffect, useState, type FormEvent } from "react";
+import AuthPanel from "@/app/components/AuthPanel";
+import { SessionExpiredError, apiFetch, fetchHealth, fetchMe, logout } from "@/lib/api";
+import type {
+  ApiHealth,
+  AuthUser,
+  ComparisonFeedback,
+  ComparisonResponse,
+  ComparisonSlot,
+  TradeAnalysis,
+} from "@/lib/types";
 
 const COMPARABLE_PROVIDERS = [
   { id: "mock", label: "Mock" },
@@ -68,6 +77,53 @@ export default function Home() {
   const [feedbackBusy, setFeedbackBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Login gate (Passage 4 §6.2: analyze requires a JWT). "checking" while
+  // we ask the API whether auth is on and whether a stored token is still
+  // valid; "login" shows the sign-in panel; "ready" shows the app.
+  const [gate, setGate] = useState<"checking" | "login" | "ready">("checking");
+  const [health, setHealth] = useState<ApiHealth | null>(null);
+  const [user, setUser] = useState<AuthUser | null>(null);
+  const [gateNotice, setGateNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const h = await fetchHealth();
+        if (cancelled) return;
+        setHealth(h);
+        const me = await fetchMe();
+        if (cancelled) return;
+        setUser(me);
+        // AUTH_REQUIRED=false (local development) lets the app run without
+        // signing in; any stored token is still sent and honoured.
+        setGate(me || !h.authRequired ? "ready" : "login");
+      } catch (err) {
+        if (cancelled) return;
+        setGateNotice(err instanceof Error ? err.message : "Cannot reach the API");
+        setGate("login");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  function endSession(message: string | null) {
+    setUser(null);
+    setResult(null);
+    setComparison(null);
+    setFeedback(null);
+    setError(null);
+    setGateNotice(message);
+    setGate("login");
+  }
+
+  async function signOut() {
+    await logout();
+    endSession(null);
+  }
+
   function toggleCompareId(id: string) {
     setCompareIds((prev) =>
       prev.includes(id) ? prev.filter((x) => x !== id) : prev.length >= 3 ? prev : [...prev, id]
@@ -87,14 +143,12 @@ export default function Home() {
     setComparison(null);
     setFeedback(null);
     try {
-      const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
       const body =
         mode === "single"
           ? { symbol: symbol.trim(), provider: providerId }
           : { symbol: symbol.trim(), providers: compareIds };
-      const res = await fetch(`${apiBase}/api/ai/analyze`, {
+      const res = await apiFetch("/api/ai/analyze", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
       const data = await res.json();
@@ -102,7 +156,8 @@ export default function Home() {
       else if (mode === "single") setResult(data);
       else setComparison(data);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Network error");
+      if (err instanceof SessionExpiredError) endSession(err.message);
+      else setError(err instanceof Error ? err.message : "Network error");
     } finally {
       setLoading(false);
     }
@@ -112,27 +167,64 @@ export default function Home() {
     if (!comparison?.comparisonId) return;
     setFeedbackBusy(true);
     try {
-      const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
-      const res = await fetch(`${apiBase}/api/ai/comparisons/${comparison.comparisonId}`, {
+      const res = await apiFetch(`/api/ai/comparisons/${comparison.comparisonId}`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ rating, preferredProviderId }),
       });
       const data = await res.json();
       if (res.ok) setFeedback(data);
       // A failed rating/preference doesn't disturb the comparison
       // already on screen — it's a secondary action, not resubmitted.
-    } catch {
-      // Same reasoning — network hiccup on a footer action shouldn't
-      // surface as a page-level error.
+    } catch (err) {
+      // An expired session is the one failure worth surfacing: the user
+      // must sign in again. A network hiccup on a footer action is not.
+      if (err instanceof SessionExpiredError) endSession(err.message);
     } finally {
       setFeedbackBusy(false);
     }
   }
 
+  if (gate === "checking") {
+    return (
+      <main className="min-h-screen bg-[#0A0C10] px-4 py-10 text-[#E8EAED]">
+        <p className="mx-auto max-w-xl font-mono text-xs text-[#7C8591]">Connecting to the API…</p>
+      </main>
+    );
+  }
+
+  if (gate === "login") {
+    return (
+      <main className="min-h-screen bg-[#0A0C10] px-4 py-10 text-[#E8EAED]">
+        <AuthPanel
+          health={health}
+          notice={gateNotice}
+          onAuthenticated={(u) => {
+            setUser(u);
+            setGateNotice(null);
+            setGate("ready");
+          }}
+        />
+      </main>
+    );
+  }
+
   return (
     <main className="min-h-screen bg-[#0A0C10] px-4 py-10 text-[#E8EAED]">
       <div className={mode === "compare" ? "mx-auto max-w-4xl" : "mx-auto max-w-xl"}>
+        {user && (
+          <div className="mb-4 flex items-center justify-end gap-3 font-mono text-xs text-[#7C8591]">
+            <span>
+              {user.email} · {user.role}
+            </span>
+            <button
+              type="button"
+              onClick={signOut}
+              className="rounded border border-[#232830] px-2 py-1 transition hover:border-[#4FD1C5] hover:text-[#E8EAED]"
+            >
+              Sign out
+            </button>
+          </div>
+        )}
         <header className="mb-8">
           <p className="font-mono text-xs uppercase tracking-widest text-[#4FD1C5]">
             Oxygen AI — minimal slice

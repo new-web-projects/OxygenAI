@@ -70,3 +70,30 @@ never takes the others down).
 - No migration tool — `../infra/migrations/*.sql` are hand-written,
   applied directly with `psql`. Fine for now; matters once the schema
   needs to evolve with a tracked history.
+
+## Authentication (JWT is required)
+
+`POST /api/ai/analyze` and the comparison-feedback endpoint require a
+bearer token (Passage 4 §6.2). Setup, once per environment:
+
+```bash
+# 1. In apps/api/.env.local: a signing secret (never commit it) and a database
+python -c "import secrets; print(secrets.token_urlsafe(48))"   # -> JWT_SECRET=
+# DATABASE_URL=postgresql://...   (sessions live in Postgres)
+
+# 2. Apply every migration in order (0005 adds the session indexes)
+for f in ../../infra/migrations/000*.sql; do psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"; done
+
+# 3. Create the first admin — registration only ever yields the `user` role
+python -m app.cli create-admin --email you@example.com      # prompts for the password
+python -m app.cli set-role --email someone@example.com --role admin
+```
+
+Roles: `admin` can upload/delete knowledge documents, call provider
+`/test` and `/health`, and use the tool endpoints; any signed-in user can
+analyse, search/list knowledge, and rate their own comparisons.
+
+`AUTH_REQUIRED=false` re-enables anonymous analysis for local development
+only (the API logs a warning at startup). Behind a reverse proxy set
+`TRUSTED_PROXY_COUNT` (and start uvicorn with `--no-proxy-headers`) so rate
+limits key off the real client address — see `app/security/network.py`.

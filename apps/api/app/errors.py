@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Sequence
 from typing import Any
 
 from fastapi import FastAPI, Request, status
@@ -122,7 +123,33 @@ def error_body(
     return body
 
 
-def install_error_handlers(app: FastAPI) -> None:
+def _cross_origin_headers(request: Request, allowed_origins: Sequence[str] | None) -> dict[str, str]:
+    """
+    Headers a browser needs in order to READ an error response.
+
+    Starlette routes `Exception` (i.e. every genuinely unhandled error)
+    to ServerErrorMiddleware, which sits OUTSIDE `CORSMiddleware`, so
+    those responses used to carry no `Access-Control-Allow-Origin` at all
+    (reproduced: a handled 429/400 had the header, a forced 500 did not).
+    The browser then reports an opaque "Failed to fetch" and the error id
+    in the body — the one thing a user is told to quote — is unreadable.
+    The request id is attached for the same reason: the access-log line
+    for a 500 is written by a middleware that is skipped on this path.
+    """
+    headers: dict[str, str] = {}
+    request_id = getattr(request.state, "request_id", None)
+    if request_id:
+        headers["X-Request-Id"] = str(request_id)
+    origin = request.headers.get("origin")
+    if origin and allowed_origins and ("*" in allowed_origins or origin in allowed_origins):
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Access-Control-Allow-Credentials"] = "true"
+        headers["Access-Control-Expose-Headers"] = "X-Request-Id, X-Response-Time-Ms"
+        headers["Vary"] = "Origin"
+    return headers
+
+
+def install_error_handlers(app: FastAPI, allowed_origins: Sequence[str] | None = None) -> None:
     @app.exception_handler(ApiError)
     async def _api_error(request: Request, exc: ApiError) -> JSONResponse:
         return JSONResponse(
@@ -160,6 +187,7 @@ def install_error_handlers(app: FastAPI) -> None:
                 content=error_body(
                     "One or more identifiers in the request are malformed.", "invalid_request"
                 ),
+                headers=_cross_origin_headers(request, allowed_origins),
             )
         error_id = uuid.uuid4().hex[:12]
         logger.exception(
@@ -173,6 +201,7 @@ def install_error_handlers(app: FastAPI) -> None:
                 "internal_error",
                 error_id=error_id,
             ),
+            headers=_cross_origin_headers(request, allowed_origins),
         )
 
 

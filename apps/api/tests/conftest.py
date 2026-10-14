@@ -27,7 +27,18 @@ necessarily expecting to need this.
 
 from __future__ import annotations
 
+import os
+
 import pytest
+
+# The in-process ASGI test transport has no real peer address, so every
+# request in the suite would share a single "ip:unknown" rate-limit bucket
+# and the (deliberately tight) credential-endpoint limit would trip across
+# unrelated tests. Rate limiting is therefore off for the suite by default
+# and is covered directly by tests/test_gateway_security.py, which builds
+# its own app around `RateLimitMiddleware` with explicit settings. Must be
+# set before `app.main` is first imported (it captures settings at import).
+os.environ.setdefault("RATE_LIMIT_ENABLED", "false")
 
 from app.providers.circuit_breaker import reset_circuit_breakers_for_tests
 

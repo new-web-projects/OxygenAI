@@ -68,3 +68,26 @@ export interface ComparisonFeedback {
   userChoiceProviderId: string | null;
   userRating: number | null;
 }
+
+// Passage 4 §6.2: authentication is required. Shapes mirror the API's
+// `TokenResponse` / `UserResponse` (apps/api/app/schemas.py).
+export interface AuthUser {
+  id: string;
+  email: string;
+  role: string;
+  status: string;
+}
+
+export interface AuthTokenResponse {
+  accessToken: string;
+  tokenType: "bearer";
+  expiresIn: number;
+  user: AuthUser;
+}
+
+// Subset of GET /health the login gate needs.
+export interface ApiHealth {
+  status: string;
+  authConfigured: boolean;
+  authRequired: boolean;
+}

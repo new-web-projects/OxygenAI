@@ -15,6 +15,8 @@ Phase-1 item in this pass (admin gating) depends on it existing.
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 from fastapi import APIRouter, Depends, Request
 
 from ..config import get_settings
@@ -22,12 +24,28 @@ from ..db.users import EmailAlreadyRegisteredError, create_session, create_user,
 from ..errors import ConfigurationError, UnauthorizedError, ValidationError
 from ..observability import get_logger
 from ..schemas import LoginRequest, RegisterRequest, TokenResponse, UserResponse
-from ..security.dependencies import AuthenticatedUser, client_ip, get_current_user
+from ..security.dependencies import (
+    AuthenticatedUser,
+    bearer_token_from_request,
+    client_ip,
+    get_current_user,
+)
 from ..security.jwt import create_access_token, token_hash_for
 from ..security.passwords import hash_password, verify_password
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 logger = get_logger("routers.auth")
+
+
+@lru_cache(maxsize=1)
+def _timing_decoy_hash() -> str:
+    """
+    A real bcrypt hash of a throwaway string, computed once. Login for an
+    unknown email verifies against it so that path costs the same bcrypt
+    time as a wrong-password path — otherwise response time alone reveals
+    which emails are registered, even though the 401 bodies are identical.
+    """
+    return hash_password("oxygen-ai-timing-decoy-not-a-real-password")
 
 
 def _require_auth_configured() -> None:
@@ -71,9 +89,12 @@ async def login(body: LoginRequest, request: Request) -> TokenResponse:
     _require_auth_configured()
     email = body.email.strip().lower()
     user = await get_user_by_email(email)
-    # Constant-shape failure: a nonexistent user and a wrong password
-    # both produce the identical 401 — never reveal which one it was.
-    if user is None or user.status != "active" or not verify_password(body.password, user.password_hash):
+    # Constant-shape AND constant-time failure: a nonexistent user, an
+    # inactive user and a wrong password all produce the identical 401 and
+    # all pay one bcrypt verification — never reveal which one it was.
+    stored_hash = user.password_hash if user is not None else _timing_decoy_hash()
+    password_ok = verify_password(body.password, stored_hash)
+    if user is None or user.status != "active" or not password_ok:
         raise UnauthorizedError("Incorrect email or password")
     logger.info("user logged in", extra={"userId": user.id})
     return await _issue_token(user.id, user.email, user.role_name, request)
@@ -83,8 +104,7 @@ async def login(body: LoginRequest, request: Request) -> TokenResponse:
 async def logout(request: Request, user: AuthenticatedUser = Depends(get_current_user)) -> dict:
     from ..db.users import delete_session_by_hash
 
-    auth_header = request.headers.get("authorization", "")
-    token = auth_header.removeprefix("Bearer ").strip()
+    token = bearer_token_from_request(request)
     if token:
         await delete_session_by_hash(token_hash_for(token))
     return {"ok": True}

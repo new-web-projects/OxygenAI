@@ -2,13 +2,19 @@
 Knowledge endpoints - the "Knowledge" category Passage 4 section 6.3
 (G13) names among the 19 required endpoint categories.
 
-Upload requires authentication (any authenticated user, attributed via
-`uploaded_by`) since it's a mutating, shared-resource action - every
-uploaded document feeds every future analysis's RAG context, not just
-the uploader's own. Search stays open: it's read-only, and
+Authorization (Passage 1 §8: knowledge memory is retained "until admin
+deletes" — i.e. it is an admin-curated store):
+
+* Upload (text and file) and delete require the `admin` role. Every
+  document feeds EVERY user's future analysis prompts, so letting any
+  self-registered account add or remove documents would let one user
+  poison, or erase, the context all others reason over.
+* Search and list require authentication (any role): they are read-only,
+  but search spends embedding-provider quota and the document list is
+  not public information.
+
 `routers/analyze.py` calls the same underlying `rag.pipeline.retrieve`
-function internally regardless of whether the request itself is
-authenticated.
+function internally on behalf of the already-authenticated caller.
 """
 
 from __future__ import annotations
@@ -19,7 +25,7 @@ from ..errors import NotFoundError, ValidationError
 from ..rag.chunking import UnsupportedFileTypeError, extract_text
 from ..rag.pipeline import ingest_text, retrieve
 from ..schemas import KnowledgeChunkResponse, KnowledgeSearchRequest, KnowledgeUploadRequest
-from ..security.dependencies import AuthenticatedUser, get_current_user
+from ..security.dependencies import AuthenticatedUser, get_current_user, require_role
 
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
 
@@ -31,7 +37,7 @@ MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 @router.post("/upload")
 async def upload_text(
-    body: KnowledgeUploadRequest, user: AuthenticatedUser = Depends(get_current_user)
+    body: KnowledgeUploadRequest, user: AuthenticatedUser = Depends(require_role("admin"))
 ) -> dict:
     result = await ingest_text(body.title, body.content, body.sourceType, uploaded_by=user.id)
     return {
@@ -46,7 +52,7 @@ async def upload_file(
     title: str = Form(...),
     sourceType: str = Form("knowledge"),
     file: UploadFile = File(...),
-    user: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(require_role("admin")),
 ) -> dict:
     raw = await file.read()
     if len(raw) > MAX_UPLOAD_BYTES:
@@ -66,7 +72,9 @@ async def upload_file(
 
 
 @router.post("/search")
-async def search(body: KnowledgeSearchRequest) -> list[KnowledgeChunkResponse]:
+async def search(
+    body: KnowledgeSearchRequest, user: AuthenticatedUser = Depends(get_current_user)
+) -> list[KnowledgeChunkResponse]:
     hits = await retrieve(body.query, top_k=body.topK)
     return [
         KnowledgeChunkResponse(
@@ -83,7 +91,9 @@ async def search(body: KnowledgeSearchRequest) -> list[KnowledgeChunkResponse]:
 
 
 @router.get("/documents")
-async def list_knowledge_documents() -> list[dict]:
+async def list_knowledge_documents(
+    user: AuthenticatedUser = Depends(get_current_user),
+) -> list[dict]:
     from ..db.knowledge import list_documents
 
     return await list_documents()
@@ -91,7 +101,7 @@ async def list_knowledge_documents() -> list[dict]:
 
 @router.delete("/documents/{document_id}")
 async def delete_knowledge_document(
-    document_id: str, user: AuthenticatedUser = Depends(get_current_user)
+    document_id: str, user: AuthenticatedUser = Depends(require_role("admin"))
 ) -> dict:
     from ..db.knowledge import delete_document
 

@@ -7,17 +7,22 @@ this is why that endpoint now returns comparisonId.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from ..db.client import is_db_configured
 from ..db.comparisons import get_comparison, get_provider_db_id_by_name, update_comparison_feedback
 from ..schemas import ComparisonFeedback, RateComparisonRequest
+from ..security.dependencies import AuthenticatedUser, get_analysis_user
 
 router = APIRouter()
 
 
 @router.patch("/api/ai/comparisons/{comparison_id}")
-async def rate_comparison(comparison_id: str, body: RateComparisonRequest) -> ComparisonFeedback:
+async def rate_comparison(
+    comparison_id: str,
+    body: RateComparisonRequest,
+    user: AuthenticatedUser | None = Depends(get_analysis_user),
+) -> ComparisonFeedback:
     if not is_db_configured():
         raise HTTPException(
             status_code=503, detail="Ratings require a database — DATABASE_URL is not set"
@@ -27,6 +32,14 @@ async def rate_comparison(comparison_id: str, body: RateComparisonRequest) -> Co
 
     existing = await get_comparison(comparison_id)
     if existing is None:
+        raise HTTPException(status_code=404, detail="No comparison found with that id")
+
+    # Ownership (Passage 1 §3: auth + role boundaries). A comparison that
+    # has an owner can be rated/preferred only by that owner or an admin.
+    # A non-owner gets the same 404 as a missing id so the endpoint can't
+    # be used to probe which comparison ids exist.
+    owner = existing.get("ownerUserId")
+    if owner is not None and (user is None or (user.id != owner and user.role != "admin")):
         raise HTTPException(status_code=404, detail="No comparison found with that id")
 
     preferred_db_id = None

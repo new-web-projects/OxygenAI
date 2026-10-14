@@ -229,12 +229,48 @@ async def test_route_endpoint_requires_authentication_but_not_admin(client, pool
 
 
 @pytest.mark.asyncio
-async def test_analyze_endpoint_still_works_with_no_token_at_all(client):
-    """The compatibility guarantee this whole design exists to preserve:
-    the live frontend's one real endpoint must keep working anonymously."""
+async def test_analyze_endpoint_requires_a_token_by_default(client):
+    """Passage 4 §6.2 (G08b): POST /api/ai/analyze is "Auth: required (JWT)".
+
+    This replaces the previous pass's pin
+    (`..._still_works_with_no_token_at_all`), which existed only because
+    the frontend had no login flow yet. That flow now ships
+    (app/components/AuthPanel.tsx), so the interim compatibility
+    guarantee is retired on purpose rather than quietly deleted.
+    """
+    resp = await client.post("/api/ai/analyze", json={"symbol": "ZZTESTAUTH", "provider": "mock"})
+    assert resp.status_code == 401
+    assert resp.json()["code"] == "unauthorized"
+
+
+@pytest.mark.asyncio
+async def test_analyze_endpoint_is_anonymous_only_when_auth_is_explicitly_disabled(client, monkeypatch):
+    """AUTH_REQUIRED=false is the explicit local-development escape hatch."""
+    monkeypatch.setenv("AUTH_REQUIRED", "false")
+    from app.config import get_settings
+
+    get_settings(refresh=True)
     resp = await client.post("/api/ai/analyze", json={"symbol": "ZZTESTAUTH", "provider": "mock"})
     assert resp.status_code == 200
     assert resp.json()["status"] in ("SETUP_FOUND", "NO_VALID_SETUP")
+
+
+@pytest.mark.asyncio
+async def test_analyze_succeeds_with_a_valid_token(client, pool):
+    email = _unique_email()
+    try:
+        registered = await client.post(
+            "/api/auth/register", json={"email": email, "password": "correct-horse-battery-staple"}
+        )
+        token = registered.json()["accessToken"]
+        resp = await client.post(
+            "/api/ai/analyze",
+            json={"symbol": "ZZTESTAUTH", "provider": "mock"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+    finally:
+        await _cleanup(pool, email)
 
 
 @pytest.mark.asyncio

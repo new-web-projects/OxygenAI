@@ -18,14 +18,14 @@ configured_model_id`, which is registry-aware (Grok's retired-slug
 redirects, §3.2/G02) rather than the router's own hardcoded per-provider
 defaults from before this pass.
 
-Auth (this pass): accepts but does not require a bearer token
-(`security.dependencies.get_optional_user`). Passage 4 §6.2 states
-analyze requires JWT; making it mandatory here today would break the
-one endpoint the live, working frontend actually depends on, since that
-frontend has no login flow yet — a deliberate, disclosed interim step,
-not a claim that full enforcement is done. When a token is present, the
-request is attributed via a new `usage_logs` write (see `db/usage.py`);
-anonymous requests behave exactly as before this pass.
+Auth: JWT is REQUIRED (Passage 4 §6.2 / G08b) via
+`security.dependencies.get_analysis_user`; the interim "optional token"
+behaviour of the earlier pass is retired now that the frontend ships a
+login flow. `AUTH_REQUIRED=false` restores anonymous access explicitly
+for local development. The authenticated user is attributed via a
+`usage_logs` write (see `db/usage.py`), and a multi-provider comparison is
+attached to one of that user's conversations so only they (or an admin)
+can rate it.
 
 RAG (Passage 1 §7, this pass): `AnalysisContext.knowledge` was always
 empty before this pass — the field existed but nothing ever populated
@@ -46,6 +46,7 @@ from fastapi import APIRouter, Depends
 from ..comparison import run_comparison, validate_provider_set
 from ..db.client import is_db_configured
 from ..db.comparisons import build_scores_record, save_comparison
+from ..db.conversations import create_conversation
 from ..db.indicators_db import persist_indicator_bundle
 from ..db.market_data import get_or_create_instrument, get_recent_bars, insert_bars
 from ..db.signals import get_or_seed_model, save_signal
@@ -60,7 +61,7 @@ from ..providers.model_registry import configured_model_id
 from ..providers.registry import execute_provider, resolve_provider
 from ..rag.pipeline import retrieve as retrieve_knowledge
 from ..schemas import AnalyzeRequest, ComparisonResponse, ComparisonSlotOk, TradeAnalysis, now_iso
-from ..security.dependencies import AuthenticatedUser, get_optional_user
+from ..security.dependencies import AuthenticatedUser, get_analysis_user
 from ..utils import compute_freshness
 from ..verify import build_trade_analysis
 
@@ -97,7 +98,7 @@ async def get_or_refresh_bars(symbol: str):
 
 
 @router.post("/api/ai/analyze")
-async def analyze(body: AnalyzeRequest, user: AuthenticatedUser | None = Depends(get_optional_user)):
+async def analyze(body: AnalyzeRequest, user: AuthenticatedUser | None = Depends(get_analysis_user)):
     symbol = body.symbol.upper()
     bars, instrument_id, persisted = await get_or_refresh_bars(symbol)
 
@@ -197,11 +198,18 @@ async def analyze(body: AnalyzeRequest, user: AuthenticatedUser | None = Depends
                         )
                     else:
                         signal_id_by_provider[slot.providerId] = None
+                # An authenticated user's comparison hangs off one of
+                # their conversations, which is what lets the feedback
+                # endpoint restrict rating/preference to its owner.
+                conversation_id = (
+                    await create_conversation(user.id, "multi") if user is not None else None
+                )
                 comparison_id = await save_comparison(
                     provider_list,
                     build_scores_record(results),
                     signal_id_by_provider,
                     model_id_by_provider,
+                    conversation_id=conversation_id,
                 )
             except Exception as err:  # noqa: BLE001
                 # The comparison result itself is still valid and already

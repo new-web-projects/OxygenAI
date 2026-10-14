@@ -152,6 +152,12 @@ class AuthSettings:
     access_token_ttl_seconds: int = field(
         default_factory=lambda: _env_int("ACCESS_TOKEN_TTL_SECONDS", 3600)
     )
+    # Passage 4 §6.2 (G08b): POST /api/ai/analyze "Auth: required (JWT)".
+    # Enforced by default. AUTH_REQUIRED=false is an explicit local-dev
+    # escape hatch (e.g. running the demo with no database), logged as a
+    # warning at startup — never the silent default.
+    auth_required: bool = field(default_factory=lambda: _env_bool("AUTH_REQUIRED", True))
+
     # When no JWT_SECRET is configured the API refuses to mint tokens
     # rather than falling back to a baked-in development key.
     @property
@@ -167,6 +173,10 @@ class RateLimitSettings:
     analyze_per_minute: int = field(default_factory=lambda: _env_int("RATE_LIMIT_ANALYZE", 30))
     default_per_minute: int = field(default_factory=lambda: _env_int("RATE_LIMIT_DEFAULT", 120))
     admin_per_minute: int = field(default_factory=lambda: _env_int("RATE_LIMIT_ADMIN", 60))
+    # Credential endpoints (login/register) get their own, much tighter
+    # bucket: bcrypt verification is deliberately slow, and these are the
+    # endpoints a password-guessing client would hammer.
+    auth_per_minute: int = field(default_factory=lambda: _env_int("RATE_LIMIT_AUTH", 10))
 
 
 @dataclass(frozen=True)
@@ -182,6 +192,11 @@ class Settings:
         default_factory=lambda: _env_float("PROVIDER_TIMEOUT_SECONDS", 30.0)
     )
     provider_retry_count: int = field(default_factory=lambda: _env_int("PROVIDER_RETRY_COUNT", 2))
+    # How many reverse proxies sit in front of this API and append to
+    # X-Forwarded-For. 0 (default) means X-Forwarded-For is IGNORED and the
+    # socket peer address is used — a client-supplied header must never
+    # decide rate-limit identity. Set to 1 behind a single nginx/ALB/etc.
+    trusted_proxy_count: int = field(default_factory=lambda: _env_int("TRUSTED_PROXY_COUNT", 0))
     # Passage 1 §5: the native layer is always present as a boundary, but
     # a missing/unbuilt binary degrades performance, never correctness.
     native_enabled: bool = field(default_factory=lambda: _env_bool("NATIVE_ENABLED", True))

@@ -1,24 +1,27 @@
 """
 FastAPI dependencies for authentication and RBAC.
 
-Two current-user dependencies, deliberately different failure modes:
+Three current-user dependencies, deliberately different failure modes:
 
-* `get_current_user` — REQUIRED. No/invalid/expired/revoked token → 401.
-  Used on admin-only endpoints (provider test, models CRUD).
-* `get_optional_user` — OPTIONAL. No/invalid token → returns None, the
-  request proceeds anonymously. Used on `/api/ai/analyze` so a request
-  is attributed to a user when a token is present, without requiring
-  one — the live frontend has no login flow yet, and forcing auth here
-  would break the one endpoint every existing user actually depends on.
-  Passage 4 §6.2 states analyze requires JWT; this is a deliberate,
-  disclosed interim step toward that, not a claim that it's already
-  enforced — see the delivery notes for why full enforcement waits on a
-  coordinated frontend login phase.
+* `get_current_user` — REQUIRED. No/invalid/expired/revoked token → 401;
+  auth backend (database) unreachable → 503. Used on admin endpoints and
+  every user-scoped endpoint.
+* `get_optional_user` — OPTIONAL. No/invalid token → None and the request
+  proceeds anonymously. If the auth backend is unreachable it ALSO
+  degrades to anonymous (previously it surfaced as a 500: a validly
+  signed token plus a database outage broke an endpoint documented as
+  "optional auth").
+* `get_analysis_user` — the policy dependency for the analysis surface
+  (`POST /api/ai/analyze`, comparison feedback). Passage 4 §6.2 (G08b)
+  states analyze is "Auth: required (JWT)", so this is `get_current_user`
+  unless `AUTH_REQUIRED=false` is set explicitly for local development,
+  in which case it is `get_optional_user`. The interim "accept but do not
+  require a token" behaviour of the previous pass is therefore retired:
+  the frontend now ships a login flow (see `app/components/AuthPanel.tsx`).
 
-Both verify the JWT itself (signature, expiry, issuer) AND that a
-matching `sessions` row still exists and hasn't expired — a token whose
-session was deleted (logout) stops working immediately, not just when
-the JWT's own expiry eventually arrives.
+All verify the JWT (signature, expiry, issuer) AND that a matching
+`sessions` row still exists — logout revokes a token immediately, not at
+its natural expiry.
 """
 
 from __future__ import annotations
@@ -28,14 +31,26 @@ from dataclasses import dataclass
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from ..config import get_settings
 from ..db.users import UserRecord, get_permissions_for_role, get_user_by_id, session_is_valid
-from ..errors import ForbiddenError, UnauthorizedError
+from ..errors import ApiError, ForbiddenError, UnauthorizedError
 from ..observability import get_logger
 from .jwt import TokenError, decode_access_token, token_hash_for
+from .network import client_ip  # noqa: F401 — re-exported; auth.py and older imports use this path
 
 logger = get_logger("security")
 
+# FastAPI's HTTPBearer matches the scheme case-insensitively ("Bearer",
+# "bearer", "BEARER"), so every token-reading site must too — see
+# `bearer_token_from_request`.
 _bearer_optional = HTTPBearer(auto_error=False)
+
+
+class AuthBackendUnavailableError(ApiError):
+    """The session/user store could not be reached — not the caller's fault."""
+
+    status_code = 503
+    code = "auth_unavailable"
 
 
 @dataclass(frozen=True)
@@ -46,18 +61,44 @@ class AuthenticatedUser:
     status: str
 
 
+def bearer_token_from_request(request: Request) -> str:
+    """
+    Extract the bearer token the same way `HTTPBearer` does: scheme
+    compared case-insensitively. `logout` previously used
+    `removeprefix("Bearer ")`, so `Authorization: bearer <token>` was
+    accepted for authentication but silently failed to revoke the
+    session — logout returned 200 and the token kept working.
+    """
+    header = request.headers.get("authorization", "")
+    scheme, _, token = header.partition(" ")
+    if scheme.lower() != "bearer":
+        return ""
+    return token.strip()
+
+
 async def _resolve(token: str) -> AuthenticatedUser | None:
+    """
+    Returns the user, or None for any rejection (bad/expired/revoked
+    token, inactive user). Raises AuthBackendUnavailableError only when
+    the session/user store itself fails.
+    """
     try:
         claims = decode_access_token(token)
     except TokenError as err:
         logger.info("token rejected", extra={"reason": str(err)})
         return None
 
-    if not await session_is_valid(token_hash_for(token)):
-        logger.info("token valid but session was revoked or expired", extra={"jti": claims.jti})
-        return None
+    try:
+        if not await session_is_valid(token_hash_for(token)):
+            logger.info("token valid but session was revoked or expired", extra={"jti": claims.jti})
+            return None
+        user = await get_user_by_id(claims.user_id)
+    except Exception as err:  # noqa: BLE001 — any store failure is "backend unavailable"
+        logger.warning("auth backend unavailable", extra={"error": str(err)})
+        raise AuthBackendUnavailableError(
+            "Authentication service is temporarily unavailable"
+        ) from err
 
-    user = await get_user_by_id(claims.user_id)
     if user is None or user.status != "active":
         return None
 
@@ -69,7 +110,12 @@ async def get_optional_user(
 ) -> AuthenticatedUser | None:
     if credentials is None or not credentials.credentials:
         return None
-    return await _resolve(credentials.credentials)
+    try:
+        return await _resolve(credentials.credentials)
+    except AuthBackendUnavailableError:
+        # Optional means optional: an unreachable store must not turn an
+        # anonymous-capable endpoint into an error.
+        return None
 
 
 async def get_current_user(
@@ -81,6 +127,15 @@ async def get_current_user(
     if user is None:
         raise UnauthorizedError("Invalid, expired, or revoked token")
     return user
+
+
+async def get_analysis_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_optional),
+) -> AuthenticatedUser | None:
+    """Policy dependency: JWT required unless AUTH_REQUIRED=false (dev only)."""
+    if get_settings().auth.auth_required:
+        return await get_current_user(credentials)
+    return await get_optional_user(credentials)
 
 
 def require_role(*allowed_roles: str):
@@ -117,10 +172,3 @@ def require_permission(resource: str, action: str):
         return user
 
     return _check
-
-
-def client_ip(request: Request) -> str | None:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else None

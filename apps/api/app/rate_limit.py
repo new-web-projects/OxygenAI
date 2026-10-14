@@ -3,11 +3,28 @@ Rate limiting — Passage 4 §6.2 (G08b): "Rate limit: per-plan, e.g.
 30/min" on POST /api/ai/analyze, with the broader per-plan concept
 extending to every route.
 
-In-process token buckets, keyed by client IP. This is the same
-documented limitation as the circuit breaker (`providers/circuit_breaker.py`):
-correct and sufficient for a single API instance; a multi-instance
-deployment would need this state in Redis (Passage 1 §3 lists Redis for
-exactly this). Flagged rather than silently assumed to scale.
+In-process token buckets. This is the same documented limitation as the
+circuit breaker (`providers/circuit_breaker.py`): correct and sufficient
+for a single API instance; a multi-instance deployment needs this state
+in Redis (Passage 1 §3 lists Redis for exactly this — the Redis phase of
+the implementation plan swaps the bucket storage behind this middleware).
+
+Bucket identity (Phase 1 hardening; each defect reproduced before fixing):
+
+* Authenticated requests are keyed per USER (validly signed, unexpired
+  bearer token — signature/expiry only, no database hit; revocation is the
+  auth dependency's job). "Per-plan" limits therefore follow the account,
+  not the network path.
+* Anonymous requests are keyed by `security.network.client_ip`, which
+  honours X-Forwarded-For only for `TRUSTED_PROXY_COUNT` proxies. The old
+  key was the first X-Forwarded-For value, which any client can rotate —
+  8 of 8 requests passed a 5/min limit that way.
+* Credential endpoints (login/register) have their own tighter bucket
+  (`RATE_LIMIT_AUTH`); the provider `/test` and `/health` probes (which
+  spend provider tokens) now land in the admin bucket — the old prefix
+  match only covered `/api/ai/models` and `/api/ai/route`.
+* Idle buckets are pruned, so the table no longer gains one entry per
+  distinct client for the life of the process.
 
 A 429 carries a `Retry-After` header and the standard error body, so a
 rate-limited client can back off correctly rather than hammering the
@@ -16,6 +33,7 @@ endpoint.
 
 from __future__ import annotations
 
+import re
 import time
 from collections import defaultdict
 from typing import Awaitable, Callable
@@ -27,8 +45,14 @@ from starlette.responses import JSONResponse, Response
 from .config import RateLimitSettings, get_settings
 from .errors import error_body
 from .observability import get_logger
+from .security.jwt import TokenError, decode_access_token
+from .security.network import client_ip
 
 logger = get_logger("rate_limit")
+
+_PROVIDER_PROBE = re.compile(r"^/api/ai/[^/]+/(test|health)$")
+_PRUNE_INTERVAL_SECONDS = 300.0
+_IDLE_SECONDS = 600.0
 
 
 class _TokenBucket:
@@ -54,20 +78,29 @@ class _TokenBucket:
 
 def _limit_for_path(path: str, settings: RateLimitSettings) -> tuple[str, int]:
     """Returns (bucket_name, requests_per_minute) for a request path."""
+    if path in ("/api/auth/login", "/api/auth/register"):
+        return "auth", settings.auth_per_minute
     if path.startswith("/api/ai/analyze"):
         return "analyze", settings.analyze_per_minute
-    if path.startswith("/api/ai/models") or path.startswith("/api/ai/route"):
+    if (
+        path.startswith("/api/ai/models")
+        or path.startswith("/api/ai/route")
+        or _PROVIDER_PROBE.match(path)
+    ):
         return "admin", settings.admin_per_minute
     return "default", settings.default_per_minute
 
 
 def _client_key(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    if request.client:
-        return request.client.host
-    return "unknown"
+    """`user:<id>` for a valid bearer token, otherwise `ip:<addr>`."""
+    header = request.headers.get("authorization", "")
+    scheme, _, token = header.partition(" ")
+    if scheme.lower() == "bearer" and token.strip():
+        try:
+            return f"user:{decode_access_token(token.strip()).user_id}"
+        except TokenError:
+            pass  # a garbage token buys no extra identity — fall back to the IP
+    return f"ip:{client_ip(request) or 'unknown'}"
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -75,6 +108,15 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
         self._settings = settings or get_settings().rate_limit
         self._buckets: dict[tuple[str, str], _TokenBucket] = {}
+        self._last_prune = time.monotonic()
+
+    def _prune(self, now: float) -> None:
+        if now - self._last_prune < _PRUNE_INTERVAL_SECONDS:
+            return
+        self._last_prune = now
+        stale = [k for k, b in self._buckets.items() if now - b.last_refill > _IDLE_SECONDS]
+        for key in stale:
+            del self._buckets[key]
 
     def _bucket_for(self, key: str, name: str, per_minute: int) -> _TokenBucket:
         bucket_key = (key, name)
@@ -95,8 +137,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         client_key = _client_key(request)
+        now = time.monotonic()
+        self._prune(now)
         bucket = self._bucket_for(client_key, name, per_minute)
-        allowed, retry_after = bucket.try_consume(time.monotonic())
+        allowed, retry_after = bucket.try_consume(now)
 
         if not allowed:
             logger.info(

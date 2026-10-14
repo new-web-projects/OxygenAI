@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:client": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test lib/api.test.mjs"
   },
   "dependencies": {
     "next": "^14.2.5",

@@ -88,35 +88,40 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         token = request_id_var.set(request_id)
         request.state.request_id = request_id
         started = time.perf_counter()
+        # The request-id context variable must stay set until the access
+        # log line has been emitted. It used to be reset in a `finally`
+        # that ran BEFORE that line, so every "request" log entry carried
+        # requestId "-" regardless of the id the client sent.
         try:
-            response = await call_next(request)
-        except Exception:
+            try:
+                response = await call_next(request)
+            except Exception:
+                elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+                self.logger.exception(
+                    "request failed",
+                    extra={
+                        "method": request.method,
+                        "path": request.url.path,
+                        "latencyMs": elapsed_ms,
+                    },
+                )
+                raise
             elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
-            self.logger.exception(
-                "request failed",
+            response.headers["X-Request-Id"] = request_id
+            response.headers["X-Response-Time-Ms"] = str(elapsed_ms)
+            log = self.logger.info if response.status_code < 500 else self.logger.error
+            log(
+                "request",
                 extra={
                     "method": request.method,
                     "path": request.url.path,
+                    "status": response.status_code,
                     "latencyMs": elapsed_ms,
                 },
             )
-            raise
+            return response
         finally:
             request_id_var.reset(token)
-        elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
-        response.headers["X-Request-Id"] = request_id
-        response.headers["X-Response-Time-Ms"] = str(elapsed_ms)
-        log = self.logger.info if response.status_code < 500 else self.logger.error
-        log(
-            "request",
-            extra={
-                "method": request.method,
-                "path": request.url.path,
-                "status": response.status_code,
-                "latencyMs": elapsed_ms,
-            },
-        )
-        return response
 
 
 def get_logger(name: str) -> logging.Logger:
