@@ -1,0 +1,3133 @@
+diff --git a/app/components/AuthPanel.tsx b/app/components/AuthPanel.tsx
+new file mode 100644
+index 0000000..b8c2690
+--- /dev/null
++++ b/app/components/AuthPanel.tsx
+@@ -0,0 +1,108 @@
++"use client";
++
++import { useState, type FormEvent } from "react";
++import { authenticate } from "@/lib/api";
++import type { ApiHealth, AuthUser } from "@/lib/types";
++
++const MIN_PASSWORD_LENGTH = 12; // mirrors RegisterRequest on the API
++
++interface Props {
++  health: ApiHealth | null;
++  notice?: string | null;
++  onAuthenticated: (user: AuthUser) => void;
++}
++
++export default function AuthPanel({ health, notice, onAuthenticated }: Props) {
++  const [kind, setKind] = useState<"login" | "register">("login");
++  const [email, setEmail] = useState("");
++  const [password, setPassword] = useState("");
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++
++  const unavailable = health !== null && !health.authConfigured;
++
++  async function submit(e: FormEvent) {
++    e.preventDefault();
++    if (busy) return;
++    if (kind === "register" && password.length < MIN_PASSWORD_LENGTH) {
++      setError(`Use at least ${MIN_PASSWORD_LENGTH} characters for the password`);
++      return;
++    }
++    setBusy(true);
++    setError(null);
++    try {
++      onAuthenticated(await authenticate(kind, email.trim(), password));
++    } catch (err) {
++      setError(err instanceof Error ? err.message : "Network error");
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  return (
++    <div className="mx-auto max-w-sm">
++      <header className="mb-6">
++        <p className="font-mono text-xs uppercase tracking-widest text-[#4FD1C5]">Oxygen AI</p>
++        <h1 className="mt-1 text-2xl font-semibold">
++          {kind === "login" ? "Sign in" : "Create an account"}
++        </h1>
++        <p className="mt-2 text-sm text-[#7C8591]">
++          Analyses are attributed to your account and rate-limited per user.
++        </p>
++      </header>
++
++      {notice && (
++        <p className="mb-4 rounded-md border border-[#3a3320] bg-[#1c1a12] px-3 py-2 text-sm text-[#E8C26A]">
++          {notice}
++        </p>
++      )}
++      {unavailable && (
++        <p className="mb-4 rounded-md border border-[#3a2022] bg-[#1c1214] px-3 py-2 text-sm text-[#F28B82]">
++          This server has no JWT_SECRET configured, so sign-in is unavailable. Set it in
++          apps/api/.env.local (see apps/api/.env.example) and restart the API.
++        </p>
++      )}
++
++      <form onSubmit={submit} className="flex flex-col gap-3">
++        <input
++          type="email"
++          required
++          autoComplete="email"
++          value={email}
++          onChange={(e) => setEmail(e.target.value)}
++          placeholder="Email"
++          className="rounded-md border border-[#232830] bg-[#12151B] px-3 py-2 text-sm outline-none focus:border-[#4FD1C5] focus:ring-1 focus:ring-[#4FD1C5]"
++        />
++        <input
++          type="password"
++          required
++          autoComplete={kind === "login" ? "current-password" : "new-password"}
++          value={password}
++          onChange={(e) => setPassword(e.target.value)}
++          placeholder={kind === "register" ? `Password (min ${MIN_PASSWORD_LENGTH} characters)` : "Password"}
++          className="rounded-md border border-[#232830] bg-[#12151B] px-3 py-2 text-sm outline-none focus:border-[#4FD1C5] focus:ring-1 focus:ring-[#4FD1C5]"
++        />
++        <button
++          type="submit"
++          disabled={busy || unavailable}
++          className="rounded-md bg-[#4FD1C5] px-4 py-2 text-sm font-medium text-[#0A0C10] transition disabled:cursor-not-allowed disabled:opacity-50"
++        >
++          {busy ? "Please wait…" : kind === "login" ? "Sign in" : "Register"}
++        </button>
++      </form>
++
++      {error && <p className="mt-3 text-sm text-[#F28B82]">{error}</p>}
++
++      <button
++        type="button"
++        onClick={() => {
++          setKind(kind === "login" ? "register" : "login");
++          setError(null);
++        }}
++        className="mt-4 text-sm text-[#7C8591] underline-offset-2 hover:text-[#E8EAED] hover:underline"
++      >
++        {kind === "login" ? "No account yet? Register" : "Already registered? Sign in"}
++      </button>
++    </div>
++  );
++}
+diff --git a/app/page.tsx b/app/page.tsx
+index 4e3910f..f59537b 100644
+--- a/app/page.tsx
++++ b/app/page.tsx
+@@ -1,7 +1,16 @@
+ "use client";
+ 
+-import { useState, type FormEvent } from "react";
+-import type { ComparisonFeedback, ComparisonResponse, ComparisonSlot, TradeAnalysis } from "@/lib/types";
++import { useEffect, useState, type FormEvent } from "react";
++import AuthPanel from "@/app/components/AuthPanel";
++import { SessionExpiredError, apiFetch, fetchHealth, fetchMe, logout } from "@/lib/api";
++import type {
++  ApiHealth,
++  AuthUser,
++  ComparisonFeedback,
++  ComparisonResponse,
++  ComparisonSlot,
++  TradeAnalysis,
++} from "@/lib/types";
+ 
+ const COMPARABLE_PROVIDERS = [
+   { id: "mock", label: "Mock" },
+@@ -68,6 +77,53 @@ export default function Home() {
+   const [feedbackBusy, setFeedbackBusy] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+ 
++  // Login gate (Passage 4 §6.2: analyze requires a JWT). "checking" while
++  // we ask the API whether auth is on and whether a stored token is still
++  // valid; "login" shows the sign-in panel; "ready" shows the app.
++  const [gate, setGate] = useState<"checking" | "login" | "ready">("checking");
++  const [health, setHealth] = useState<ApiHealth | null>(null);
++  const [user, setUser] = useState<AuthUser | null>(null);
++  const [gateNotice, setGateNotice] = useState<string | null>(null);
++
++  useEffect(() => {
++    let cancelled = false;
++    (async () => {
++      try {
++        const h = await fetchHealth();
++        if (cancelled) return;
++        setHealth(h);
++        const me = await fetchMe();
++        if (cancelled) return;
++        setUser(me);
++        // AUTH_REQUIRED=false (local development) lets the app run without
++        // signing in; any stored token is still sent and honoured.
++        setGate(me || !h.authRequired ? "ready" : "login");
++      } catch (err) {
++        if (cancelled) return;
++        setGateNotice(err instanceof Error ? err.message : "Cannot reach the API");
++        setGate("login");
++      }
++    })();
++    return () => {
++      cancelled = true;
++    };
++  }, []);
++
++  function endSession(message: string | null) {
++    setUser(null);
++    setResult(null);
++    setComparison(null);
++    setFeedback(null);
++    setError(null);
++    setGateNotice(message);
++    setGate("login");
++  }
++
++  async function signOut() {
++    await logout();
++    endSession(null);
++  }
++
+   function toggleCompareId(id: string) {
+     setCompareIds((prev) =>
+       prev.includes(id) ? prev.filter((x) => x !== id) : prev.length >= 3 ? prev : [...prev, id]
+@@ -87,14 +143,12 @@ export default function Home() {
+     setComparison(null);
+     setFeedback(null);
+     try {
+-      const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
+       const body =
+         mode === "single"
+           ? { symbol: symbol.trim(), provider: providerId }
+           : { symbol: symbol.trim(), providers: compareIds };
+-      const res = await fetch(`${apiBase}/api/ai/analyze`, {
++      const res = await apiFetch("/api/ai/analyze", {
+         method: "POST",
+-        headers: { "Content-Type": "application/json" },
+         body: JSON.stringify(body),
+       });
+       const data = await res.json();
+@@ -102,7 +156,8 @@ export default function Home() {
+       else if (mode === "single") setResult(data);
+       else setComparison(data);
+     } catch (err) {
+-      setError(err instanceof Error ? err.message : "Network error");
++      if (err instanceof SessionExpiredError) endSession(err.message);
++      else setError(err instanceof Error ? err.message : "Network error");
+     } finally {
+       setLoading(false);
+     }
+@@ -112,27 +167,64 @@ export default function Home() {
+     if (!comparison?.comparisonId) return;
+     setFeedbackBusy(true);
+     try {
+-      const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
+-      const res = await fetch(`${apiBase}/api/ai/comparisons/${comparison.comparisonId}`, {
++      const res = await apiFetch(`/api/ai/comparisons/${comparison.comparisonId}`, {
+         method: "PATCH",
+-        headers: { "Content-Type": "application/json" },
+         body: JSON.stringify({ rating, preferredProviderId }),
+       });
+       const data = await res.json();
+       if (res.ok) setFeedback(data);
+       // A failed rating/preference doesn't disturb the comparison
+       // already on screen — it's a secondary action, not resubmitted.
+-    } catch {
+-      // Same reasoning — network hiccup on a footer action shouldn't
+-      // surface as a page-level error.
++    } catch (err) {
++      // An expired session is the one failure worth surfacing: the user
++      // must sign in again. A network hiccup on a footer action is not.
++      if (err instanceof SessionExpiredError) endSession(err.message);
+     } finally {
+       setFeedbackBusy(false);
+     }
+   }
+ 
++  if (gate === "checking") {
++    return (
++      <main className="min-h-screen bg-[#0A0C10] px-4 py-10 text-[#E8EAED]">
++        <p className="mx-auto max-w-xl font-mono text-xs text-[#7C8591]">Connecting to the API…</p>
++      </main>
++    );
++  }
++
++  if (gate === "login") {
++    return (
++      <main className="min-h-screen bg-[#0A0C10] px-4 py-10 text-[#E8EAED]">
++        <AuthPanel
++          health={health}
++          notice={gateNotice}
++          onAuthenticated={(u) => {
++            setUser(u);
++            setGateNotice(null);
++            setGate("ready");
++          }}
++        />
++      </main>
++    );
++  }
++
+   return (
+     <main className="min-h-screen bg-[#0A0C10] px-4 py-10 text-[#E8EAED]">
+       <div className={mode === "compare" ? "mx-auto max-w-4xl" : "mx-auto max-w-xl"}>
++        {user && (
++          <div className="mb-4 flex items-center justify-end gap-3 font-mono text-xs text-[#7C8591]">
++            <span>
++              {user.email} · {user.role}
++            </span>
++            <button
++              type="button"
++              onClick={signOut}
++              className="rounded border border-[#232830] px-2 py-1 transition hover:border-[#4FD1C5] hover:text-[#E8EAED]"
++            >
++              Sign out
++            </button>
++          </div>
++        )}
+         <header className="mb-8">
+           <p className="font-mono text-xs uppercase tracking-widest text-[#4FD1C5]">
+             Oxygen AI — minimal slice
+diff --git a/apps/api/.env.example b/apps/api/.env.example
+index e920c12..2224167 100644
+--- a/apps/api/.env.example
++++ b/apps/api/.env.example
+@@ -5,11 +5,31 @@ CORS_ALLOWED_ORIGINS=http://localhost:3000
+ # nothing persists, but it still works.
+ DATABASE_URL=
+ 
++# Required for login. Generate one, e.g.: python -c "import secrets; print(secrets.token_urlsafe(48))"
++# Never commit a real value.
+ JWT_SECRET=
+ 
+ JWT_ISSUER=oxygen-ai
+ ACCESS_TOKEN_TTL_SECONDS=3600
+ 
++# Passage 4 §6.2: /api/ai/analyze requires a JWT. Leave true (the default)
++# for anything but local development; false re-enables anonymous access and
++# the API logs a warning at startup. Create the first admin with:
++#   python -m app.cli create-admin --email you@example.com
++AUTH_REQUIRED=true
++
++# Number of reverse proxies in front of the API that append to
++# X-Forwarded-For (0 = ignore the header, use the socket address).
++# Rate limits and session IPs are keyed off this — see app/security/network.py.
++# Behind a proxy, set this (and start uvicorn with --no-proxy-headers so this
++# setting is the single authority); if you leave it 0 behind a proxy that does
++# not preserve the client address, every client shares one rate-limit bucket.
++TRUSTED_PROXY_COUNT=0
++
++# Optional per-minute overrides (defaults shown).
++# RATE_LIMIT_ANALYZE=30
++# RATE_LIMIT_AUTH=10
++
+ # Optional. Without these, the app falls back to the offline Mock
+ # provider for that provider id -- nothing breaks if you leave them blank.
+ 
+diff --git a/apps/api/README.md b/apps/api/README.md
+index 73002fa..f5f4c85 100644
+--- a/apps/api/README.md
++++ b/apps/api/README.md
+@@ -70,3 +70,30 @@ never takes the others down).
+ - No migration tool — `../infra/migrations/*.sql` are hand-written,
+   applied directly with `psql`. Fine for now; matters once the schema
+   needs to evolve with a tracked history.
++
++## Authentication (JWT is required)
++
++`POST /api/ai/analyze` and the comparison-feedback endpoint require a
++bearer token (Passage 4 §6.2). Setup, once per environment:
++
++```bash
++# 1. In apps/api/.env.local: a signing secret (never commit it) and a database
++python -c "import secrets; print(secrets.token_urlsafe(48))"   # -> JWT_SECRET=
++# DATABASE_URL=postgresql://...   (sessions live in Postgres)
++
++# 2. Apply every migration in order (0005 adds the session indexes)
++for f in ../../infra/migrations/000*.sql; do psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"; done
++
++# 3. Create the first admin — registration only ever yields the `user` role
++python -m app.cli create-admin --email you@example.com      # prompts for the password
++python -m app.cli set-role --email someone@example.com --role admin
++```
++
++Roles: `admin` can upload/delete knowledge documents, call provider
++`/test` and `/health`, and use the tool endpoints; any signed-in user can
++analyse, search/list knowledge, and rate their own comparisons.
++
++`AUTH_REQUIRED=false` re-enables anonymous analysis for local development
++only (the API logs a warning at startup). Behind a reverse proxy set
++`TRUSTED_PROXY_COUNT` (and start uvicorn with `--no-proxy-headers`) so rate
++limits key off the real client address — see `app/security/network.py`.
+diff --git a/apps/api/app/cli.py b/apps/api/app/cli.py
+new file mode 100644
+index 0000000..6bce881
+--- /dev/null
++++ b/apps/api/app/cli.py
+@@ -0,0 +1,101 @@
++"""
++Operator commands — the only supported way to create or promote an admin.
++
++Why this exists: registration always yields the `user` role (there is
++deliberately no HTTP route that grants a role), and migration 0004 seeds
++the `admin` role but no admin account. Before this module the admin-only
++endpoints (provider test/health, knowledge upload/delete) were
++unreachable on a fresh install short of hand-written SQL.
++
++    python -m app.cli create-admin --email you@example.com
++    python -m app.cli set-role --email you@example.com --role admin
++
++The password is read from an interactive prompt (or, for scripted use,
++one line on stdin with --password-stdin). It is never accepted as a
++command-line argument — arguments land in shell history and `ps`.
++Requires DATABASE_URL (read from the same .env files the API uses).
++"""
++
++from __future__ import annotations
++
++import argparse
++import asyncio
++import getpass
++import sys
++
++from .config import load_env_files
++
++MIN_PASSWORD_LENGTH = 12  # mirrors schemas.RegisterRequest
++
++
++def _read_password(from_stdin: bool) -> str:
++    if from_stdin:
++        password = sys.stdin.readline().rstrip("\r\n")
++    else:
++        password = getpass.getpass("Password (min 12 characters): ")
++        if password != getpass.getpass("Repeat password: "):
++            raise SystemExit("Passwords do not match.")
++    if len(password) < MIN_PASSWORD_LENGTH:
++        raise SystemExit(f"Password must be at least {MIN_PASSWORD_LENGTH} characters.")
++    return password
++
++
++async def _create_admin(email: str, password: str) -> str:
++    from .db.client import close_pool
++    from .db.users import create_user, get_user_by_email, set_user_role
++    from .security.passwords import hash_password
++
++    email = email.strip().lower()
++    try:
++        existing = await get_user_by_email(email)
++        if existing is not None:
++            await set_user_role(email, "admin")
++            return f"User {email} already existed — role set to admin (password unchanged)."
++        await create_user(email, hash_password(password), role_name="admin")
++        return f"Admin account created for {email}."
++    finally:
++        await close_pool()
++
++
++async def _set_role(email: str, role: str) -> str:
++    from .db.client import close_pool
++    from .db.users import set_user_role
++
++    try:
++        ok = await set_user_role(email.strip().lower(), role)
++    finally:
++        await close_pool()
++    return f"{email} is now '{role}'." if ok else f"No such user '{email}' or role '{role}' — nothing changed."
++
++
++def main(argv: list[str] | None = None) -> int:
++    load_env_files()
++    parser = argparse.ArgumentParser(prog="python -m app.cli", description=__doc__.split("\n\n")[0])
++    sub = parser.add_subparsers(dest="command", required=True)
++
++    create = sub.add_parser("create-admin", help="Create an admin account, or promote an existing user")
++    create.add_argument("--email", required=True)
++    create.add_argument("--password-stdin", action="store_true", help="Read the password from one line of stdin")
++
++    role = sub.add_parser("set-role", help="Set an existing user's role")
++    role.add_argument("--email", required=True)
++    role.add_argument("--role", required=True, choices=["admin", "user"])
++
++    args = parser.parse_args(argv)
++
++    from .db.client import is_db_configured
++
++    if not is_db_configured():
++        print("DATABASE_URL is not set — nothing to do.", file=sys.stderr)
++        return 2
++
++    if args.command == "create-admin":
++        message = asyncio.run(_create_admin(args.email, _read_password(args.password_stdin)))
++    else:
++        message = asyncio.run(_set_role(args.email, args.role))
++    print(message)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/apps/api/app/config.py b/apps/api/app/config.py
+index 26b5430..a9fae5b 100644
+--- a/apps/api/app/config.py
++++ b/apps/api/app/config.py
+@@ -152,6 +152,12 @@ class AuthSettings:
+     access_token_ttl_seconds: int = field(
+         default_factory=lambda: _env_int("ACCESS_TOKEN_TTL_SECONDS", 3600)
+     )
++    # Passage 4 §6.2 (G08b): POST /api/ai/analyze "Auth: required (JWT)".
++    # Enforced by default. AUTH_REQUIRED=false is an explicit local-dev
++    # escape hatch (e.g. running the demo with no database), logged as a
++    # warning at startup — never the silent default.
++    auth_required: bool = field(default_factory=lambda: _env_bool("AUTH_REQUIRED", True))
++
+     # When no JWT_SECRET is configured the API refuses to mint tokens
+     # rather than falling back to a baked-in development key.
+     @property
+@@ -167,6 +173,10 @@ class RateLimitSettings:
+     analyze_per_minute: int = field(default_factory=lambda: _env_int("RATE_LIMIT_ANALYZE", 30))
+     default_per_minute: int = field(default_factory=lambda: _env_int("RATE_LIMIT_DEFAULT", 120))
+     admin_per_minute: int = field(default_factory=lambda: _env_int("RATE_LIMIT_ADMIN", 60))
++    # Credential endpoints (login/register) get their own, much tighter
++    # bucket: bcrypt verification is deliberately slow, and these are the
++    # endpoints a password-guessing client would hammer.
++    auth_per_minute: int = field(default_factory=lambda: _env_int("RATE_LIMIT_AUTH", 10))
+ 
+ 
+ @dataclass(frozen=True)
+@@ -182,6 +192,11 @@ class Settings:
+         default_factory=lambda: _env_float("PROVIDER_TIMEOUT_SECONDS", 30.0)
+     )
+     provider_retry_count: int = field(default_factory=lambda: _env_int("PROVIDER_RETRY_COUNT", 2))
++    # How many reverse proxies sit in front of this API and append to
++    # X-Forwarded-For. 0 (default) means X-Forwarded-For is IGNORED and the
++    # socket peer address is used — a client-supplied header must never
++    # decide rate-limit identity. Set to 1 behind a single nginx/ALB/etc.
++    trusted_proxy_count: int = field(default_factory=lambda: _env_int("TRUSTED_PROXY_COUNT", 0))
+     # Passage 1 §5: the native layer is always present as a boundary, but
+     # a missing/unbuilt binary degrades performance, never correctness.
+     native_enabled: bool = field(default_factory=lambda: _env_bool("NATIVE_ENABLED", True))
+diff --git a/apps/api/app/db/comparisons.py b/apps/api/app/db/comparisons.py
+index b28faab..ee8104d 100644
+--- a/apps/api/app/db/comparisons.py
++++ b/apps/api/app/db/comparisons.py
+@@ -21,11 +21,19 @@ async def save_comparison(
+     scores: dict,
+     signal_id_by_provider: dict[str, str | None],
+     model_id_by_provider: dict[str, str],
++    conversation_id: str | None = None,
+ ) -> str:
++    """`conversation_id` (optional) attaches the comparison to its owner's
++    conversation — see `db/conversations.py`. None keeps the previous
++    anonymous behaviour (AUTH_REQUIRED=false local development)."""
+     pool = await get_pool()
+ 
+     comparison_row = await pool.fetchrow(
+-        "INSERT INTO ai_comparisons (provider_set, scores) VALUES ($1, $2) RETURNING id",
++        """
++        INSERT INTO ai_comparisons (conversation_id, provider_set, scores)
++        VALUES ($1, $2, $3) RETURNING id
++        """,
++        conversation_id,
+         json.dumps(provider_ids),
+         json.dumps(scores),
+     )
+@@ -67,9 +75,11 @@ async def get_comparison(comparison_id: str) -> dict | None:
+     # stores.
+     row = await pool.fetchrow(
+         """
+-        SELECT ac.id, ac.provider_set, ap.name AS user_choice_provider_name, ac.user_rating
++        SELECT ac.id, ac.provider_set, ap.name AS user_choice_provider_name, ac.user_rating,
++               c.user_id AS owner_user_id
+         FROM ai_comparisons ac
+         LEFT JOIN ai_providers ap ON ap.id = ac.user_choice_provider_id
++        LEFT JOIN conversations c ON c.id = ac.conversation_id
+         WHERE ac.id = $1
+         """,
+         comparison_id,
+@@ -81,6 +91,8 @@ async def get_comparison(comparison_id: str) -> dict | None:
+         "providerSet": json.loads(row["provider_set"]),
+         "userChoiceProviderId": row["user_choice_provider_name"],
+         "userRating": row["user_rating"],
++        # None for a comparison with no conversation (anonymous/dev mode).
++        "ownerUserId": str(row["owner_user_id"]) if row["owner_user_id"] else None,
+     }
+ 
+ 
+diff --git a/apps/api/app/db/conversations.py b/apps/api/app/db/conversations.py
+new file mode 100644
+index 0000000..702f8d0
+--- /dev/null
++++ b/apps/api/app/db/conversations.py
+@@ -0,0 +1,30 @@
++"""
++Conversations — reads and writes the `conversations` table (Passage 4
++§5.2/G12: `conversations(id, user_id, mode, created_at)`), which existed
++in the schema but had no application code.
++
++First owner of the table is comparison feedback authorization: a
++multi-provider comparison run by an authenticated user is attached to a
++conversation, and `ai_comparisons.conversation_id` then answers "whose
++comparison is this?" so a rating/preference can only be written by its
++owner (or an admin). The WebSocket and memory phases build on the same
++table for conversation/channel isolation rather than introducing a
++second ownership concept.
++"""
++
++from __future__ import annotations
++
++from .client import get_pool
++
++VALID_MODES = ("custom", "grok", "gemma", "multi")
++
++
++async def create_conversation(user_id: str, mode: str) -> str:
++    if mode not in VALID_MODES:
++        raise ValueError(f"Invalid conversation mode '{mode}' — expected one of {VALID_MODES}")
++    pool = await get_pool()
++    row = await pool.fetchrow(
++        "INSERT INTO conversations (user_id, mode) VALUES ($1, $2) RETURNING id", user_id, mode
++    )
++    assert row is not None
++    return str(row["id"])
+diff --git a/apps/api/app/db/users.py b/apps/api/app/db/users.py
+index d322089..cb603cf 100644
+--- a/apps/api/app/db/users.py
++++ b/apps/api/app/db/users.py
+@@ -125,6 +125,18 @@ async def create_user(email: str, password_hash: str, role_name: str = DEFAULT_R
+     )
+ 
+ 
++async def set_user_role(email: str, role_name: str) -> bool:
++    """Change a user's role by email. Returns False if no such user or role.
++    Used by the `app.cli` bootstrap commands — there is deliberately no
++    HTTP path that lets a user grant themselves a role."""
++    role_id = await get_role_id_by_name(role_name)
++    if role_id is None:
++        return False
++    pool = await get_pool()
++    result = await pool.execute("UPDATE users SET role_id = $1 WHERE email = $2", role_id, email)
++    return result != "UPDATE 0"
++
++
+ async def create_session(
+     user_id: str, token_hash: str, expires_at: datetime, ip: str | None, user_agent: str | None
+ ) -> str:
+diff --git a/apps/api/app/errors.py b/apps/api/app/errors.py
+index d2e3a8f..0b118e4 100644
+--- a/apps/api/app/errors.py
++++ b/apps/api/app/errors.py
+@@ -22,6 +22,7 @@ from __future__ import annotations
+ 
+ import logging
+ import uuid
++from collections.abc import Sequence
+ from typing import Any
+ 
+ from fastapi import FastAPI, Request, status
+@@ -122,7 +123,33 @@ def error_body(
+     return body
+ 
+ 
+-def install_error_handlers(app: FastAPI) -> None:
++def _cross_origin_headers(request: Request, allowed_origins: Sequence[str] | None) -> dict[str, str]:
++    """
++    Headers a browser needs in order to READ an error response.
++
++    Starlette routes `Exception` (i.e. every genuinely unhandled error)
++    to ServerErrorMiddleware, which sits OUTSIDE `CORSMiddleware`, so
++    those responses used to carry no `Access-Control-Allow-Origin` at all
++    (reproduced: a handled 429/400 had the header, a forced 500 did not).
++    The browser then reports an opaque "Failed to fetch" and the error id
++    in the body — the one thing a user is told to quote — is unreadable.
++    The request id is attached for the same reason: the access-log line
++    for a 500 is written by a middleware that is skipped on this path.
++    """
++    headers: dict[str, str] = {}
++    request_id = getattr(request.state, "request_id", None)
++    if request_id:
++        headers["X-Request-Id"] = str(request_id)
++    origin = request.headers.get("origin")
++    if origin and allowed_origins and ("*" in allowed_origins or origin in allowed_origins):
++        headers["Access-Control-Allow-Origin"] = origin
++        headers["Access-Control-Allow-Credentials"] = "true"
++        headers["Access-Control-Expose-Headers"] = "X-Request-Id, X-Response-Time-Ms"
++        headers["Vary"] = "Origin"
++    return headers
++
++
++def install_error_handlers(app: FastAPI, allowed_origins: Sequence[str] | None = None) -> None:
+     @app.exception_handler(ApiError)
+     async def _api_error(request: Request, exc: ApiError) -> JSONResponse:
+         return JSONResponse(
+@@ -160,6 +187,7 @@ def install_error_handlers(app: FastAPI) -> None:
+                 content=error_body(
+                     "One or more identifiers in the request are malformed.", "invalid_request"
+                 ),
++                headers=_cross_origin_headers(request, allowed_origins),
+             )
+         error_id = uuid.uuid4().hex[:12]
+         logger.exception(
+@@ -173,6 +201,7 @@ def install_error_handlers(app: FastAPI) -> None:
+                 "internal_error",
+                 error_id=error_id,
+             ),
++            headers=_cross_origin_headers(request, allowed_origins),
+         )
+ 
+ 
+diff --git a/apps/api/app/main.py b/apps/api/app/main.py
+index b21ede7..e747649 100644
+--- a/apps/api/app/main.py
++++ b/apps/api/app/main.py
+@@ -23,13 +23,18 @@ called from the app that serves requests:
+ * `routers.providers` — the restored `/api/ai/route` (Passage 4 §6.1 /
+   G08a) and the generalised `/api/ai/providers`, `/api/ai/{id}/test`,
+   `/api/ai/{id}/health` endpoints.
+-* `routers.auth` — new this pass: register/login/logout/me, the
+-  endpoints that make `config.AuthSettings` and `security/jwt.py` real
+-  rather than unused scaffolding. `/api/ai/{id}/test` and
+-  `/api/ai/{id}/health` now require the admin role; `/api/ai/route`
+-  requires any authenticated user; `/api/ai/analyze` accepts but does
+-  not require a token (see `routers/analyze.py`'s docstring for why
+-  full enforcement there waits on a coordinated frontend phase).
++* `routers.auth` — register/login/logout/me, the endpoints that make
++  `config.AuthSettings` and `security/jwt.py` real rather than unused
++  scaffolding. `/api/ai/{id}/test` and `/api/ai/{id}/health` require the
++  admin role; `/api/ai/route` requires any authenticated user.
++
++Phase 1 of the Passage 1 + Passage 4 continuation (authentication and
++gateway security): `/api/ai/analyze` and the comparison-feedback endpoint
++now REQUIRE a JWT (Passage 4 §6.2) unless `AUTH_REQUIRED=false` is set
++explicitly for local development; knowledge upload/delete are admin-only
++and search/list need a login; rate-limit identity is the user (or a
++validated client IP) instead of a spoofable header; unhandled-error
++responses carry CORS headers so a browser can read the error id.
+ """
+ 
+ from __future__ import annotations
+@@ -67,12 +72,24 @@ async def _lifespan(app: FastAPI):
+     tool_registry = get_tool_registry()
+     await tool_registry.seed_database()
+ 
++    if not settings.auth.auth_required:
++        logger.warning(
++            "AUTH_REQUIRED=false — /api/ai/analyze accepts anonymous requests. "
++            "Local development only; Passage 4 §6.2 requires JWT in any shared deployment."
++        )
++    elif not settings.auth.is_configured:
++        logger.warning(
++            "AUTH_REQUIRED is on but JWT_SECRET is not set — nobody can log in, so every "
++            "authenticated endpoint will return 401. Set JWT_SECRET (see apps/api/.env.example)."
++        )
++
+     logger.info(
+         "oxygen-ai api starting",
+         extra={
+             "envFilesLoaded": _loaded_env_files,
+             "databaseConfigured": settings.database_configured,
+             "authConfigured": settings.auth.is_configured,
++            "authRequired": settings.auth.auth_required,
+             "corsAllowedOrigins": settings.cors_allowed_origins,
+             "nativeLayerAvailable": native_status.available,
+             "nativeLayerDetail": native_status.reason,
+@@ -84,7 +101,7 @@ async def _lifespan(app: FastAPI):
+ 
+ app = FastAPI(title="Oxygen AI API Gateway", version="0.3.0", lifespan=_lifespan)
+ 
+-install_error_handlers(app)
++install_error_handlers(app, allowed_origins=settings.cors_allowed_origins)
+ 
+ app.add_middleware(RateLimitMiddleware, settings=settings.rate_limit)
+ app.add_middleware(RequestContextMiddleware)
+@@ -109,6 +126,7 @@ async def health():
+         "service": "oxygen-ai-api",
+         "databaseConfigured": is_db_configured(),
+         "authConfigured": settings.auth.is_configured,
++        "authRequired": settings.auth.auth_required,
+         "nativeLayerAvailable": status.available,
+     }
+ 
+diff --git a/apps/api/app/observability.py b/apps/api/app/observability.py
+index 6aad083..6f1626b 100644
+--- a/apps/api/app/observability.py
++++ b/apps/api/app/observability.py
+@@ -88,35 +88,40 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
+         token = request_id_var.set(request_id)
+         request.state.request_id = request_id
+         started = time.perf_counter()
++        # The request-id context variable must stay set until the access
++        # log line has been emitted. It used to be reset in a `finally`
++        # that ran BEFORE that line, so every "request" log entry carried
++        # requestId "-" regardless of the id the client sent.
+         try:
+-            response = await call_next(request)
+-        except Exception:
++            try:
++                response = await call_next(request)
++            except Exception:
++                elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
++                self.logger.exception(
++                    "request failed",
++                    extra={
++                        "method": request.method,
++                        "path": request.url.path,
++                        "latencyMs": elapsed_ms,
++                    },
++                )
++                raise
+             elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+-            self.logger.exception(
+-                "request failed",
++            response.headers["X-Request-Id"] = request_id
++            response.headers["X-Response-Time-Ms"] = str(elapsed_ms)
++            log = self.logger.info if response.status_code < 500 else self.logger.error
++            log(
++                "request",
+                 extra={
+                     "method": request.method,
+                     "path": request.url.path,
++                    "status": response.status_code,
+                     "latencyMs": elapsed_ms,
+                 },
+             )
+-            raise
++            return response
+         finally:
+             request_id_var.reset(token)
+-        elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+-        response.headers["X-Request-Id"] = request_id
+-        response.headers["X-Response-Time-Ms"] = str(elapsed_ms)
+-        log = self.logger.info if response.status_code < 500 else self.logger.error
+-        log(
+-            "request",
+-            extra={
+-                "method": request.method,
+-                "path": request.url.path,
+-                "status": response.status_code,
+-                "latencyMs": elapsed_ms,
+-            },
+-        )
+-        return response
+ 
+ 
+ def get_logger(name: str) -> logging.Logger:
+diff --git a/apps/api/app/rate_limit.py b/apps/api/app/rate_limit.py
+index 784e8dc..93eafff 100644
+--- a/apps/api/app/rate_limit.py
++++ b/apps/api/app/rate_limit.py
+@@ -3,11 +3,28 @@ Rate limiting — Passage 4 §6.2 (G08b): "Rate limit: per-plan, e.g.
+ 30/min" on POST /api/ai/analyze, with the broader per-plan concept
+ extending to every route.
+ 
+-In-process token buckets, keyed by client IP. This is the same
+-documented limitation as the circuit breaker (`providers/circuit_breaker.py`):
+-correct and sufficient for a single API instance; a multi-instance
+-deployment would need this state in Redis (Passage 1 §3 lists Redis for
+-exactly this). Flagged rather than silently assumed to scale.
++In-process token buckets. This is the same documented limitation as the
++circuit breaker (`providers/circuit_breaker.py`): correct and sufficient
++for a single API instance; a multi-instance deployment needs this state
++in Redis (Passage 1 §3 lists Redis for exactly this — the Redis phase of
++the implementation plan swaps the bucket storage behind this middleware).
++
++Bucket identity (Phase 1 hardening; each defect reproduced before fixing):
++
++* Authenticated requests are keyed per USER (validly signed, unexpired
++  bearer token — signature/expiry only, no database hit; revocation is the
++  auth dependency's job). "Per-plan" limits therefore follow the account,
++  not the network path.
++* Anonymous requests are keyed by `security.network.client_ip`, which
++  honours X-Forwarded-For only for `TRUSTED_PROXY_COUNT` proxies. The old
++  key was the first X-Forwarded-For value, which any client can rotate —
++  8 of 8 requests passed a 5/min limit that way.
++* Credential endpoints (login/register) have their own tighter bucket
++  (`RATE_LIMIT_AUTH`); the provider `/test` and `/health` probes (which
++  spend provider tokens) now land in the admin bucket — the old prefix
++  match only covered `/api/ai/models` and `/api/ai/route`.
++* Idle buckets are pruned, so the table no longer gains one entry per
++  distinct client for the life of the process.
+ 
+ A 429 carries a `Retry-After` header and the standard error body, so a
+ rate-limited client can back off correctly rather than hammering the
+@@ -16,6 +33,7 @@ endpoint.
+ 
+ from __future__ import annotations
+ 
++import re
+ import time
+ from collections import defaultdict
+ from typing import Awaitable, Callable
+@@ -27,9 +45,15 @@ from starlette.responses import JSONResponse, Response
+ from .config import RateLimitSettings, get_settings
+ from .errors import error_body
+ from .observability import get_logger
++from .security.jwt import TokenError, decode_access_token
++from .security.network import client_ip
+ 
+ logger = get_logger("rate_limit")
+ 
++_PROVIDER_PROBE = re.compile(r"^/api/ai/[^/]+/(test|health)$")
++_PRUNE_INTERVAL_SECONDS = 300.0
++_IDLE_SECONDS = 600.0
++
+ 
+ class _TokenBucket:
+     __slots__ = ("capacity", "tokens", "refill_per_second", "last_refill")
+@@ -54,20 +78,29 @@ class _TokenBucket:
+ 
+ def _limit_for_path(path: str, settings: RateLimitSettings) -> tuple[str, int]:
+     """Returns (bucket_name, requests_per_minute) for a request path."""
++    if path in ("/api/auth/login", "/api/auth/register"):
++        return "auth", settings.auth_per_minute
+     if path.startswith("/api/ai/analyze"):
+         return "analyze", settings.analyze_per_minute
+-    if path.startswith("/api/ai/models") or path.startswith("/api/ai/route"):
++    if (
++        path.startswith("/api/ai/models")
++        or path.startswith("/api/ai/route")
++        or _PROVIDER_PROBE.match(path)
++    ):
+         return "admin", settings.admin_per_minute
+     return "default", settings.default_per_minute
+ 
+ 
+ def _client_key(request: Request) -> str:
+-    forwarded = request.headers.get("x-forwarded-for")
+-    if forwarded:
+-        return forwarded.split(",")[0].strip()
+-    if request.client:
+-        return request.client.host
+-    return "unknown"
++    """`user:<id>` for a valid bearer token, otherwise `ip:<addr>`."""
++    header = request.headers.get("authorization", "")
++    scheme, _, token = header.partition(" ")
++    if scheme.lower() == "bearer" and token.strip():
++        try:
++            return f"user:{decode_access_token(token.strip()).user_id}"
++        except TokenError:
++            pass  # a garbage token buys no extra identity — fall back to the IP
++    return f"ip:{client_ip(request) or 'unknown'}"
+ 
+ 
+ class RateLimitMiddleware(BaseHTTPMiddleware):
+@@ -75,6 +108,15 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
+         super().__init__(app)
+         self._settings = settings or get_settings().rate_limit
+         self._buckets: dict[tuple[str, str], _TokenBucket] = {}
++        self._last_prune = time.monotonic()
++
++    def _prune(self, now: float) -> None:
++        if now - self._last_prune < _PRUNE_INTERVAL_SECONDS:
++            return
++        self._last_prune = now
++        stale = [k for k, b in self._buckets.items() if now - b.last_refill > _IDLE_SECONDS]
++        for key in stale:
++            del self._buckets[key]
+ 
+     def _bucket_for(self, key: str, name: str, per_minute: int) -> _TokenBucket:
+         bucket_key = (key, name)
+@@ -95,8 +137,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
+             return await call_next(request)
+ 
+         client_key = _client_key(request)
++        now = time.monotonic()
++        self._prune(now)
+         bucket = self._bucket_for(client_key, name, per_minute)
+-        allowed, retry_after = bucket.try_consume(time.monotonic())
++        allowed, retry_after = bucket.try_consume(now)
+ 
+         if not allowed:
+             logger.info(
+diff --git a/apps/api/app/routers/analyze.py b/apps/api/app/routers/analyze.py
+index 0cf9e34..76878d5 100644
+--- a/apps/api/app/routers/analyze.py
++++ b/apps/api/app/routers/analyze.py
+@@ -18,14 +18,14 @@ configured_model_id`, which is registry-aware (Grok's retired-slug
+ redirects, §3.2/G02) rather than the router's own hardcoded per-provider
+ defaults from before this pass.
+ 
+-Auth (this pass): accepts but does not require a bearer token
+-(`security.dependencies.get_optional_user`). Passage 4 §6.2 states
+-analyze requires JWT; making it mandatory here today would break the
+-one endpoint the live, working frontend actually depends on, since that
+-frontend has no login flow yet — a deliberate, disclosed interim step,
+-not a claim that full enforcement is done. When a token is present, the
+-request is attributed via a new `usage_logs` write (see `db/usage.py`);
+-anonymous requests behave exactly as before this pass.
++Auth: JWT is REQUIRED (Passage 4 §6.2 / G08b) via
++`security.dependencies.get_analysis_user`; the interim "optional token"
++behaviour of the earlier pass is retired now that the frontend ships a
++login flow. `AUTH_REQUIRED=false` restores anonymous access explicitly
++for local development. The authenticated user is attributed via a
++`usage_logs` write (see `db/usage.py`), and a multi-provider comparison is
++attached to one of that user's conversations so only they (or an admin)
++can rate it.
+ 
+ RAG (Passage 1 §7, this pass): `AnalysisContext.knowledge` was always
+ empty before this pass — the field existed but nothing ever populated
+@@ -46,6 +46,7 @@ from fastapi import APIRouter, Depends
+ from ..comparison import run_comparison, validate_provider_set
+ from ..db.client import is_db_configured
+ from ..db.comparisons import build_scores_record, save_comparison
++from ..db.conversations import create_conversation
+ from ..db.indicators_db import persist_indicator_bundle
+ from ..db.market_data import get_or_create_instrument, get_recent_bars, insert_bars
+ from ..db.signals import get_or_seed_model, save_signal
+@@ -60,7 +61,7 @@ from ..providers.model_registry import configured_model_id
+ from ..providers.registry import execute_provider, resolve_provider
+ from ..rag.pipeline import retrieve as retrieve_knowledge
+ from ..schemas import AnalyzeRequest, ComparisonResponse, ComparisonSlotOk, TradeAnalysis, now_iso
+-from ..security.dependencies import AuthenticatedUser, get_optional_user
++from ..security.dependencies import AuthenticatedUser, get_analysis_user
+ from ..utils import compute_freshness
+ from ..verify import build_trade_analysis
+ 
+@@ -97,7 +98,7 @@ async def get_or_refresh_bars(symbol: str):
+ 
+ 
+ @router.post("/api/ai/analyze")
+-async def analyze(body: AnalyzeRequest, user: AuthenticatedUser | None = Depends(get_optional_user)):
++async def analyze(body: AnalyzeRequest, user: AuthenticatedUser | None = Depends(get_analysis_user)):
+     symbol = body.symbol.upper()
+     bars, instrument_id, persisted = await get_or_refresh_bars(symbol)
+ 
+@@ -197,11 +198,18 @@ async def analyze(body: AnalyzeRequest, user: AuthenticatedUser | None = Depends
+                         )
+                     else:
+                         signal_id_by_provider[slot.providerId] = None
++                # An authenticated user's comparison hangs off one of
++                # their conversations, which is what lets the feedback
++                # endpoint restrict rating/preference to its owner.
++                conversation_id = (
++                    await create_conversation(user.id, "multi") if user is not None else None
++                )
+                 comparison_id = await save_comparison(
+                     provider_list,
+                     build_scores_record(results),
+                     signal_id_by_provider,
+                     model_id_by_provider,
++                    conversation_id=conversation_id,
+                 )
+             except Exception as err:  # noqa: BLE001
+                 # The comparison result itself is still valid and already
+diff --git a/apps/api/app/routers/auth.py b/apps/api/app/routers/auth.py
+index cd2e830..badbcf0 100644
+--- a/apps/api/app/routers/auth.py
++++ b/apps/api/app/routers/auth.py
+@@ -15,6 +15,8 @@ Phase-1 item in this pass (admin gating) depends on it existing.
+ 
+ from __future__ import annotations
+ 
++from functools import lru_cache
++
+ from fastapi import APIRouter, Depends, Request
+ 
+ from ..config import get_settings
+@@ -22,7 +24,12 @@ from ..db.users import EmailAlreadyRegisteredError, create_session, create_user,
+ from ..errors import ConfigurationError, UnauthorizedError, ValidationError
+ from ..observability import get_logger
+ from ..schemas import LoginRequest, RegisterRequest, TokenResponse, UserResponse
+-from ..security.dependencies import AuthenticatedUser, client_ip, get_current_user
++from ..security.dependencies import (
++    AuthenticatedUser,
++    bearer_token_from_request,
++    client_ip,
++    get_current_user,
++)
+ from ..security.jwt import create_access_token, token_hash_for
+ from ..security.passwords import hash_password, verify_password
+ 
+@@ -30,6 +37,17 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
+ logger = get_logger("routers.auth")
+ 
+ 
++@lru_cache(maxsize=1)
++def _timing_decoy_hash() -> str:
++    """
++    A real bcrypt hash of a throwaway string, computed once. Login for an
++    unknown email verifies against it so that path costs the same bcrypt
++    time as a wrong-password path — otherwise response time alone reveals
++    which emails are registered, even though the 401 bodies are identical.
++    """
++    return hash_password("oxygen-ai-timing-decoy-not-a-real-password")
++
++
+ def _require_auth_configured() -> None:
+     if not get_settings().auth.is_configured:
+         raise ConfigurationError(
+@@ -71,9 +89,12 @@ async def login(body: LoginRequest, request: Request) -> TokenResponse:
+     _require_auth_configured()
+     email = body.email.strip().lower()
+     user = await get_user_by_email(email)
+-    # Constant-shape failure: a nonexistent user and a wrong password
+-    # both produce the identical 401 — never reveal which one it was.
+-    if user is None or user.status != "active" or not verify_password(body.password, user.password_hash):
++    # Constant-shape AND constant-time failure: a nonexistent user, an
++    # inactive user and a wrong password all produce the identical 401 and
++    # all pay one bcrypt verification — never reveal which one it was.
++    stored_hash = user.password_hash if user is not None else _timing_decoy_hash()
++    password_ok = verify_password(body.password, stored_hash)
++    if user is None or user.status != "active" or not password_ok:
+         raise UnauthorizedError("Incorrect email or password")
+     logger.info("user logged in", extra={"userId": user.id})
+     return await _issue_token(user.id, user.email, user.role_name, request)
+@@ -83,8 +104,7 @@ async def login(body: LoginRequest, request: Request) -> TokenResponse:
+ async def logout(request: Request, user: AuthenticatedUser = Depends(get_current_user)) -> dict:
+     from ..db.users import delete_session_by_hash
+ 
+-    auth_header = request.headers.get("authorization", "")
+-    token = auth_header.removeprefix("Bearer ").strip()
++    token = bearer_token_from_request(request)
+     if token:
+         await delete_session_by_hash(token_hash_for(token))
+     return {"ok": True}
+diff --git a/apps/api/app/routers/comparisons.py b/apps/api/app/routers/comparisons.py
+index 69eeba6..74ac963 100644
+--- a/apps/api/app/routers/comparisons.py
++++ b/apps/api/app/routers/comparisons.py
+@@ -7,17 +7,22 @@ this is why that endpoint now returns comparisonId.
+ 
+ from __future__ import annotations
+ 
+-from fastapi import APIRouter, HTTPException
++from fastapi import APIRouter, Depends, HTTPException
+ 
+ from ..db.client import is_db_configured
+ from ..db.comparisons import get_comparison, get_provider_db_id_by_name, update_comparison_feedback
+ from ..schemas import ComparisonFeedback, RateComparisonRequest
++from ..security.dependencies import AuthenticatedUser, get_analysis_user
+ 
+ router = APIRouter()
+ 
+ 
+ @router.patch("/api/ai/comparisons/{comparison_id}")
+-async def rate_comparison(comparison_id: str, body: RateComparisonRequest) -> ComparisonFeedback:
++async def rate_comparison(
++    comparison_id: str,
++    body: RateComparisonRequest,
++    user: AuthenticatedUser | None = Depends(get_analysis_user),
++) -> ComparisonFeedback:
+     if not is_db_configured():
+         raise HTTPException(
+             status_code=503, detail="Ratings require a database — DATABASE_URL is not set"
+@@ -29,6 +34,14 @@ async def rate_comparison(comparison_id: str, body: RateComparisonRequest) -> Co
+     if existing is None:
+         raise HTTPException(status_code=404, detail="No comparison found with that id")
+ 
++    # Ownership (Passage 1 §3: auth + role boundaries). A comparison that
++    # has an owner can be rated/preferred only by that owner or an admin.
++    # A non-owner gets the same 404 as a missing id so the endpoint can't
++    # be used to probe which comparison ids exist.
++    owner = existing.get("ownerUserId")
++    if owner is not None and (user is None or (user.id != owner and user.role != "admin")):
++        raise HTTPException(status_code=404, detail="No comparison found with that id")
++
+     preferred_db_id = None
+     if body.preferredProviderId is not None:
+         # You can only prefer a provider that was actually part of this
+diff --git a/apps/api/app/routers/knowledge.py b/apps/api/app/routers/knowledge.py
+index 7f11253..1b7a58f 100644
+--- a/apps/api/app/routers/knowledge.py
++++ b/apps/api/app/routers/knowledge.py
+@@ -2,13 +2,19 @@
+ Knowledge endpoints - the "Knowledge" category Passage 4 section 6.3
+ (G13) names among the 19 required endpoint categories.
+ 
+-Upload requires authentication (any authenticated user, attributed via
+-`uploaded_by`) since it's a mutating, shared-resource action - every
+-uploaded document feeds every future analysis's RAG context, not just
+-the uploader's own. Search stays open: it's read-only, and
++Authorization (Passage 1 §8: knowledge memory is retained "until admin
++deletes" — i.e. it is an admin-curated store):
++
++* Upload (text and file) and delete require the `admin` role. Every
++  document feeds EVERY user's future analysis prompts, so letting any
++  self-registered account add or remove documents would let one user
++  poison, or erase, the context all others reason over.
++* Search and list require authentication (any role): they are read-only,
++  but search spends embedding-provider quota and the document list is
++  not public information.
++
+ `routers/analyze.py` calls the same underlying `rag.pipeline.retrieve`
+-function internally regardless of whether the request itself is
+-authenticated.
++function internally on behalf of the already-authenticated caller.
+ """
+ 
+ from __future__ import annotations
+@@ -19,7 +25,7 @@ from ..errors import NotFoundError, ValidationError
+ from ..rag.chunking import UnsupportedFileTypeError, extract_text
+ from ..rag.pipeline import ingest_text, retrieve
+ from ..schemas import KnowledgeChunkResponse, KnowledgeSearchRequest, KnowledgeUploadRequest
+-from ..security.dependencies import AuthenticatedUser, get_current_user
++from ..security.dependencies import AuthenticatedUser, get_current_user, require_role
+ 
+ router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
+ 
+@@ -31,7 +37,7 @@ MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+ 
+ @router.post("/upload")
+ async def upload_text(
+-    body: KnowledgeUploadRequest, user: AuthenticatedUser = Depends(get_current_user)
++    body: KnowledgeUploadRequest, user: AuthenticatedUser = Depends(require_role("admin"))
+ ) -> dict:
+     result = await ingest_text(body.title, body.content, body.sourceType, uploaded_by=user.id)
+     return {
+@@ -46,7 +52,7 @@ async def upload_file(
+     title: str = Form(...),
+     sourceType: str = Form("knowledge"),
+     file: UploadFile = File(...),
+-    user: AuthenticatedUser = Depends(get_current_user),
++    user: AuthenticatedUser = Depends(require_role("admin")),
+ ) -> dict:
+     raw = await file.read()
+     if len(raw) > MAX_UPLOAD_BYTES:
+@@ -66,7 +72,9 @@ async def upload_file(
+ 
+ 
+ @router.post("/search")
+-async def search(body: KnowledgeSearchRequest) -> list[KnowledgeChunkResponse]:
++async def search(
++    body: KnowledgeSearchRequest, user: AuthenticatedUser = Depends(get_current_user)
++) -> list[KnowledgeChunkResponse]:
+     hits = await retrieve(body.query, top_k=body.topK)
+     return [
+         KnowledgeChunkResponse(
+@@ -83,7 +91,9 @@ async def search(body: KnowledgeSearchRequest) -> list[KnowledgeChunkResponse]:
+ 
+ 
+ @router.get("/documents")
+-async def list_knowledge_documents() -> list[dict]:
++async def list_knowledge_documents(
++    user: AuthenticatedUser = Depends(get_current_user),
++) -> list[dict]:
+     from ..db.knowledge import list_documents
+ 
+     return await list_documents()
+@@ -91,7 +101,7 @@ async def list_knowledge_documents() -> list[dict]:
+ 
+ @router.delete("/documents/{document_id}")
+ async def delete_knowledge_document(
+-    document_id: str, user: AuthenticatedUser = Depends(get_current_user)
++    document_id: str, user: AuthenticatedUser = Depends(require_role("admin"))
+ ) -> dict:
+     from ..db.knowledge import delete_document
+ 
+diff --git a/apps/api/app/security/dependencies.py b/apps/api/app/security/dependencies.py
+index 309837a..91a0821 100644
+--- a/apps/api/app/security/dependencies.py
++++ b/apps/api/app/security/dependencies.py
+@@ -1,24 +1,27 @@
+ """
+ FastAPI dependencies for authentication and RBAC.
+ 
+-Two current-user dependencies, deliberately different failure modes:
+-
+-* `get_current_user` — REQUIRED. No/invalid/expired/revoked token → 401.
+-  Used on admin-only endpoints (provider test, models CRUD).
+-* `get_optional_user` — OPTIONAL. No/invalid token → returns None, the
+-  request proceeds anonymously. Used on `/api/ai/analyze` so a request
+-  is attributed to a user when a token is present, without requiring
+-  one — the live frontend has no login flow yet, and forcing auth here
+-  would break the one endpoint every existing user actually depends on.
+-  Passage 4 §6.2 states analyze requires JWT; this is a deliberate,
+-  disclosed interim step toward that, not a claim that it's already
+-  enforced — see the delivery notes for why full enforcement waits on a
+-  coordinated frontend login phase.
+-
+-Both verify the JWT itself (signature, expiry, issuer) AND that a
+-matching `sessions` row still exists and hasn't expired — a token whose
+-session was deleted (logout) stops working immediately, not just when
+-the JWT's own expiry eventually arrives.
++Three current-user dependencies, deliberately different failure modes:
++
++* `get_current_user` — REQUIRED. No/invalid/expired/revoked token → 401;
++  auth backend (database) unreachable → 503. Used on admin endpoints and
++  every user-scoped endpoint.
++* `get_optional_user` — OPTIONAL. No/invalid token → None and the request
++  proceeds anonymously. If the auth backend is unreachable it ALSO
++  degrades to anonymous (previously it surfaced as a 500: a validly
++  signed token plus a database outage broke an endpoint documented as
++  "optional auth").
++* `get_analysis_user` — the policy dependency for the analysis surface
++  (`POST /api/ai/analyze`, comparison feedback). Passage 4 §6.2 (G08b)
++  states analyze is "Auth: required (JWT)", so this is `get_current_user`
++  unless `AUTH_REQUIRED=false` is set explicitly for local development,
++  in which case it is `get_optional_user`. The interim "accept but do not
++  require a token" behaviour of the previous pass is therefore retired:
++  the frontend now ships a login flow (see `app/components/AuthPanel.tsx`).
++
++All verify the JWT (signature, expiry, issuer) AND that a matching
++`sessions` row still exists — logout revokes a token immediately, not at
++its natural expiry.
+ """
+ 
+ from __future__ import annotations
+@@ -28,16 +31,28 @@ from dataclasses import dataclass
+ from fastapi import Depends, Request
+ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+ 
++from ..config import get_settings
+ from ..db.users import UserRecord, get_permissions_for_role, get_user_by_id, session_is_valid
+-from ..errors import ForbiddenError, UnauthorizedError
++from ..errors import ApiError, ForbiddenError, UnauthorizedError
+ from ..observability import get_logger
+ from .jwt import TokenError, decode_access_token, token_hash_for
++from .network import client_ip  # noqa: F401 — re-exported; auth.py and older imports use this path
+ 
+ logger = get_logger("security")
+ 
++# FastAPI's HTTPBearer matches the scheme case-insensitively ("Bearer",
++# "bearer", "BEARER"), so every token-reading site must too — see
++# `bearer_token_from_request`.
+ _bearer_optional = HTTPBearer(auto_error=False)
+ 
+ 
++class AuthBackendUnavailableError(ApiError):
++    """The session/user store could not be reached — not the caller's fault."""
++
++    status_code = 503
++    code = "auth_unavailable"
++
++
+ @dataclass(frozen=True)
+ class AuthenticatedUser:
+     id: str
+@@ -46,18 +61,44 @@ class AuthenticatedUser:
+     status: str
+ 
+ 
++def bearer_token_from_request(request: Request) -> str:
++    """
++    Extract the bearer token the same way `HTTPBearer` does: scheme
++    compared case-insensitively. `logout` previously used
++    `removeprefix("Bearer ")`, so `Authorization: bearer <token>` was
++    accepted for authentication but silently failed to revoke the
++    session — logout returned 200 and the token kept working.
++    """
++    header = request.headers.get("authorization", "")
++    scheme, _, token = header.partition(" ")
++    if scheme.lower() != "bearer":
++        return ""
++    return token.strip()
++
++
+ async def _resolve(token: str) -> AuthenticatedUser | None:
++    """
++    Returns the user, or None for any rejection (bad/expired/revoked
++    token, inactive user). Raises AuthBackendUnavailableError only when
++    the session/user store itself fails.
++    """
+     try:
+         claims = decode_access_token(token)
+     except TokenError as err:
+         logger.info("token rejected", extra={"reason": str(err)})
+         return None
+ 
+-    if not await session_is_valid(token_hash_for(token)):
+-        logger.info("token valid but session was revoked or expired", extra={"jti": claims.jti})
+-        return None
++    try:
++        if not await session_is_valid(token_hash_for(token)):
++            logger.info("token valid but session was revoked or expired", extra={"jti": claims.jti})
++            return None
++        user = await get_user_by_id(claims.user_id)
++    except Exception as err:  # noqa: BLE001 — any store failure is "backend unavailable"
++        logger.warning("auth backend unavailable", extra={"error": str(err)})
++        raise AuthBackendUnavailableError(
++            "Authentication service is temporarily unavailable"
++        ) from err
+ 
+-    user = await get_user_by_id(claims.user_id)
+     if user is None or user.status != "active":
+         return None
+ 
+@@ -69,7 +110,12 @@ async def get_optional_user(
+ ) -> AuthenticatedUser | None:
+     if credentials is None or not credentials.credentials:
+         return None
+-    return await _resolve(credentials.credentials)
++    try:
++        return await _resolve(credentials.credentials)
++    except AuthBackendUnavailableError:
++        # Optional means optional: an unreachable store must not turn an
++        # anonymous-capable endpoint into an error.
++        return None
+ 
+ 
+ async def get_current_user(
+@@ -83,6 +129,15 @@ async def get_current_user(
+     return user
+ 
+ 
++async def get_analysis_user(
++    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_optional),
++) -> AuthenticatedUser | None:
++    """Policy dependency: JWT required unless AUTH_REQUIRED=false (dev only)."""
++    if get_settings().auth.auth_required:
++        return await get_current_user(credentials)
++    return await get_optional_user(credentials)
++
++
+ def require_role(*allowed_roles: str):
+     """
+     Dependency factory: `Depends(require_role("admin"))`. Layers on top
+@@ -117,10 +172,3 @@ def require_permission(resource: str, action: str):
+         return user
+ 
+     return _check
+-
+-
+-def client_ip(request: Request) -> str | None:
+-    forwarded = request.headers.get("x-forwarded-for")
+-    if forwarded:
+-        return forwarded.split(",")[0].strip()
+-    return request.client.host if request.client else None
+\ No newline at end of file
+diff --git a/apps/api/app/security/network.py b/apps/api/app/security/network.py
+new file mode 100644
+index 0000000..62a4017
+--- /dev/null
++++ b/apps/api/app/security/network.py
+@@ -0,0 +1,93 @@
++"""
++Client network identity — one implementation shared by the rate limiter
++and the session writer.
++
++Defects this replaces (both reproduced against the running app):
++
++1. Both call sites trusted the first `X-Forwarded-For` value
++   unconditionally. A client can put anything there, so rotating the
++   header defeated every rate limit (5/min limit, 8 of 8 requests passed).
++2. The same unvalidated string was written to `sessions.ip`
++   (`$4::inet`). A proxy that appends `ip:port` (some PaaS front doors
++   do), or any non-IP value, made Postgres reject the insert — breaking
++   login and registration, and leaving a half-registered account behind.
++
++Rules now: a forwarded header is honoured only for the configured number
++of trusted proxies (`TRUSTED_PROXY_COUNT`, default 0 = ignore it), the
++chosen entry is parsed as a real IP (an `ip:port` or `[v6]:port` form is
++reduced to the address), and anything that is not an IP yields None.
++
++Operator note — two independent trust layers exist:
++
++* uvicorn's own `--proxy-headers` (ON by default) rewrites
++  `request.client` from X-Forwarded-For BEFORE this code runs, but only
++  when the TCP peer is in `--forwarded-allow-ips` (default: 127.0.0.1).
++  So a client on the same host as the API — local development, or an
++  nginx on the same machine — is treated as a proxy by uvicorn. This is
++  uvicorn's documented behaviour, not something this module can see or
++  override.
++* `TRUSTED_PROXY_COUNT` is this application's own, server-independent
++  rule. To make it the single authority, start uvicorn with
++  `--no-proxy-headers`. Behind a same-host reverse proxy you may instead
++  leave it at 0 and let uvicorn do the rewriting.
++
++Verified against a real server from a non-loopback peer: the previous code
++let 7/7 requests through a 3/min limit by rotating the header; this code
++returns 429 from the 4th.
++"""
++
++from __future__ import annotations
++
++import ipaddress
++
++from fastapi import Request
++
++from ..config import get_settings
++
++
++def normalize_ip(raw: str | None) -> str | None:
++    """Return a canonical IP string, or None if `raw` is not an IP address."""
++    if not raw:
++        return None
++    value = raw.strip().strip('"')
++    if not value:
++        return None
++    try:
++        return str(ipaddress.ip_address(value))
++    except ValueError:
++        pass
++    if value.startswith("["):  # [v6]:port
++        host = value[1:].partition("]")[0]
++        try:
++            return str(ipaddress.ip_address(host))
++        except ValueError:
++            return None
++    if value.count(":") == 1:  # v4:port
++        host, _, port = value.partition(":")
++        if port.isdigit():
++            try:
++                return str(ipaddress.ip_address(host))
++            except ValueError:
++                return None
++    return None
++
++
++def client_ip(request: Request, trusted_proxy_count: int | None = None) -> str | None:
++    """
++    The caller's IP, or None when it cannot be established as a valid IP
++    (e.g. the in-process test transport's peer is the string "testclient").
++    """
++    peer = normalize_ip(request.client.host if request.client else None)
++    count = get_settings().trusted_proxy_count if trusted_proxy_count is None else trusted_proxy_count
++    if count <= 0:
++        return peer
++
++    header = request.headers.get("x-forwarded-for", "")
++    entries = [normalize_ip(part) for part in header.split(",") if part.strip()]
++    if not entries:
++        return peer
++    # With N trusted proxies each appending its peer, the real client is
++    # the Nth entry from the right; a shorter header means fewer proxies
++    # than configured, so the leftmost entry is the best available.
++    chosen = entries[-count] if len(entries) >= count else entries[0]
++    return chosen or peer
+diff --git a/apps/api/tests/conftest.py b/apps/api/tests/conftest.py
+index 32f8f61..522e581 100644
+--- a/apps/api/tests/conftest.py
++++ b/apps/api/tests/conftest.py
+@@ -27,8 +27,19 @@ necessarily expecting to need this.
+ 
+ from __future__ import annotations
+ 
++import os
++
+ import pytest
+ 
++# The in-process ASGI test transport has no real peer address, so every
++# request in the suite would share a single "ip:unknown" rate-limit bucket
++# and the (deliberately tight) credential-endpoint limit would trip across
++# unrelated tests. Rate limiting is therefore off for the suite by default
++# and is covered directly by tests/test_gateway_security.py, which builds
++# its own app around `RateLimitMiddleware` with explicit settings. Must be
++# set before `app.main` is first imported (it captures settings at import).
++os.environ.setdefault("RATE_LIMIT_ENABLED", "false")
++
+ from app.providers.circuit_breaker import reset_circuit_breakers_for_tests
+ 
+ 
+diff --git a/apps/api/tests/test_auth_enforcement.py b/apps/api/tests/test_auth_enforcement.py
+new file mode 100644
+index 0000000..1d3443d
+--- /dev/null
++++ b/apps/api/tests/test_auth_enforcement.py
+@@ -0,0 +1,281 @@
++"""
++Authentication enforcement end to end — the live FastAPI app (ASGI
++transport, no socket) against a real Postgres. Skipped without
++DATABASE_URL, like the other integration modules.
++
++Covers the Phase 1 behaviours that need real sessions/users/rows:
++
++* a hostile or proxy-shaped X-Forwarded-For can no longer break login or
++  registration (it used to reach `sessions.ip inet` unvalidated);
++* logout revokes the session whatever case the client wrote the scheme in
++  (it used to return 200 and leave the token working);
++* knowledge upload/delete are admin-only; search/list need a login;
++* a multi-provider comparison can be rated/preferred only by its owner or
++  an admin, and a non-owner cannot tell it exists;
++* the `app.cli` bootstrap is the supported way to obtain an admin.
++"""
++
++from __future__ import annotations
++
++import os
++import uuid
++
++import pytest
++
++pytestmark = pytest.mark.skipif(
++    not os.environ.get("DATABASE_URL"),
++    reason="DATABASE_URL is not set — auth enforcement tests require a live Postgres instance",
++)
++
++PASSWORD = "correct-horse-battery-staple"
++
++
++@pytest.fixture
++async def client(monkeypatch):
++    monkeypatch.setenv("JWT_SECRET", "test-secret-do-not-use-in-production")
++    monkeypatch.setenv("JWT_ISSUER", "oxygen-ai-test")
++    monkeypatch.setenv("ACCESS_TOKEN_TTL_SECONDS", "3600")
++    monkeypatch.setenv("TRUSTED_PROXY_COUNT", "0")
++    from app.config import get_settings
++
++    get_settings(refresh=True)
++
++    import app.db.client as db_client
++
++    db_client._pool = None
++
++    import httpx
++
++    from app.main import app
++
++    transport = httpx.ASGITransport(app=app)
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
++        yield c
++
++    db_client._pool = None
++    get_settings(refresh=True)
++
++
++@pytest.fixture
++async def pool():
++    import app.db.client as db_client
++
++    db_client._pool = None
++    from app.db.client import get_pool
++
++    p = await get_pool()
++    yield p
++    db_client._pool = None
++
++
++@pytest.fixture
++async def accounts(pool):
++    """Registers throwaway accounts and removes everything they created."""
++    created: list[str] = []
++    documents: list[str] = []
++
++    async def make(client, *, role: str = "user") -> tuple[str, str, dict[str, str]]:
++        email = f"zztest-{uuid.uuid4().hex[:12]}@example.com"
++        created.append(email)
++        registered = await client.post("/api/auth/register", json={"email": email, "password": PASSWORD})
++        assert registered.status_code == 200, registered.text
++        if role != "user":
++            from app.db.users import set_user_role
++
++            assert await set_user_role(email, role)
++        token = registered.json()["accessToken"]
++        user_id = str(await pool.fetchval("SELECT id FROM users WHERE email = $1", email))
++        return email, user_id, {"Authorization": f"Bearer {token}"}
++
++    make.documents = documents  # type: ignore[attr-defined]
++    yield make
++
++    for document_id in documents:
++        await pool.execute("DELETE FROM knowledge_documents WHERE id = $1", document_id)
++    for email in created:
++        await pool.execute(
++            "DELETE FROM conversations WHERE user_id IN (SELECT id FROM users WHERE email = $1)", email
++        )
++        await pool.execute(
++            "DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE email = $1)", email
++        )
++        await pool.execute("DELETE FROM users WHERE email = $1", email)
++
++
++# --------------------------------------------------------------------------
++# Network identity reaching the sessions table
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "forwarded, expected_ip",
++    [
++        ("unknown", "127.0.0.1"),  # unparseable -> falls back to the socket peer
++        ("203.0.113.9:51234", "203.0.113.9"),  # PaaS-style ip:port -> reduced to the address
++        ("6.6.6.6, 203.0.113.9", "203.0.113.9"),  # client-prepended junk is ignored
++    ],
++)
++async def test_hostile_forwarded_for_cannot_break_registration_or_login(
++    client, pool, monkeypatch, forwarded, expected_ip
++):
++    monkeypatch.setenv("TRUSTED_PROXY_COUNT", "1")
++    from app.config import get_settings
++
++    get_settings(refresh=True)
++
++    email = f"zztest-{uuid.uuid4().hex[:12]}@example.com"
++    try:
++        registered = await client.post(
++            "/api/auth/register",
++            json={"email": email, "password": PASSWORD},
++            headers={"X-Forwarded-For": forwarded},
++        )
++        # Before the fix: 400 "identifiers malformed", with the account already created.
++        assert registered.status_code == 200, registered.text
++        logged_in = await client.post(
++            "/api/auth/login",
++            json={"email": email, "password": PASSWORD},
++            headers={"X-Forwarded-For": forwarded},
++        )
++        assert logged_in.status_code == 200, logged_in.text
++
++        stored = await pool.fetch(
++            "SELECT ip FROM sessions WHERE user_id = (SELECT id FROM users WHERE email = $1)", email
++        )
++        assert {str(row["ip"]) for row in stored} == {expected_ip}
++    finally:
++        await pool.execute(
++            "DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE email = $1)", email
++        )
++        await pool.execute("DELETE FROM users WHERE email = $1", email)
++
++
++# --------------------------------------------------------------------------
++# Logout
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("scheme", ["Bearer", "bearer", "BEARER"])
++async def test_logout_revokes_the_token_whatever_case_the_scheme_is_written_in(client, accounts, scheme):
++    _, _, headers = await accounts(client)
++    token = headers["Authorization"].split(" ", 1)[1]
++
++    assert (await client.get("/api/auth/me", headers=headers)).status_code == 200
++    logout = await client.post("/api/auth/logout", headers={"Authorization": f"{scheme} {token}"})
++    assert logout.status_code == 200
++    # Before the fix a lowercase scheme returned 200 here and this stayed 200.
++    assert (await client.get("/api/auth/me", headers=headers)).status_code == 401
++
++
++# --------------------------------------------------------------------------
++# Knowledge authorization
++# --------------------------------------------------------------------------
++
++UPLOAD = {"title": "zztest policy note", "content": "Position sizing must cap risk per trade.", "sourceType": "knowledge"}
++
++
++@pytest.mark.asyncio
++async def test_knowledge_endpoints_reject_anonymous_callers(client):
++    assert (await client.post("/api/knowledge/search", json={"query": "risk"})).status_code == 401
++    assert (await client.get("/api/knowledge/documents")).status_code == 401
++    assert (await client.post("/api/knowledge/upload", json=UPLOAD)).status_code == 401
++    assert (await client.delete(f"/api/knowledge/documents/{uuid.uuid4()}")).status_code == 401
++
++
++@pytest.mark.asyncio
++async def test_a_plain_user_can_search_and_list_but_not_upload_or_delete(client, accounts):
++    _, _, user = await accounts(client)
++    assert (await client.post("/api/knowledge/search", json={"query": "risk"}, headers=user)).status_code == 200
++    assert (await client.get("/api/knowledge/documents", headers=user)).status_code == 200
++    assert (await client.post("/api/knowledge/upload", json=UPLOAD, headers=user)).status_code == 403
++    assert (await client.delete(f"/api/knowledge/documents/{uuid.uuid4()}", headers=user)).status_code == 403
++
++
++@pytest.mark.asyncio
++async def test_an_admin_can_upload_and_delete_a_document(client, accounts):
++    _, _, admin = await accounts(client, role="admin")
++    uploaded = await client.post("/api/knowledge/upload", json=UPLOAD, headers=admin)
++    assert uploaded.status_code == 200, uploaded.text
++    document_id = uploaded.json()["documentId"]
++    accounts.documents.append(document_id)
++
++    deleted = await client.delete(f"/api/knowledge/documents/{document_id}", headers=admin)
++    assert deleted.status_code == 200
++
++
++# --------------------------------------------------------------------------
++# Comparison ownership
++# --------------------------------------------------------------------------
++
++
++async def _run_comparison(client, headers) -> str:
++    response = await client.post(
++        "/api/ai/analyze", json={"symbol": "ZZOWN", "providers": ["mock", "grok"]}, headers=headers
++    )
++    assert response.status_code == 200, response.text
++    comparison_id = response.json()["comparisonId"]
++    assert comparison_id, "the comparison should have been persisted"
++    return comparison_id
++
++
++@pytest.mark.asyncio
++async def test_only_the_owner_or_an_admin_can_rate_a_comparison(client, pool, accounts):
++    _, owner_id, owner = await accounts(client)
++    _, _, stranger = await accounts(client)
++    _, _, admin = await accounts(client, role="admin")
++
++    comparison_id = await _run_comparison(client, owner)
++    stored_owner = await pool.fetchval(
++        "SELECT c.user_id FROM ai_comparisons ac JOIN conversations c ON c.id = ac.conversation_id WHERE ac.id = $1",
++        comparison_id,
++    )
++    assert str(stored_owner) == owner_id
++
++    url = f"/api/ai/comparisons/{comparison_id}"
++    # A non-owner gets the same 404 as a nonexistent id — no existence probing.
++    assert (await client.patch(url, json={"rating": 1}, headers=stranger)).status_code == 404
++    assert (await client.patch(f"/api/ai/comparisons/{uuid.uuid4()}", json={"rating": 1}, headers=stranger)).status_code == 404
++    assert (await client.patch(url, json={"rating": 1})).status_code == 401  # anonymous
++
++    mine = await client.patch(url, json={"rating": 4}, headers=owner)
++    assert mine.status_code == 200 and mine.json()["userRating"] == 4
++    theirs = await client.patch(url, json={"rating": 5}, headers=admin)
++    assert theirs.status_code == 200 and theirs.json()["userRating"] == 5
++
++
++# --------------------------------------------------------------------------
++# Admin bootstrap CLI
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_cli_create_admin_yields_an_account_that_can_log_in_as_admin(client, pool):
++    from app import cli
++
++    email = f"zztest-{uuid.uuid4().hex[:12]}@example.com"
++    try:
++        message = await cli._create_admin(email, PASSWORD)
++        assert "created" in message
++
++        login = await client.post("/api/auth/login", json={"email": email, "password": PASSWORD})
++        assert login.status_code == 200, login.text
++        headers = {"Authorization": f"Bearer {login.json()['accessToken']}"}
++        assert (await client.get("/api/auth/me", headers=headers)).json()["role"] == "admin"
++
++        # Re-running promotes, never overwrites the password.
++        again = await cli._create_admin(email, "a-different-password-entirely")
++        assert "already existed" in again
++        assert (await client.post("/api/auth/login", json={"email": email, "password": PASSWORD})).status_code == 200
++
++        demoted = await cli._set_role(email, "user")
++        assert "now 'user'" in demoted
++        assert (await client.get("/api/auth/me", headers=headers)).json()["role"] == "user"
++        assert "nothing changed" in await cli._set_role("nobody-here@example.com", "admin")
++    finally:
++        from app.db.client import get_pool
++
++        p = await get_pool()
++        await p.execute("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE email = $1)", email)
++        await p.execute("DELETE FROM users WHERE email = $1", email)
+diff --git a/apps/api/tests/test_auth_integration.py b/apps/api/tests/test_auth_integration.py
+index 6f1c4a6..acffd85 100644
+--- a/apps/api/tests/test_auth_integration.py
++++ b/apps/api/tests/test_auth_integration.py
+@@ -229,14 +229,50 @@ async def test_route_endpoint_requires_authentication_but_not_admin(client, pool
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_analyze_endpoint_still_works_with_no_token_at_all(client):
+-    """The compatibility guarantee this whole design exists to preserve:
+-    the live frontend's one real endpoint must keep working anonymously."""
++async def test_analyze_endpoint_requires_a_token_by_default(client):
++    """Passage 4 §6.2 (G08b): POST /api/ai/analyze is "Auth: required (JWT)".
++
++    This replaces the previous pass's pin
++    (`..._still_works_with_no_token_at_all`), which existed only because
++    the frontend had no login flow yet. That flow now ships
++    (app/components/AuthPanel.tsx), so the interim compatibility
++    guarantee is retired on purpose rather than quietly deleted.
++    """
++    resp = await client.post("/api/ai/analyze", json={"symbol": "ZZTESTAUTH", "provider": "mock"})
++    assert resp.status_code == 401
++    assert resp.json()["code"] == "unauthorized"
++
++
++@pytest.mark.asyncio
++async def test_analyze_endpoint_is_anonymous_only_when_auth_is_explicitly_disabled(client, monkeypatch):
++    """AUTH_REQUIRED=false is the explicit local-development escape hatch."""
++    monkeypatch.setenv("AUTH_REQUIRED", "false")
++    from app.config import get_settings
++
++    get_settings(refresh=True)
+     resp = await client.post("/api/ai/analyze", json={"symbol": "ZZTESTAUTH", "provider": "mock"})
+     assert resp.status_code == 200
+     assert resp.json()["status"] in ("SETUP_FOUND", "NO_VALID_SETUP")
+ 
+ 
++@pytest.mark.asyncio
++async def test_analyze_succeeds_with_a_valid_token(client, pool):
++    email = _unique_email()
++    try:
++        registered = await client.post(
++            "/api/auth/register", json={"email": email, "password": "correct-horse-battery-staple"}
++        )
++        token = registered.json()["accessToken"]
++        resp = await client.post(
++            "/api/ai/analyze",
++            json={"symbol": "ZZTESTAUTH", "provider": "mock"},
++            headers={"Authorization": f"Bearer {token}"},
++        )
++        assert resp.status_code == 200
++    finally:
++        await _cleanup(pool, email)
++
++
+ @pytest.mark.asyncio
+ async def test_password_shorter_than_twelve_characters_is_rejected(client):
+     resp = await client.post(
+diff --git a/apps/api/tests/test_auth_policy.py b/apps/api/tests/test_auth_policy.py
+new file mode 100644
+index 0000000..5d84ff5
+--- /dev/null
++++ b/apps/api/tests/test_auth_policy.py
+@@ -0,0 +1,203 @@
++"""
++Authentication policy and dependency behaviour — no database required
++(the session/user store is replaced with test doubles), so these run
++everywhere and pin the *decisions* the auth layer makes:
++
++* `/api/ai/analyze` requires a JWT by default; `AUTH_REQUIRED=false` is
++  the explicit local-development escape hatch (Passage 4 §6.2 / G08b);
++* "optional" auth really is optional — an unreachable session store used
++  to turn it into a 500 (reproduced), now it degrades to anonymous;
++* a required-auth endpoint reports an unreachable store as 503, not a
++  misleading 401 and not an unexplained 500;
++* the bearer scheme is matched case-insensitively everywhere;
++* unknown-email login pays the same bcrypt cost as a wrong password.
++"""
++
++from __future__ import annotations
++
++import pytest
++from fastapi.security import HTTPAuthorizationCredentials
++from starlette.requests import Request
++
++from app.config import get_settings
++from app.errors import UnauthorizedError
++from app.security import dependencies
++from app.security.dependencies import (
++    AuthBackendUnavailableError,
++    bearer_token_from_request,
++    get_analysis_user,
++    get_current_user,
++    get_optional_user,
++)
++from app.security.jwt import create_access_token, token_hash_for
++
++SECRET = "test-secret-do-not-use-in-production"
++
++
++@pytest.fixture
++def auth_env(monkeypatch):
++    monkeypatch.setenv("JWT_SECRET", SECRET)
++    monkeypatch.setenv("JWT_ISSUER", "oxygen-ai-test")
++    get_settings(refresh=True)
++    yield monkeypatch
++    monkeypatch.undo()
++    get_settings(refresh=True)
++
++
++@pytest.fixture
++def token(auth_env):
++    value, _ = create_access_token("22222222-2222-2222-2222-222222222222", "u@example.com", "user")
++    return value
++
++
++def _credentials(token: str) -> HTTPAuthorizationCredentials:
++    return HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
++
++
++class _FakeUser:
++    id = "22222222-2222-2222-2222-222222222222"
++    email = "u@example.com"
++    role_name = "user"
++    status = "active"
++
++
++def _healthy_store(monkeypatch):
++    async def valid(_hash):
++        return True
++
++    async def user(_id):
++        return _FakeUser()
++
++    monkeypatch.setattr(dependencies, "session_is_valid", valid)
++    monkeypatch.setattr(dependencies, "get_user_by_id", user)
++
++
++def _broken_store(monkeypatch):
++    async def boom(*_a, **_k):
++        raise ConnectionError("database is down")
++
++    monkeypatch.setattr(dependencies, "session_is_valid", boom)
++
++
++# --------------------------------------------------------------------------
++# Policy: analyze requires JWT unless explicitly disabled
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_analysis_user_requires_credentials_by_default(auth_env):
++    with pytest.raises(UnauthorizedError):
++        await get_analysis_user(None)
++
++
++@pytest.mark.asyncio
++async def test_analysis_user_allows_anonymous_only_when_explicitly_disabled(auth_env):
++    auth_env.setenv("AUTH_REQUIRED", "false")
++    get_settings(refresh=True)
++    assert await get_analysis_user(None) is None
++
++
++@pytest.mark.asyncio
++async def test_analysis_user_resolves_a_valid_session(auth_env, token):
++    _healthy_store(auth_env)
++    user = await get_analysis_user(_credentials(token))
++    assert user is not None and user.email == "u@example.com" and user.role == "user"
++
++
++@pytest.mark.asyncio
++async def test_revoked_session_is_rejected_even_with_a_valid_signature(auth_env, token):
++    async def revoked(_hash):
++        return False
++
++    auth_env.setattr(dependencies, "session_is_valid", revoked)
++    with pytest.raises(UnauthorizedError):
++        await get_current_user(_credentials(token))
++    assert await get_optional_user(_credentials(token)) is None
++
++
++# --------------------------------------------------------------------------
++# Store outage behaviour
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_optional_auth_degrades_to_anonymous_when_the_store_is_down(auth_env, token):
++    _broken_store(auth_env)
++    # Before the fix this raised (-> HTTP 500) despite "optional" auth.
++    assert await get_optional_user(_credentials(token)) is None
++
++
++@pytest.mark.asyncio
++async def test_required_auth_reports_a_store_outage_as_503(auth_env, token):
++    _broken_store(auth_env)
++    with pytest.raises(AuthBackendUnavailableError) as caught:
++        await get_current_user(_credentials(token))
++    assert caught.value.status_code == 503
++    assert caught.value.code == "auth_unavailable"
++
++
++@pytest.mark.asyncio
++async def test_a_garbage_token_never_touches_the_store(auth_env):
++    _broken_store(auth_env)  # would raise if consulted
++    assert await get_optional_user(_credentials("not.a.jwt")) is None
++    with pytest.raises(UnauthorizedError):
++        await get_current_user(_credentials("not.a.jwt"))
++
++
++# --------------------------------------------------------------------------
++# Bearer parsing
++# --------------------------------------------------------------------------
++
++
++def _request_with_auth(value: str | None) -> Request:
++    headers = [(b"authorization", value.encode())] if value is not None else []
++    return Request({"type": "http", "method": "POST", "path": "/", "headers": headers})
++
++
++@pytest.mark.parametrize("scheme", ["Bearer", "bearer", "BEARER", "bEaReR"])
++def test_bearer_scheme_is_case_insensitive(scheme):
++    assert bearer_token_from_request(_request_with_auth(f"{scheme} abc.def.ghi")) == "abc.def.ghi"
++
++
++@pytest.mark.parametrize("value", [None, "", "Bearer", "Basic abc", "abc.def.ghi"])
++def test_non_bearer_headers_yield_no_token(value):
++    assert bearer_token_from_request(_request_with_auth(value)) == ""
++
++
++def test_token_hash_matches_what_logout_will_look_up(auth_env, token):
++    # login stores token_hash_for(token); logout must derive the same value
++    # from whatever scheme casing the client used.
++    for scheme in ("Bearer", "bearer"):
++        extracted = bearer_token_from_request(_request_with_auth(f"{scheme} {token}"))
++        assert token_hash_for(extracted) == token_hash_for(token)
++
++
++# --------------------------------------------------------------------------
++# Login timing
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_unknown_email_login_still_pays_one_bcrypt_verification(auth_env):
++    from app.routers import auth as auth_router
++    from app.schemas import LoginRequest
++
++    calls: list[str] = []
++
++    async def no_such_user(_email):
++        return None
++
++    def spy_verify(plain, hashed):
++        calls.append(hashed)
++        return False
++
++    auth_env.setattr(auth_router, "get_user_by_email", no_such_user)
++    auth_env.setattr(auth_router, "verify_password", spy_verify)
++
++    request = Request({"type": "http", "method": "POST", "path": "/api/auth/login", "headers": []})
++    with pytest.raises(UnauthorizedError):
++        await auth_router.login(LoginRequest(email="nobody@example.com", password="whatever-password"), request)
++
++    # Before: verify_password was short-circuited away for unknown emails,
++    # so response time alone revealed which addresses were registered.
++    assert len(calls) == 1 and calls[0].startswith("$2")  # a real bcrypt hash
+diff --git a/apps/api/tests/test_gateway_security.py b/apps/api/tests/test_gateway_security.py
+new file mode 100644
+index 0000000..e1f1167
+--- /dev/null
++++ b/apps/api/tests/test_gateway_security.py
+@@ -0,0 +1,277 @@
++"""
++Gateway-layer security behaviour, tested against small purpose-built apps
++(no database, no provider calls) so each property is exercised in
++isolation and the tests run anywhere.
++
++Each test pins a defect that was reproduced against the running app
++before it was fixed (see the module docstrings of `rate_limit.py`,
++`errors.py`, `observability.py`):
++
++* rotating a spoofed X-Forwarded-For defeated every rate limit;
++* unhandled-error (500) responses carried no CORS header, so a browser
++  could not read the error id it is told to quote;
++* the access-log line for every request carried requestId "-".
++"""
++
++from __future__ import annotations
++
++import logging
++import time
++
++import httpx
++import pytest
++from fastapi import FastAPI
++from fastapi.middleware.cors import CORSMiddleware
++
++from app.config import RateLimitSettings, get_settings
++from app.errors import install_error_handlers
++from app.observability import RequestContextMiddleware, request_id_var
++from app.rate_limit import RateLimitMiddleware
++from app.security.jwt import create_access_token
++
++
++@pytest.fixture
++def env(monkeypatch):
++    """Set env vars and refresh cached settings; restore both afterwards."""
++
++    def _set(**values: str) -> None:
++        for key, value in values.items():
++            monkeypatch.setenv(key, value)
++        get_settings(refresh=True)
++
++    yield _set
++    monkeypatch.undo()
++    get_settings(refresh=True)
++
++
++def _limits(**overrides) -> RateLimitSettings:
++    base = dict(enabled=True, analyze_per_minute=3, default_per_minute=100, admin_per_minute=100, auth_per_minute=100)
++    base.update(overrides)
++    return RateLimitSettings(**base)
++
++
++def _rate_limited_app(settings: RateLimitSettings) -> FastAPI:
++    app = FastAPI()
++    app.add_middleware(RateLimitMiddleware, settings=settings)
++
++    @app.post("/api/ai/analyze")
++    async def analyze():
++        return {"ok": True}
++
++    @app.post("/api/auth/login")
++    async def login():
++        return {"ok": True}
++
++    @app.get("/api/ai/grok/health")
++    async def probe():
++        return {"ok": True}
++
++    @app.get("/api/ai/providers")
++    async def providers():
++        return {"ok": True}
++
++    return app
++
++
++def _client(app: FastAPI, peer: str = "198.51.100.7") -> httpx.AsyncClient:
++    transport = httpx.ASGITransport(app=app, client=(peer, 40000))
++    return httpx.AsyncClient(transport=transport, base_url="http://test")
++
++
++async def _statuses(client: httpx.AsyncClient, n: int, headers_for=lambda i: {}, path="/api/ai/analyze", method="POST"):
++    out = []
++    for i in range(n):
++        response = await client.request(method, path, headers=headers_for(i))
++        out.append(response.status_code)
++    return out
++
++
++# --------------------------------------------------------------------------
++# Rate-limit identity
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_rotating_a_spoofed_forwarded_for_header_cannot_bypass_the_limit(env):
++    env(TRUSTED_PROXY_COUNT="0")
++    async with _client(_rate_limited_app(_limits())) as client:
++        codes = await _statuses(client, 6, headers_for=lambda i: {"X-Forwarded-For": f"198.51.100.{i + 10}"})
++    # Before the fix this was [200]*6 — each new header value got a fresh bucket.
++    assert codes == [200, 200, 200, 429, 429, 429]
++
++
++@pytest.mark.asyncio
++async def test_a_trusted_proxy_makes_forwarded_for_the_identity(env):
++    env(TRUSTED_PROXY_COUNT="1")
++    async with _client(_rate_limited_app(_limits())) as client:
++        a = await _statuses(client, 4, headers_for=lambda i: {"X-Forwarded-For": "203.0.113.1"})
++        b = await _statuses(client, 3, headers_for=lambda i: {"X-Forwarded-For": "203.0.113.2"})
++    assert a == [200, 200, 200, 429]  # one real client, one bucket
++    assert b == [200, 200, 200]  # a different real client is unaffected
++
++
++@pytest.mark.asyncio
++async def test_authenticated_requests_share_one_bucket_per_user_across_ips(env):
++    env(JWT_SECRET="test-secret-do-not-use-in-production", JWT_ISSUER="oxygen-ai-test", TRUSTED_PROXY_COUNT="0")
++    token, _ = create_access_token("11111111-1111-1111-1111-111111111111", "u@example.com", "user")
++    headers = {"Authorization": f"Bearer {token}"}
++    app = _rate_limited_app(_limits())
++    async with _client(app, peer="198.51.100.1") as first, _client(app, peer="198.51.100.2") as second:
++        codes = await _statuses(first, 2, headers_for=lambda i: headers)
++        codes += await _statuses(second, 2, headers_for=lambda i: headers)
++    # Same account from two networks draws on the SAME 3-request budget.
++    assert codes == [200, 200, 200, 429]
++
++
++@pytest.mark.asyncio
++async def test_a_garbage_token_buys_no_extra_identity(env):
++    env(JWT_SECRET="test-secret-do-not-use-in-production", JWT_ISSUER="oxygen-ai-test", TRUSTED_PROXY_COUNT="0")
++    async with _client(_rate_limited_app(_limits())) as client:
++        codes = await _statuses(
++            client, 5, headers_for=lambda i: {"Authorization": f"Bearer not-a-real-token-{i}"}
++        )
++    assert codes == [200, 200, 200, 429, 429]
++
++
++# --------------------------------------------------------------------------
++# Bucket selection
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_credential_endpoints_use_the_tight_auth_bucket(env):
++    env(TRUSTED_PROXY_COUNT="0")
++    async with _client(_rate_limited_app(_limits(auth_per_minute=2))) as client:
++        login = await _statuses(client, 3, path="/api/auth/login")
++        analyze = await _statuses(client, 2)  # separate bucket, unaffected
++    assert login == [200, 200, 429]
++    assert analyze == [200, 200]
++
++
++@pytest.mark.asyncio
++async def test_provider_probe_endpoints_use_the_admin_bucket(env):
++    env(TRUSTED_PROXY_COUNT="0")
++    async with _client(_rate_limited_app(_limits(admin_per_minute=2))) as client:
++        probe = await _statuses(client, 3, path="/api/ai/grok/health", method="GET")
++        other = await _statuses(client, 3, path="/api/ai/providers", method="GET")
++    # Before: /api/ai/{id}/health fell through to the default bucket.
++    assert probe == [200, 200, 429]
++    assert other == [200, 200, 200]
++
++
++def test_idle_buckets_are_pruned():
++    middleware = RateLimitMiddleware(FastAPI(), settings=_limits())
++    middleware._bucket_for("ip:198.51.100.1", "analyze", 30)
++    middleware._bucket_for("ip:198.51.100.2", "analyze", 30)
++    assert len(middleware._buckets) == 2
++
++    middleware._buckets[("ip:198.51.100.1", "analyze")].last_refill -= 10_000  # long idle
++    middleware._last_prune -= 10_000  # prune interval elapsed
++    middleware._prune(time.monotonic())
++
++    assert list(middleware._buckets) == [("ip:198.51.100.2", "analyze")]
++
++
++# --------------------------------------------------------------------------
++# Unhandled errors are readable by the browser
++# --------------------------------------------------------------------------
++
++ALLOWED = "http://localhost:3000"
++
++
++def _error_app() -> FastAPI:
++    app = FastAPI()
++    install_error_handlers(app, allowed_origins=[ALLOWED])
++    app.add_middleware(RequestContextMiddleware)
++    app.add_middleware(
++        CORSMiddleware, allow_origins=[ALLOWED], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
++    )
++
++    @app.get("/boom")
++    async def boom():
++        raise KeyError("simulated bug")
++
++    class DataError(Exception):  # name-matched by the handler, like asyncpg's
++        pass
++
++    @app.get("/malformed")
++    async def malformed():
++        raise DataError("invalid UUID")
++
++    return app
++
++
++@pytest.mark.asyncio
++async def test_unhandled_error_response_carries_cors_headers_and_request_id():
++    transport = httpx.ASGITransport(app=_error_app(), raise_app_exceptions=False)
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++        response = await client.get("/boom", headers={"Origin": ALLOWED, "X-Request-Id": "trace-500"})
++    assert response.status_code == 500
++    assert response.json()["code"] == "internal_error"
++    assert response.json()["errorId"]  # the thing a user is told to quote
++    # Before the fix both of these were absent on a 500.
++    assert response.headers["access-control-allow-origin"] == ALLOWED
++    assert response.headers["x-request-id"] == "trace-500"
++
++
++@pytest.mark.asyncio
++async def test_driver_data_error_400_also_carries_cors_headers():
++    transport = httpx.ASGITransport(app=_error_app(), raise_app_exceptions=False)
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++        response = await client.get("/malformed", headers={"Origin": ALLOWED})
++    assert response.status_code == 400
++    assert response.headers["access-control-allow-origin"] == ALLOWED
++
++
++@pytest.mark.asyncio
++async def test_error_response_does_not_grant_cors_to_an_unlisted_origin():
++    transport = httpx.ASGITransport(app=_error_app(), raise_app_exceptions=False)
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++        evil = await client.get("/boom", headers={"Origin": "https://evil.example"})
++        none = await client.get("/boom")
++    assert "access-control-allow-origin" not in evil.headers
++    assert "access-control-allow-origin" not in none.headers
++
++
++# --------------------------------------------------------------------------
++# Request id on the access-log line
++# --------------------------------------------------------------------------
++
++
++class _CaptureRequestId(logging.Handler):
++    """Records the request-id context variable as seen at emit time — which
++    is exactly what the JSON formatter reads when it renders the line."""
++
++    def __init__(self) -> None:
++        super().__init__(level=logging.DEBUG)
++        self.seen: list[tuple[str, str]] = []
++
++    def emit(self, record: logging.LogRecord) -> None:
++        self.seen.append((record.getMessage(), request_id_var.get()))
++
++
++@pytest.mark.asyncio
++async def test_access_log_line_carries_the_request_id():
++    app = FastAPI()
++    app.add_middleware(RequestContextMiddleware)
++
++    @app.get("/ping")
++    async def ping():
++        return {"ok": True}
++
++    logger = logging.getLogger("oxygen.request")
++    capture = _CaptureRequestId()
++    previous_level = logger.level
++    logger.addHandler(capture)
++    logger.setLevel(logging.INFO)
++    try:
++        transport = httpx.ASGITransport(app=app)
++        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++            response = await client.get("/ping", headers={"X-Request-Id": "trace-abc-123"})
++    finally:
++        logger.removeHandler(capture)
++        logger.setLevel(previous_level)
++
++    assert response.headers["x-request-id"] == "trace-abc-123"
++    # Before the fix this line was recorded with request id "-".
++    assert ("request", "trace-abc-123") in capture.seen
+diff --git a/apps/api/tests/test_network.py b/apps/api/tests/test_network.py
+new file mode 100644
+index 0000000..7601a3f
+--- /dev/null
++++ b/apps/api/tests/test_network.py
+@@ -0,0 +1,88 @@
++"""
++`security/network.py` — client identity for rate limiting and sessions.
++
++Regression coverage for two reproduced defects: (1) the first
++X-Forwarded-For value was trusted unconditionally, so a client could
++choose its own rate-limit identity; (2) the raw header string was written
++to `sessions.ip` (`inet`), so a non-IP value or an `ip:port` form from a
++proxy made login/registration fail. No database needed.
++"""
++
++from __future__ import annotations
++
++import pytest
++from starlette.requests import Request
++
++from app.security.network import client_ip, normalize_ip
++
++
++def _request(peer: str | None, forwarded: str | None = None) -> Request:
++    headers = []
++    if forwarded is not None:
++        headers.append((b"x-forwarded-for", forwarded.encode()))
++    scope = {
++        "type": "http",
++        "method": "GET",
++        "path": "/",
++        "headers": headers,
++        "client": (peer, 1234) if peer is not None else None,
++    }
++    return Request(scope)
++
++
++class TestNormalizeIp:
++    @pytest.mark.parametrize(
++        "raw, expected",
++        [
++            ("203.0.113.9", "203.0.113.9"),
++            (" 203.0.113.9 ", "203.0.113.9"),
++            ("203.0.113.9:51234", "203.0.113.9"),  # PaaS front doors append the port
++            ("2001:db8::1", "2001:db8::1"),
++            ("[2001:db8::1]:443", "2001:db8::1"),
++            ("::1", "::1"),
++        ],
++    )
++    def test_valid_forms_reduce_to_the_address(self, raw, expected):
++        assert normalize_ip(raw) == expected
++
++    @pytest.mark.parametrize(
++        "raw", [None, "", "   ", "unknown", "testclient", "203.0.113.999", "1.2.3.4:abc", "a, b", "'; DROP TABLE sessions;--"]
++    )
++    def test_anything_that_is_not_an_ip_is_none(self, raw):
++        assert normalize_ip(raw) is None
++
++
++class TestClientIp:
++    def test_header_is_ignored_when_no_proxy_is_trusted(self):
++        # The default (0). A client-supplied value must never decide identity.
++        request = _request("198.51.100.7", forwarded="1.1.1.1, 2.2.2.2")
++        assert client_ip(request, trusted_proxy_count=0) == "198.51.100.7"
++
++    def test_one_trusted_proxy_uses_the_last_entry(self):
++        # nginx appends the address it saw as the final entry; anything a
++        # client prepended to the header sits to its left and is ignored.
++        request = _request("10.0.0.5", forwarded="6.6.6.6, 203.0.113.9")
++        assert client_ip(request, trusted_proxy_count=1) == "203.0.113.9"
++
++    def test_two_trusted_proxies_use_the_second_from_the_right(self):
++        request = _request("10.0.0.5", forwarded="6.6.6.6, 203.0.113.9, 10.0.0.4")
++        assert client_ip(request, trusted_proxy_count=2) == "203.0.113.9"
++
++    def test_header_shorter_than_configured_falls_back_to_leftmost(self):
++        request = _request("10.0.0.5", forwarded="203.0.113.9")
++        assert client_ip(request, trusted_proxy_count=3) == "203.0.113.9"
++
++    def test_unparseable_trusted_entry_falls_back_to_the_peer(self):
++        request = _request("198.51.100.7", forwarded="unknown")
++        assert client_ip(request, trusted_proxy_count=1) == "198.51.100.7"
++
++    def test_port_suffixed_entry_is_reduced_to_an_address(self):
++        request = _request("10.0.0.5", forwarded="203.0.113.9:51234")
++        assert client_ip(request, trusted_proxy_count=1) == "203.0.113.9"
++
++    def test_non_ip_peer_yields_none_not_a_string_postgres_would_reject(self):
++        # The in-process test transport reports the peer as "testclient".
++        assert client_ip(_request("testclient"), trusted_proxy_count=0) is None
++
++    def test_missing_peer_yields_none(self):
++        assert client_ip(_request(None), trusted_proxy_count=0) is None
+diff --git a/docs/implementation/ENDPOINT_CHECKLIST.md b/docs/implementation/ENDPOINT_CHECKLIST.md
+new file mode 100644
+index 0000000..322f6be
+--- /dev/null
++++ b/docs/implementation/ENDPOINT_CHECKLIST.md
+@@ -0,0 +1,96 @@
++# Endpoint reconciliation — Passage 1 §10 + Passage 4 §6.1–§6.3
++
++Built from the **live route table** of the application (`app.routes`), then compared with
++the endpoints Passage 1/4 name. Updated at the end of every phase.
++
++Required contract shape (P4 §6.3): Method · Path · Authentication · Request schema ·
++Response schema · Error schema · Rate limits · Permissions. Errors everywhere use the single
++body `{ "error", "code", "detail", "details"?, "errorId"? }` (`app/errors.py`).
++
++Rate-limit buckets (`app/rate_limit.py`, per user when authenticated, else per validated
++client IP): `auth` 10/min · `analyze` 30/min · `admin` 60/min (models, route, provider
++test/health) · `default` 120/min.
++
++## A. Implemented (18 routes)
++
++| Method · Path | Request → Response | Authn / Authz | Validation & errors | Persistence · deps | Status · Tests |
++|---|---|---|---|---|---|
++| GET `/health` | — → `{status, service, databaseConfigured, authConfigured, authRequired, nativeLayerAvailable}` | none | — | — | Done · smoke-run against real uvicorn; automated test planned (P2) |
++| POST `/api/auth/register` | `RegisterRequest{email, password 12–256}` → `TokenResponse{accessToken, tokenType, expiresIn, user}` | none · `auth` bucket | 400 invalid **or email already registered** · 503 auth not configured | `users`, `sessions` (IP validated) | Done · integration ✔ |
++| POST `/api/auth/login` | `LoginRequest` → `TokenResponse` | none · `auth` bucket | 401 identical for unknown/wrong/inactive; constant-time | `sessions` | Done · integration ✔, timing-decoy ✔ |
++| POST `/api/auth/logout` | — → `{ok}` | JWT (scheme case-insensitive) | idempotent | deletes `sessions` row | Done · integration ✔ (3 scheme casings) |
++| GET `/api/auth/me` | — → `UserResponse` | JWT | 401 · 503 store down | reads `users` | Done · integration ✔ |
++| POST `/api/ai/analyze` | `AnalyzeRequest{symbol≤20, mode?, provider?, providers[2–3]?, timeframe:"1d", accountEquity?…}` → `TradeAnalysis` (single) \| `ComparisonResponse` (multi) | **JWT required** (`AUTH_REQUIRED=false` = dev only) · `analyze` bucket | 400 invalid · 401 · **409 market data unavailable/invalid** · 503 provider unavailable (only if the fallback also fails) · a verification failure is a 200 `NO_VALID_SETUP` | `market_data`, `technical_indicators`, `trading_signals`, `usage_logs`, `conversations`+`ai_comparisons`+`ai_comparison_results` (multi) · engine, RAG, router | Done* · HTTP auth ✔; engine/router unit ✔. *Array-shape question D4 → P3/P12 |
++| PATCH `/api/ai/comparisons/{id}` | `RateComparisonRequest{rating 1–5?, preferredProviderId?}` → `ComparisonFeedback` | JWT required · **owner or admin only** (non-owner gets 404) | 400 malformed id · 404 | `ai_comparisons` | Done · integration ✔ |
++| GET `/api/ai/providers` | — → provider list | **none (public)** — reveals which providers are configured; tighten decision → P12 | — | registry | Done · no HTTP test (P12) |
++| POST `/api/ai/route` | `RouteRequest{mode?, provider?, providers?, allowFallback}` → `RouteResponse{mode, decisions[]}` | JWT (any role) · `admin` bucket | 400 | registry + breaker (no execution) | Done · integration ✔ |
++| GET `/api/ai/tools` | — → tool list | JWT + **admin** | 401/403 | `tool_registry` | Done · registry-level tests (HTTP test → P6) |
++| POST `/api/ai/tools/{name}/invoke` | tool input → tool output | JWT + **admin** | 404 unknown tool. Tool failures are **HTTP 200** with the outcome in the body: `{tool, status: ok\|error\|timeout, output, error, latencyMs, available}`; runs as `provider_id="custom"` for permission checks | `tool_calls` | Done · registry-level ✔ (HTTP test → P6) |
++| POST `/api/ai/{provider_id}/test` | — → `HealthResponse{ok, latencyMs, modelChecked, detail, transport}` | JWT + **admin** · `admin` bucket | 404 unknown provider | provider call | Done* · admin gating ✔. *P4 §6.2 wants `{ok, latency_ms, model_checked}` → snake_case alias in P3 |
++| GET `/api/ai/{provider_id}/health` | — → `HealthResponse` | JWT + **admin** · `admin` bucket | as above | provider call; `ai_health_checks` write → P2 | Done* · same note |
++| POST `/api/knowledge/upload` | `KnowledgeUploadRequest{title, content, sourceType}` | JWT + **admin** | 400 · 403 | `knowledge_documents/chunks`, `embeddings` | Done · authz ✔ |
++| POST `/api/knowledge/upload/file` | multipart PDF/TXT/CSV | JWT + **admin** | 400 unsupported · size limit (**reads whole file before checking** → P9) | same | Done · authz ✔ |
++| POST `/api/knowledge/search` | `KnowledgeSearchRequest{query, topK}` → chunks | JWT (any role) | 400 | pgvector | Done · authz ✔ |
++| GET `/api/knowledge/documents` | → documents | JWT (any role) | — | — | Done · authz ✔ |
++| DELETE `/api/knowledge/documents/{id}` | — | JWT + **admin** | 404 | cascades chunks/embeddings | Done · authz ✔ |
++
++**Spec ambiguity recorded (not silently resolved):** P4 §6.2 lists "409 market data unavailable →
++engine returns NO_VALID_SETUP, not an HTTP error". Those two halves conflict. The baseline raises
++HTTP 409 when the engine cannot run at all (too few / invalid bars) and returns a 200
++`NO_VALID_SETUP` when the engine ran but verification failed. Kept as-is; to be revisited in P7,
++when real market-data adapters make "stale vs unavailable" a first-class distinction.
++
++## B. Required by Passage 1/4 but not yet implemented
++
++| Method · Path | Source | Spec detail | Phase |
++|---|---|---|---|
++| GET/POST/PATCH/DELETE `/api/ai/models` | P1 §10, P4 §6.2 | CRUD over `ai_models`, admin RBAC, **every write → `audit_logs`**, 7-value status enum | P3 |
++| POST `/api/ai/compare` | P1 §10 | accepts 2–3 `provider_id`; writes `ai_comparisons` + `ai_comparison_results` | P3 |
++| POST `/api/ai/gemma/test`, GET `/api/ai/gemma/health` | P1 §10 | generic routes already serve the *path*; add `{ok, latency_ms, model_checked}` and hosted+local health backed by `ai_health_checks` | P3/P4 |
++| Custom AI test/health | P4 §6.3 category | same generic routes; local-runtime detail | P4 |
++| Provider settings read/write | P1 §4.4.1 | the 14 local-runtime admin fields, timeouts, retries, fallback model | P3/P4 |
++| Market Data (quotes, history, instruments) | P4 §6.3 | via adapter abstraction | P7 |
++| Indicators (list/compute; custom-indicator CRUD + test) | P4 §6.3, G01b | constrained expression tree; backtest-before-enable | P8 |
++| Memory (user-scoped get/put/delete/export) | P1 §8 | explicit delete/export for long-term + session | P10 |
++| WebSocket `/ws/conversations/{id}` | P1 §3 | auth, channel isolation, persistence, pub/sub | P11 |
++| Users (admin CRUD) | P4 §6.3 | admin | P12 |
++| Trading Signals (list/read) | P4 §6.3 | user-scoped | P12 |
++| History (save/list user results) | P4 §3.6 "Save result" | per-user | P12 |
++| Usage | P4 §6.3 | reads `usage_logs` | P12 |
++| Monitoring (dashboards) | P4 §6.3 | reads `ai_health_checks` | P12 |
++| Errors (error center) | P4 §6.3 | reads/updates `error_logs` (status workflow) | P12 |
++| Admin (system settings versioned, audit log read) | P1 §8, P4 §6.3 | admin | P12 |
++| Feedback | P4 §5.2 `feedback` | rating on signals | P12 |
++
++## C. Deferred — owning subsystem/spec outside Passage 1 + 4
++
++Backtesting (run/results), Paper Trading (positions), Voice (session), Charting data,
++payments/billing, News/Sentiment. Contracts follow the same shape and are deliberately deferred
++(P4 §6.3: "deferred to a Phase-1 OpenAPI-spec task rather than pre-written"). The tools that
++depend on them (`backtesting`, `portfolio_analyzer`, `news`, `sentiment`, …) already return
++an explicit *unavailable* result. P14 exports the OpenAPI document so the remaining
++contracts can be added against a real schema.
++
++## D. The 19 required endpoint categories (P4 §6.3)
++
++| Category | State |
++|---|---|
++| Auth | ✔ |
++| Users | P12 |
++| AI | ✔ (analyze) · P3 (compare) |
++| Grok | ✔ generic test/health · P3 alias |
++| Custom AI | generic test/health ✔ · P4 |
++| AI Provider Routing | ✔ `/route` |
++| AI Model Management | P3 |
++| Market Data | P7 |
++| Indicators | P8 |
++| Trading Signals | P12 |
++| Backtesting | deferred (C) |
++| Paper Trading | deferred (C) |
++| Knowledge | ✔ |
++| Memory | P10 |
++| Voice | deferred (C) |
++| Admin | P12 |
++| Monitoring | P12 |
++| Errors | P12 |
++| Usage | P12 |
+diff --git a/docs/implementation/PLAN.md b/docs/implementation/PLAN.md
+new file mode 100644
+index 0000000..90d05ea
+--- /dev/null
++++ b/docs/implementation/PLAN.md
+@@ -0,0 +1,242 @@
++# Oxygen AI — Passage 1 + Passage 4 Implementation Plan
++
++Living document. Every delivery updates the **Progress** table at the bottom;
++a continuation session resumes at the first phase not marked DONE — it does
++not re-analyse the project from scratch.
++
++## 0. Source of truth and its limits
++
++| Source | Role |
++|---|---|
++| Passage 1 (Architecture Core) | Primary blueprint |
++| Passage 4 (Correction & Recovery, G01–G16) | Corrections folded **into** Passage 1 subsystems — never a parallel system |
++| Master Prompt / Work-Start constraints | Binding architecture rules |
++| Uploaded `OxygenAI-main.zip` (the 46-file baseline) | Actual current state |
++
++**Not supplied: Passage 2 and Passage 3.** Passage 1 and Passage 4 repeatedly delegate
++detail to them (Admin Panel control inventory P2 §11.1, market-data vendors/DEMO-PAPER-LIVE
++P2 §13, backtesting/paper trading P2 §18, voice, charting, error center, roadmap P3 §26–27).
++Where a requirement's only specification lives there, this plan implements what Passage 1 /
++Passage 4 / the continuation prompt state and marks the rest **"needs Passage 2/3 text"** —
++it does not invent a spec. The continuation prompt also mentions "payments" as an admin
++domain; no Passage 1/4 text defines it, so it is listed under *Not specified* below.
++
++## 1. Baseline reconciliation (what the zip already contains)
++
++The continuation prompt's "remaining" list pre-dates the uploaded zip. Verified against the
++code (and by running it: 215 backend tests passing, mypy clean, native build + parity gate,
++frontend build):
++
++| Prompt listed as remaining | Actual baseline state | Remaining work → phase |
++|---|---|---|
++| RAG / pgvector pipeline | **Built**: extract→clean→chunk→embed→pgvector→retrieve→rerank(lexical)→labelled context | Hardening: embedding-model filter, oversize-chunk splitting, query task type, batching, rerank decision → **P9** |
++| 15-tool registry + governance | **Built**: 15 tools, schemas, timeouts, rate limits, `tool_calls` logging, admin API | Role/mode permission check, provider tool-calling loop, deferred-tool owners → **P6** |
++| Authentication / JWT | Built but **not enforced** (analyze accepted anonymous) | Enforcement + hardening → **P1 (DONE)** |
++| Memory layers | Knowledge memory only | Short-term, session, long-term (`memories`), system (versioned), delete/export → **P10** |
++| Market-data vendor adapters | **Not built** (synthetic OHLCV only) | → **P7** |
++| WebSocket | **Not built** | → **P11** |
++| Redis | **Not built** (`REDIS_URL` read, unused) | → **P9** |
++| Custom-indicator evaluator | **Not built** (table only) | → **P8** |
++| Local/offline runtimes | Gemma local *transport* only | Runtime catalog, admin config, availability, Custom AI keyless local → **P4** |
++| Admin Panel UI | **Not built** | → **P5 + P13** |
++| Models CRUD / named endpoints | **Not built** | → **P3, P12** |
++
++### Passage 1 section status
++
++| P1 § | Requirement | Baseline | Phase |
++|---|---|---|---|
++| §3 | REST gateway, auth, rate-limit | Built; auth/rate-limit hardened in P1 | P1 ✔ |
++| §3 | WebSocket | Missing | P11 |
++| §3 | Redis (cache/queue) | Missing | P9 |
++| §3 | Market Data Abstraction | Missing | P7 |
++| §4.1 | Custom AI as orchestrating agent | Provider only; `agent/orchestrator.py` referenced in docstrings but absent | P6 |
++| §4.1 / G01b | Admin-authored custom indicators (constrained expression tree) | Missing | P8 |
++| §4.2 / G02 | Grok slugs, redirects, Responses/Agent-Tools API, registry automation | Slug handling built; DB flip + alert partial; Responses API absent | P3, P6 |
++| §4.3 | Gemma 4 identity vs transport | Built | — |
++| §4.4 / §4.4.1 | Offline runtimes, admin fields, controlled fallback, `local_model` tag | Transport only | P4 |
++| §4.5 / G03 / G11 | Router, breaker (5/60s, **admin-configurable**), fallback, `ai_health_checks` persisted | Built; configurability + persistence missing | P2, P3 |
++| §4.6 / G04 / G09 / G10 | Comparison, scoring axes, placeholders, footer actions, model badge | Built; "Save → History" missing; "Why they disagree" is Post-MVP (P3 §27) | P12/P13 |
++| §4.7 | Reasoning pipeline | Built | — |
++| §4.8 / G05 | Tool registry governed, provider-agnostic | Registry built; not wired to providers | P6 |
++| §5 | C++/CUDA layer, pybind11, parity gate, pure-Python fallback | Built and verified | — |
++| §6 / G06 | Deterministic engine | Built | — |
++| §7 | RAG pipeline + source tags | Built; hardening | P9 |
++| §8 | Six memory layers + delete/export | 1 of 6 | P10 |
++| §9 / G12 | Schema, relationships, indexing, retention | Schema complete (0001–0005); operational usage partial | P2, P10, P12 |
++| §10 / G08 / G13 | Named endpoints, 19 categories, contract shape | 18 routes of the required set | P3, P12 (see ENDPOINT_CHECKLIST.md) |
++
++### Passage 4 G01–G16
++
++| ID | Status in baseline | Action | Phase |
++|---|---|---|---|
++| G01 | a: table is documentation; b: mechanism missing | Docs for (a); implement evaluator for (b) | P14 / P8 |
++| G02 | Mostly built | Responses API path; DB-backed registry flip + alert | P6 / P3 |
++| G03 | Built (5/60s) | Make admin-configurable | P3 |
++| G04, G10, G11 | Built | Re-verify in final audit | P15 |
++| G05 | Registry built, governance partial | Roles/modes, orchestration | P6 |
++| G06 | Built | Re-verify | P15 |
++| G07 | Rationale only needs documenting | Docs | P14 |
++| G08 | `/route` built; models CRUD, compare missing | Implement | P3 |
++| G09 | Built except "Save → History" | History list + save | P12/P13 |
++| G12 | Schema ✔; see table below | Per-table ownership | P2/P10/P12 |
++| G13 | 18 of the required endpoints | Full reconciliation | P3, P12 |
++| G14, G15, G16 | Missing documentation | Docs only, no runtime change | P14 |
++
++### G12 — table ownership (not "make every count non-zero")
++
++| Table | Owner subsystem | Operational today? | Plan |
++|---|---|---|---|
++| users, roles, permissions, sessions | Auth | Yes | P1 (+purge P2) |
++| ai_providers, ai_models | Router/registry | Yes (seeded on use) | P3 makes DB the registry's system of record |
++| ai_provider_settings | Provider admin | No | P3/P4 |
++| ai_routing_rules, ai_fallback_rules | Router | No | P3 decides: use for admin-configurable fallback, else document as dormant |
++| ai_health_checks | Router monitoring | No | P2 writes, P12/P13 reads |
++| ai_comparisons, ai_comparison_results | Comparison | Yes | — |
++| market_instruments, market_data, technical_indicators | Market data / engine | Yes (dedupe missing) | P2 (unique+upsert), P7 |
++| trading_signals, feedback | Engine / evaluation | signals yes; feedback no | P12 |
++| knowledge_*, embeddings | RAG | Yes | P9 |
++| conversations | Conversation/WebSocket | **Started in P1** (comparison ownership) | P11 |
++| messages | WebSocket | No | P11 |
++| memories | Memory | No | P10 |
++| tool_registry, tool_calls | Tools | Yes | P6 |
++| custom_indicator_definitions | Custom indicators | No | P8 |
++| error_logs, audit_logs, usage_logs | Ops | usage partial; error/audit no | P2 |
++| system_settings | System memory | No | P2/P12 |
++| feature_flags | Ops | No | Dormant until an owning feature exists |
++| strategies, strategy_versions, backtests, trade_setups, trade_results | Backtesting / paper trading (P2 §18) | No | **Intentionally dormant** — owner subsystem not in this scope |
++| voice_settings | Voice (P2) | No | **Intentionally dormant** |
++| Retention | audit_logs/trade_results indefinite; sessions/memories expire; tick roll-up N/A (no tick data) | — | P2 job |
++
++### Not specified in the supplied sources (not implemented, not forgotten)
++
++Backtesting, paper trading, voice, charting, payments/billing, news/sentiment feeds,
++Post-MVP "Why they disagree". Their endpoints are listed in `ENDPOINT_CHECKLIST.md` with
++status *deferred — owner subsystem/spec outside Passage 1+4*. The tool registry already
++reports the dependent tools honestly as unavailable.
++
++## 2. Cross-cutting decisions (flag to the owner)
++
++| # | Decision | Rationale |
++|---|---|---|
++| D1 | `AUTH_REQUIRED` defaults **true**; `false` is an explicit dev escape hatch with a startup warning | P4 §6.2: analyze "Auth: required (JWT)" |
++| D2 | Knowledge upload/delete are **admin-only**; search/list need login | P1 §8 "until admin deletes"; uploads feed every user's prompts |
++| D3 | JWT kept in `sessionStorage` | httpOnly-cookie auth needs CSRF work — separate change |
++| D4 | P1 §10 says analyze returns an **array**; baseline returns an object (frontend depends on it). Not changed in P1; resolved in P3/P12 via the named `POST /api/ai/compare` and an opt-in array shape | Avoids a silent breaking change; spec still satisfied by named endpoint |
++| D5 | `normalize_confidence(1)` → 100 is pinned by an existing test but ambiguous on a 0–100 prompt | Owner call; untouched |
++| D6 | R:R is a constant 2.0 for ~93% of setups (fixed R-multiples) — tests pin it | Design observation; untouched |
++| D7 | Legacy `apply_*.sh` scripts overwrite current files with older versions | Recommend deleting; P14 adds a guard |
++| D8 | `npm audit` flags `next@14.2.35`; fix needs a major bump | Separate decision, not made silently |
++
++## 3. Phases
++
++Order is dependency-driven. Where G15's rationale (Admin Panel earlier, Voice later) applies,
++the Admin Panel is split: provider/model administration (P5) lands as soon as its APIs exist.
++
++### P1 — Gateway security & JWT enforcement — **DONE**
++- **Objective:** make auth real; harden the gateway the rest of the system sits behind.
++- **P1 §:** 3 (auth, rate-limit), 8 (admin-curated knowledge). **P4:** G08b (analyze auth required, rate-limit per plan, error contract), G12 (sessions/conversations usage).
++- **Depends on:** baseline only.
++- **Files:** `security/{network,dependencies}.py`, `routers/{auth,analyze,comparisons,knowledge}.py`, `rate_limit.py`, `errors.py`, `observability.py`, `main.py`, `config.py`, `cli.py`, `db/{conversations,comparisons,users}.py`, frontend `lib/api.ts`, `app/components/AuthPanel.tsx`, `app/page.tsx`, tests.
++- **DB:** `0005_auth_hardening.sql` (indexes only, idempotent). **API:** auth now enforced; ownership on comparison feedback; knowledge RBAC. **Frontend:** login/register/sign-out gate.
++- **Tests / Verification / Completion:** see PHASE1 report in the delivery; 280 backend + 13 client tests; all green.
++
++### P2 — Persistence hygiene & operational foundations
++- **Objective:** fix the correctness/ops defects later phases build on; give G12's operational tables their writers.
++- **P1 §:** 4.5 (health checks persisted), 9 (indexing, retention). **P4:** G12 (b,c,d), G03.
++- **Depends on:** P1.
++- **Work:** `technical_indicators` unique key + upsert (duplicate rows per request today); `audit_logs` writer; `error_logs` persistence from the 500 handler (error id ↔ row); `ai_health_checks` writes from `/health` probes; usage logging in multi mode; mock-vs-fallback `display_name` corruption; breaker must not count "not configured" as a failure; negative-stop guard (`stop>0`); `get_pool` race + `close_pool` on shutdown; retention job (expired sessions, expired memories).
++- **Files:** `db/{indicators_db,audit,errors,health,usage,retention}.py`, `providers/{circuit_breaker,registry}.py` (minimal), `engine/risk_engine.py`/`verify.py` (guard), `main.py` lifespan.
++- **DB:** `0006_*` (unique index on technical_indicators with dedupe of existing rows; partial index `error_logs(status) WHERE status!='CLOSED'`). **API:** none. **Frontend:** none.
++- **Tests:** DB integration for each writer; breaker config-error regression; retention. **Verify:** full suite + mypy. **Complete when:** every item has a failing-before/passing-after test.
++
++### P3 — Provider settings, model registry persistence, Models CRUD, named endpoints
++- **Objective:** DB becomes the registry's system of record; admins manage models/providers through the API.
++- **P1 §:** 4.2, 4.5, 9.1, 10. **P4:** G02g, G03 (admin-configurable breaker), G08a/b, G12.
++- **Depends on:** P2 (audit writer).
++- **Work:** registry loads/syncs `ai_models` + seven-value status enum; `GET/POST/PATCH/DELETE /api/ai/models` (admin, audited); `ai_provider_settings` read/write incl. encrypted API keys (env stays authoritative unless admin override set; master key via env, never invented); breaker thresholds from settings; retired-slug auto-flip + alert persisted; `POST /api/ai/compare` (2–3 providers); snake_case `latency_ms`/`model_checked` aliases on test/health; decide `ai_routing_rules`/`ai_fallback_rules`.
++- **DB:** only if CHECK/enum or new column needed (decided after inspecting 0001). **Frontend:** none (P5).
++- **Tests:** CRUD authz matrix, audit rows, encryption round-trip, registry reload, compare endpoint parity with analyze multi.
++
++### P4 — Local/offline runtimes (Custom AI + Gemma 4)
++- **Objective:** real local operation, not just a transport.
++- **P1 §:** 4.1, 4.3.1, 4.4, 4.4.1. **P4:** G02 (Gemma list), G03 (both Gemma transports).
++- **Depends on:** P3 (settings + registry persistence).
++- **Work:** runtime catalog (llama.cpp, MLX, LiteRT-LM [E2B/E4B only], vLLM, Ollama; others listed as alternates) as descriptors over one OpenAI-compatible local transport; the 14 admin fields persisted (path, runtime, host, port, model id, quantization, GPU/CPU, context, enable, offline toggle, health, availability, resource display, fallback); reachability probe → controlled fallback/error; always tag `local_model`; Custom AI keyless when local; Gemma hosted gets timeout/retry parity; Gemma stays "Gemma 4", never "Gemini".
++- **Tests:** against an in-process OpenAI-compatible fake server (mock-tested; live runtime verification blocked — no runtime/GPU/weights in the sandbox, stated plainly).
++
++### P5 — Admin Panel foundation + provider/model/runtime administration (increment A)
++- **Objective:** the UI surface to test P3/P4 against (G15 rationale).
++- **P1 §:** 4.4.1 (admin requirement list). **P4:** G15, G09 (active-model badge source).
++- **Depends on:** P3, P4. **Files:** `app/admin/**`, shared admin client. **API:** none new.
++- **Work:** role-gated admin shell; providers, models CRUD, provider settings, local-runtime form (14 fields), health/test buttons, usage widget reading the account's real quota where the API exposes it.
++- **Verify:** typecheck, build, client tests; **no browser available in the sandbox** — stated in the report.
++
++### P6 — Tool-calling orchestration & tool governance
++- **Objective:** providers actually use the governed registry.
++- **P1 §:** 4.1, 4.2, 4.8. **P4:** G05, G02c.
++- **Depends on:** P3. **Work:** `agent/orchestrator.py` provider-agnostic tool loop (bounded steps/timeouts); role + mode permission check at execution; every call logged; Grok Responses/Agent-Tools path as an option; deferred tools stay honest about owners.
++- **Tests:** loop with scripted fake providers; permission denial; step-limit; log rows.
++
++### P7 — Market-data abstraction & adapters
++- **P1 §:** 3, 6. **P4:** G06 (data source), §9 URLs. **Depends on:** P2. **Needs P2 §13 text for DEMO/PAPER/LIVE semantics** (column `data_mode` exists).
++- **Work:** `market_data/` package: adapter interface, registry, demo (synthetic, labelled), TrueData and Global Datafeeds adapters (**unverified against live vendor APIs** — no credentials), crypto/forex adapter slot; engine reads via the abstraction; staleness; Market Data endpoints; market/historical tools use it.
++- **Tests:** fixtures + error/fallback paths; live vendor verification blocked by credentials.
++
++### P8 — Custom-indicator expression-tree evaluator
++- **P1 §:** 4.1. **P4:** G01b. **Depends on:** P7.
++- **Work:** constrained, side-effect-free expression tree over OHLCV + base indicators (no code execution), versioning, admin-authored, backtest-before-enable test endpoint, engine/prompt integration, CRUD endpoints.
++
++### P9 — Redis infrastructure + RAG hardening
++- **P1 §:** 3, 7, 8. **P4:** G07 (Redis role). **Depends on:** P1.
++- **Work:** Redis client + health; shared rate-limit counters; cache; session-memory store; pub/sub primitive for P11; (real Redis available via apt in the sandbox). RAG: filter by `model_used`, split oversize chunks (a 20k-row CSV currently becomes one 180k-word chunk), `RETRIEVAL_QUERY` task type, embedding batching, rerank decision.
++
++### P10 — Memory layers
++- **P1 §:** 8. **Depends on:** P9, P2. **Work:** short-term/session (Redis), long-term (`memories`), system (`system_settings`, versioned), trading (read path over signals/outcomes), knowledge (existing); user-scoped delete/export endpoints; retention.
++
++### P11 — WebSocket
++- **P1 §:** 3 (WSS), 9 (conversations/messages). **Depends on:** P9, P10, P1.
++- **Work:** authenticated connection lifecycle, per-conversation channel isolation (builds on the P1 `conversations` ownership), message handling + `messages` persistence, Redis pub/sub fan-out, reconnect/error semantics.
++
++### P12 — Remaining endpoint categories
++- **P1 §:** 10. **P4:** G13. **Depends on:** P2, P10.
++- **Work:** Users (admin CRUD), Trading Signals, History (save/list), Usage, Monitoring, Errors, Admin (settings with versioning, audit log read), feedback; analyze array-shape decision (D4). Backtesting/Paper-trading/Voice stay deferred (see §1).
++
++### P13 — Admin Panel increment B
++- **Depends on:** P12, P8, P10. **Work:** users, tools, knowledge, memory, usage, errors, system settings, monitoring, custom indicators.
++
++### P14 — Documentation artifacts
++- **P4:** G14 (folder rationale + concern map, **documenting the actual layout** and where it deliberately differs from the blueprint tree), G15 (roadmap rationale), G16 (10 source URLs), G01a (capability table), G07 (DB reasoning). OpenAPI export; refresh root/infra READMEs; guard or retire the `apply_*.sh` scripts. No runtime change.
++
++### P15 — Final forensic reconciliation
++- Requirement × Source × Implemented × Integrated × Tested × Evidence table for every P1 requirement, G01–G16, and master constraint; re-verify G04/G06/G09/G10/G11; classify anything blocked by credentials as *code complete / integration path complete / live verification blocked*.
++
++## 4. Defects found during analysis → where they are fixed
++
++| # | Defect (all reproduced against the baseline) | Phase |
++|---|---|---|
++| 1 | Rotating X-Forwarded-For bypasses rate limits (7/7 passed a 3/min limit) | **P1 ✔** |
++| 2 | Non-IP / `ip:port` X-Forwarded-For breaks login+registration | **P1 ✔** |
++| 3 | `logout` with lowercase `bearer` leaves the token valid | **P1 ✔** |
++| 4 | "Optional" auth returns 500 when the DB is down | **P1 ✔** |
++| 5 | Any registered user can delete/poison shared knowledge | **P1 ✔** |
++| 6 | Unconfigured provider trips the breaker → misleading `circuit_open` | P2 |
++| 7 | Fallback-to-mock overwrites `mock-v1` display name with "Grok (xAI)" | P2 |
++| 8 | Duplicate `technical_indicators` rows on every request | P2 |
++| 9 | 20k-row CSV → one 180,000-word chunk | P9 |
++| 10 | Negative stop-loss accepted as a valid setup | P2 |
++| 11 | RAG ignores `model_used`; switching embedding provider corrupts retrieval | P9 |
++| 12 | Unhandled-error responses lack CORS headers | **P1 ✔** |
++| 13 | Access-log line loses the request id | **P1 ✔** |
++| 14 | R:R effectively constant 2.0 | D6 (by design) |
++| 15 | `normalize_confidence(1)` = 100 | D5 (owner call) |
++| — | Timing side-channel on unknown-email login | **P1 ✔** |
++| — | `sessions.token_hash` unindexed on the hot path | **P1 ✔** (0005) |
++| — | Gemma hosted path has no timeout/retry | P4 |
++| — | `close_pool()` never called; `get_pool` race | P2 |
++
++## 5. Progress
++
++| Phase | Status |
++|---|---|
++| P1 | **DONE** — delivered with this document |
++| P2 – P15 | Pending (resume at **P2**) |
+diff --git a/infra/migrations/0005_auth_hardening.sql b/infra/migrations/0005_auth_hardening.sql
+new file mode 100644
+index 0000000..36078d0
+--- /dev/null
++++ b/infra/migrations/0005_auth_hardening.sql
+@@ -0,0 +1,31 @@
++-- 0005_auth_hardening.sql
++-- Phase 1 of the Passage 1 + Passage 4 continuation (authentication
++-- enforcement). Index-only; no table or column is created, altered, or
++-- dropped, so no data is touched and it is safe to apply to a database
++-- that already holds users, sessions and comparisons.
++--
++-- Why these indexes (each query below was a sequential scan):
++--
++--   * sessions(token_hash): every authenticated request runs
++--       SELECT ... FROM sessions WHERE token_hash = $1 AND expires_at > now()
++--     Authentication is now mandatory on /api/ai/analyze, so this runs on
++--     the hot path. UNIQUE as well as indexed: a token hash identifies one
++--     session by construction (the JWT carries a random jti), and a
++--     duplicate would make logout revoke only one of two live sessions.
++--   * sessions(expires_at): expired-session purge and the validity check.
++--   * sessions(user_id): "log out everywhere" (delete_all_sessions_for_user).
++--   * conversations(user_id): conversation ownership lookups used by
++--     comparison-feedback authorization and the later WebSocket/memory phases.
++--
++-- Idempotent: every statement is IF NOT EXISTS, so re-running is harmless.
++--
++-- ROLLBACK (the project has no migration runner; run manually if needed):
++--   DROP INDEX IF EXISTS uq_sessions_token_hash;
++--   DROP INDEX IF EXISTS idx_sessions_expires_at;
++--   DROP INDEX IF EXISTS idx_sessions_user_id;
++--   DROP INDEX IF EXISTS idx_conversations_user_id;
++
++CREATE UNIQUE INDEX IF NOT EXISTS uq_sessions_token_hash ON sessions (token_hash);
++CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions (expires_at);
++CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions (user_id);
++CREATE INDEX IF NOT EXISTS idx_conversations_user_id ON conversations (user_id);
+diff --git a/lib/api.test.mjs b/lib/api.test.mjs
+new file mode 100644
+index 0000000..b2c9027
+--- /dev/null
++++ b/lib/api.test.mjs
+@@ -0,0 +1,136 @@
++// Tests for lib/api.ts — the browser-side half of Passage 4 §6.2's "Auth:
++// required (JWT)". Run with: npm run test:client  (Node >= 22.6).
++//
++// The repo has no JS test framework, so this uses Node's built-in runner
++// and executes the real TypeScript module (type annotations stripped by
++// Node) with `fetch` and `sessionStorage` replaced by in-memory stubs.
++// It does not exercise a browser — see the Phase 1 report for what was and
++// was not run.
++
++import assert from "node:assert/strict";
++import { beforeEach, describe, test } from "node:test";
++
++const store = new Map();
++globalThis.window = {
++  sessionStorage: {
++    getItem: (k) => (store.has(k) ? store.get(k) : null),
++    setItem: (k, v) => void store.set(k, String(v)),
++    removeItem: (k) => void store.delete(k),
++  },
++};
++
++let calls = [];
++let responder = () => new Response("{}", { status: 200 });
++globalThis.fetch = async (url, init = {}) => {
++  calls.push({ url: String(url), init, headers: new Headers(init.headers) });
++  return responder(url, init);
++};
++
++const api = await import("./api.ts");
++
++const json = (status, body) =>
++  new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
++
++beforeEach(() => {
++  store.clear();
++  calls = [];
++  responder = () => json(200, {});
++});
++
++describe("apiFetch", () => {
++  test("attaches the bearer token and a JSON content type when there is a body", async () => {
++    api.setToken("tok-123");
++    await api.apiFetch("/api/ai/analyze", { method: "POST", body: "{}" });
++    assert.equal(calls[0].url, "http://localhost:8000/api/ai/analyze");
++    assert.equal(calls[0].headers.get("Authorization"), "Bearer tok-123");
++    assert.equal(calls[0].headers.get("Content-Type"), "application/json");
++  });
++
++  test("sends no Authorization header when signed out", async () => {
++    await api.apiFetch("/api/ai/providers");
++    assert.equal(calls[0].headers.get("Authorization"), null);
++  });
++
++  test("a 401 on a request that carried a token clears it and throws SessionExpiredError", async () => {
++    api.setToken("expired-token");
++    responder = () => json(401, { error: "Invalid, expired, or revoked token" });
++    await assert.rejects(() => api.apiFetch("/api/ai/analyze", { method: "POST", body: "{}" }), api.SessionExpiredError);
++    assert.equal(api.getToken(), null);
++  });
++
++  test("a 401 with no token is returned normally (it is a failed login, not an expired session)", async () => {
++    responder = () => json(401, { error: "Incorrect email or password" });
++    const res = await api.apiFetch("/api/ai/analyze", { method: "POST", body: "{}" });
++    assert.equal(res.status, 401);
++  });
++
++  test("other error statuses pass through untouched and keep the token", async () => {
++    api.setToken("still-good");
++    responder = () => json(429, { error: "Too many requests" });
++    const res = await api.apiFetch("/api/ai/analyze", { method: "POST", body: "{}" });
++    assert.equal(res.status, 429);
++    assert.equal(api.getToken(), "still-good");
++  });
++});
++
++describe("authenticate", () => {
++  const user = { id: "u1", email: "a@example.com", role: "user", status: "active" };
++
++  test("stores the token and returns the user on success", async () => {
++    responder = () => json(200, { accessToken: "fresh", tokenType: "bearer", expiresIn: 3600, user });
++    const result = await api.authenticate("login", "a@example.com", "correct-horse-battery");
++    assert.deepEqual(result, user);
++    assert.equal(api.getToken(), "fresh");
++    assert.equal(calls[0].url, "http://localhost:8000/api/auth/login");
++    assert.deepEqual(JSON.parse(calls[0].init.body), { email: "a@example.com", password: "correct-horse-battery" });
++  });
++
++  test("surfaces the server's message and stores nothing on failure", async () => {
++    responder = () => json(401, { error: "Incorrect email or password" });
++    await assert.rejects(() => api.authenticate("login", "a@example.com", "wrong"), /Incorrect email or password/);
++    assert.equal(api.getToken(), null);
++  });
++
++  test("falls back to a generic message when the error body is not JSON", async () => {
++    responder = () => new Response("<html>bad gateway</html>", { status: 502 });
++    await assert.rejects(() => api.authenticate("register", "a@example.com", "x"), /Registration failed/);
++  });
++});
++
++describe("logout and fetchMe", () => {
++  test("logout revokes server-side and always drops the local token", async () => {
++    api.setToken("to-revoke");
++    await api.logout();
++    assert.equal(calls[0].url, "http://localhost:8000/api/auth/logout");
++    assert.equal(calls[0].headers.get("Authorization"), "Bearer to-revoke");
++    assert.equal(api.getToken(), null);
++  });
++
++  test("logout still clears the token when the network call fails", async () => {
++    api.setToken("to-revoke");
++    responder = () => {
++      throw new TypeError("network down");
++    };
++    await api.logout();
++    assert.equal(api.getToken(), null);
++  });
++
++  test("fetchMe makes no request without a token", async () => {
++    assert.equal(await api.fetchMe(), null);
++    assert.equal(calls.length, 0);
++  });
++
++  test("fetchMe returns null (and clears the token) for a rejected token", async () => {
++    api.setToken("revoked");
++    responder = () => json(401, { error: "Invalid, expired, or revoked token" });
++    assert.equal(await api.fetchMe(), null);
++    assert.equal(api.getToken(), null);
++  });
++
++  test("fetchMe returns the user for a good token", async () => {
++    api.setToken("good");
++    const user = { id: "u1", email: "a@example.com", role: "admin", status: "active" };
++    responder = () => json(200, user);
++    assert.deepEqual(await api.fetchMe(), user);
++  });
++});
+diff --git a/lib/api.ts b/lib/api.ts
+new file mode 100644
+index 0000000..5e0e123
+--- /dev/null
++++ b/lib/api.ts
+@@ -0,0 +1,115 @@
++import type { ApiHealth, AuthTokenResponse, AuthUser } from "@/lib/types";
++
++export const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
++
++// The access token lives in sessionStorage: it survives a page reload but
++// not closing the tab/browser, which bounds how long a token sitting in
++// browser storage can be lifted by anything that runs in the page. (An
++// httpOnly cookie would remove that exposure entirely, but needs
++// cookie-based auth plus CSRF protection on the API — a larger, separate
++// change than Passage 4 §6.2's "Auth: required (JWT)" asks for.)
++const TOKEN_KEY = "oxygen-ai.accessToken";
++
++export function getToken(): string | null {
++  if (typeof window === "undefined") return null;
++  try {
++    return window.sessionStorage.getItem(TOKEN_KEY);
++  } catch {
++    return null; // storage disabled (private mode, blocked cookies)
++  }
++}
++
++export function setToken(token: string | null): void {
++  if (typeof window === "undefined") return;
++  try {
++    if (token) window.sessionStorage.setItem(TOKEN_KEY, token);
++    else window.sessionStorage.removeItem(TOKEN_KEY);
++  } catch {
++    // Nothing useful to do — the user simply has to sign in again.
++  }
++}
++
++// Thrown when a request that carried a token comes back 401: the token
++// expired, was revoked by logout, or the account was disabled. The stored
++// token is already cleared by the time this is thrown.
++export class SessionExpiredError extends Error {
++  constructor() {
++    super("Your session has expired — please sign in again.");
++    this.name = "SessionExpiredError";
++  }
++}
++
++export async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
++  const headers = new Headers(init.headers);
++  if (init.body !== undefined && !headers.has("Content-Type")) {
++    headers.set("Content-Type", "application/json");
++  }
++  const token = getToken();
++  if (token && !headers.has("Authorization")) {
++    headers.set("Authorization", `Bearer ${token}`);
++  }
++  const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
++  if (res.status === 401 && token) {
++    setToken(null);
++    throw new SessionExpiredError();
++  }
++  return res;
++}
++
++async function errorMessage(res: Response, fallback: string): Promise<string> {
++  try {
++    const data = await res.json();
++    return (typeof data?.error === "string" && data.error) || fallback;
++  } catch {
++    return fallback;
++  }
++}
++
++export async function fetchHealth(): Promise<ApiHealth> {
++  const res = await fetch(`${API_BASE}/health`);
++  if (!res.ok) throw new Error(`API health check failed (${res.status})`);
++  return res.json();
++}
++
++export async function fetchMe(): Promise<AuthUser | null> {
++  if (!getToken()) return null;
++  try {
++    const res = await apiFetch("/api/auth/me");
++    return res.ok ? ((await res.json()) as AuthUser) : null;
++  } catch (err) {
++    if (err instanceof SessionExpiredError) return null;
++    throw err;
++  }
++}
++
++export async function authenticate(
++  kind: "login" | "register",
++  email: string,
++  password: string
++): Promise<AuthUser> {
++  const res = await fetch(`${API_BASE}/api/auth/${kind}`, {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({ email, password }),
++  });
++  if (!res.ok) {
++    throw new Error(await errorMessage(res, kind === "login" ? "Sign-in failed" : "Registration failed"));
++  }
++  const data = (await res.json()) as AuthTokenResponse;
++  setToken(data.accessToken);
++  return data.user;
++}
++
++export async function logout(): Promise<void> {
++  try {
++    // Revokes the session server-side so the token stops working
++    // immediately, not at its natural expiry. Best effort: the local token
++    // is dropped regardless.
++    await apiFetch("/api/auth/logout", { method: "POST" });
++  } catch {
++    // SessionExpiredError (already revoked) or a network failure — either
++    // way the user is signed out locally below.
++  } finally {
++    setToken(null);
++  }
++}
+diff --git a/lib/types.ts b/lib/types.ts
+index 7bd3a4b..8251d45 100644
+--- a/lib/types.ts
++++ b/lib/types.ts
+@@ -68,3 +68,26 @@ export interface ComparisonFeedback {
+   userChoiceProviderId: string | null;
+   userRating: number | null;
+ }
++
++// Passage 4 §6.2: authentication is required. Shapes mirror the API's
++// `TokenResponse` / `UserResponse` (apps/api/app/schemas.py).
++export interface AuthUser {
++  id: string;
++  email: string;
++  role: string;
++  status: string;
++}
++
++export interface AuthTokenResponse {
++  accessToken: string;
++  tokenType: "bearer";
++  expiresIn: number;
++  user: AuthUser;
++}
++
++// Subset of GET /health the login gate needs.
++export interface ApiHealth {
++  status: string;
++  authConfigured: boolean;
++  authRequired: boolean;
++}
+diff --git a/package.json b/package.json
+index 2693789..6a235ad 100644
+--- a/package.json
++++ b/package.json
+@@ -6,7 +6,8 @@
+     "dev": "next dev",
+     "build": "next build",
+     "start": "next start",
+-    "typecheck": "tsc --noEmit"
++    "typecheck": "tsc --noEmit",
++    "test:client": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test lib/api.test.mjs"
+   },
+   "dependencies": {
+     "next": "^14.2.5",
