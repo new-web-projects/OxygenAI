@@ -1,0 +1,1973 @@
+diff --git a/apps/api/README.md b/apps/api/README.md
+index f5f4c85..8f150d2 100644
+--- a/apps/api/README.md
++++ b/apps/api/README.md
+@@ -97,3 +97,23 @@ analyse, search/list knowledge, and rate their own comparisons.
+ only (the API logs a warning at startup). Behind a reverse proxy set
+ `TRUSTED_PROXY_COUNT` (and start uvicorn with `--no-proxy-headers`) so rate
+ limits key off the real client address — see `app/security/network.py`.
++
++## Knowledge base maintenance
++
++Earlier versions stored an all-zero embedding for any chunk with no ASCII
++letters or digits (for example a Bengali or Hindi document). Cosine
++similarity against a zero vector is NaN, which made `POST
++/api/knowledge/search` fail with `Out of range float values are not JSON
++compliant: nan`. New code cannot write such rows and search skips any that
++remain, but a skipped row is also unsearchable. To repair rows already in your
++database:
++
++```bash
++cd apps/api
++python -m app.rag.maintenance reembed-unusable --dry-run   # report only
++python -m app.rag.maintenance reembed-unusable             # re-embed (or drop, if nothing embeddable)
++python -m app.rag.maintenance reembed-unusable --document-id <uuid>   # one document
++```
++
++It is safe to re-run. It uses whichever embedder is configured now and does
++not touch healthy rows.
+diff --git a/apps/api/app/db/knowledge.py b/apps/api/app/db/knowledge.py
+index 9f2105a..c6312f7 100644
+--- a/apps/api/app/db/knowledge.py
++++ b/apps/api/app/db/knowledge.py
+@@ -10,15 +10,59 @@ confirmed by inspecting the live index definition before writing this
+ query, not assumed. Distance is converted to a similarity score (1 -
+ distance) so callers work with the same "higher is better" convention
+ `rag/rerank.py` uses for its vector_score field.
++
++Cosine similarity is UNDEFINED for a zero-norm vector: pgvector returns
++NaN for `<=>` when either side is all zeros (verified against pgvector
++0.6.0). A NaN similarity cannot be ordered, cannot be serialised to JSON,
++and — before this was handled — made `POST /api/knowledge/search` fail with
++"Out of range float values are not JSON compliant: nan". Three rules keep
++it out of the system: (1) nothing unusable is ever stored
++(`insert_chunks_with_embeddings`), (2) a query with no usable direction
++matches nothing (`similarity_search`), and (3) any row whose similarity is
++undefined — e.g. a zero-vector row written by an earlier version — is
++excluded in SQL rather than returned.
+ """
+ 
+ from __future__ import annotations
+ 
+ import json
++import math
++from collections.abc import Sequence
+ from dataclasses import dataclass
+ 
++from ..observability import get_logger
+ from .client import get_pool
+ 
++logger = get_logger("db.knowledge")
++
++# Bounds on a vector's L2 norm for it to be usable with cosine distance.
++# Real embeddings sit near 1 (the hashing embedder L2-normalises; Google's
++# are ~unit length). The bounds only reject the degenerate cases: zero (no
++# direction) and values so extreme that pgvector's float32 squared-norm
++# accumulation under/overflows to 0/inf and turns the distance into NaN.
++MIN_VECTOR_NORM = 1e-6
++MAX_VECTOR_NORM = 1e18
++
++
++def is_usable_vector(vector: Sequence[float]) -> bool:
++    """
++    True when `vector` has a well-defined direction: every component is a
++    finite number and the norm is neither (near) zero nor extreme.
++    Never raises — a malformed vector is simply "not usable".
++    """
++    total = 0.0
++    try:
++        for component in vector:
++            value = float(component)
++            if not math.isfinite(value):
++                return False
++            total += value * value
++    except (TypeError, ValueError):
++        return False
++    if not math.isfinite(total):  # squared-norm overflow
++        return False
++    return MIN_VECTOR_NORM <= math.sqrt(total) <= MAX_VECTOR_NORM
++
+ 
+ @dataclass(frozen=True)
+ class StoredChunk:
+@@ -60,6 +104,15 @@ async def insert_chunks_with_embeddings(
+ ) -> list[StoredChunk]:
+     if len(chunks) != len(vectors):
+         raise ValueError("chunks and vectors must be the same length")
++    # Validate everything BEFORE opening the transaction so a bad vector
++    # can never leave a half-written document behind.
++    for index, vector in enumerate(vectors):
++        if not is_usable_vector(vector):
++            raise ValueError(
++                f"Embedding for chunk {index} has no usable direction "
++                "(all-zero, non-finite, or out of range) and cannot be stored — "
++                "cosine similarity against it would be NaN"
++            )
+     pool = await get_pool()
+     stored: list[StoredChunk] = []
+     async with pool.acquire() as conn:
+@@ -101,8 +154,79 @@ class SearchRow:
+     similarity: float
+ 
+ 
++@dataclass(frozen=True)
++class UnusableEmbedding:
++    embedding_id: str
++    chunk_id: str
++    content: str
++
++
++async def list_unusable_embeddings(document_ids: Sequence[str] | None = None) -> list[UnusableEmbedding]:
++    """
++    Stored embeddings with no usable direction — zero vectors written by
++    versions that did not validate (see the module docstring). Optionally
++    limited to the given documents.
++
++    A vector's cosine distance to ITSELF is exactly 0 for any real vector
++    and NaN only when its norm is zero, so this finds them without relying
++    on a pgvector helper function.
++    """
++    pool = await get_pool()
++    rows = await pool.fetch(
++        """
++        SELECT e.id AS embedding_id, kc.id AS chunk_id, kc.content
++        FROM embeddings e
++        JOIN knowledge_chunks kc ON kc.id = e.chunk_id
++        WHERE (e.vector <=> e.vector) = 'NaN'::float8
++          AND ($1::uuid[] IS NULL OR kc.document_id = ANY($1::uuid[]))
++        ORDER BY kc.document_id, kc.position
++        """,
++        list(document_ids) if document_ids is not None else None,
++    )
++    return [
++        UnusableEmbedding(str(r["embedding_id"]), str(r["chunk_id"]), r["content"]) for r in rows
++    ]
++
++
++async def apply_embedding_repairs(
++    replacements: list[tuple[str, list[float]]], deletions: list[str], model_used: str
++) -> None:
++    """Replace the vectors of some embedding rows and delete others, atomically."""
++    for embedding_id, vector in replacements:
++        if not is_usable_vector(vector):
++            raise ValueError(f"Replacement vector for embedding {embedding_id} is not usable")
++    pool = await get_pool()
++    async with pool.acquire() as conn:
++        async with conn.transaction():
++            for embedding_id, vector in replacements:
++                await conn.execute(
++                    "UPDATE embeddings SET vector = $1::vector, model_used = $2 WHERE id = $3",
++                    _vector_literal(vector),
++                    model_used,
++                    embedding_id,
++                )
++            for embedding_id in deletions:
++                await conn.execute("DELETE FROM embeddings WHERE id = $1", embedding_id)
++
++
+ async def similarity_search(query_vector: list[float], top_k: int) -> list[SearchRow]:
++    """
++    Top-`top_k` chunks by cosine similarity. Every returned `similarity` is
++    a finite number in [-1, 1]. A query vector with no usable direction
++    matches nothing (an empty list), and rows whose similarity is undefined
++    are never returned.
++    """
++    if not is_usable_vector(query_vector):
++        return []
++
+     pool = await get_pool()
++    # `<> 'NaN'::float8` removes rows whose cosine distance is NaN, i.e. a
++    # zero-vector row stored by an earlier version. Postgres treats NaN as
++    # equal to itself (unlike IEEE-754), so this predicate is exactly "is
++    # not NaN" and needs no pgvector function, so it works on any pgvector
++    # version. NaN sorts LAST in ascending order, so these rows could never
++    # displace a real match from the LIMIT; excluding them just keeps the
++    # undefined value from being returned at all.
+     rows = await pool.fetch(
+         """
+         SELECT
+@@ -113,24 +237,33 @@ async def similarity_search(query_vector: list[float], top_k: int) -> list[Searc
+         JOIN knowledge_chunks kc ON kc.id = e.chunk_id
+         JOIN knowledge_documents kd ON kd.id = kc.document_id
+         WHERE kd.status = 'ready'
++          AND (e.vector <=> $1::vector) <> 'NaN'::float8
+         ORDER BY e.vector <=> $1::vector
+         LIMIT $2
+         """,
+         _vector_literal(query_vector),
+         top_k,
+     )
+-    return [
+-        SearchRow(
+-            chunk_id=str(r["chunk_id"]),
+-            document_id=str(r["document_id"]),
+-            document_title=r["document_title"],
+-            source_type=r["source_type"],
+-            content=r["content"],
+-            position=r["position"],
+-            similarity=float(r["similarity"]),
++
++    results: list[SearchRow] = []
++    for r in rows:
++        similarity = float(r["similarity"])
++        if not math.isfinite(similarity):  # defence in depth; the SQL filter should make this unreachable
++            logger.warning("dropping a chunk with a non-finite similarity", extra={"chunkId": str(r["chunk_id"])})
++            continue
++        results.append(
++            SearchRow(
++                chunk_id=str(r["chunk_id"]),
++                document_id=str(r["document_id"]),
++                document_title=r["document_title"],
++                source_type=r["source_type"],
++                content=r["content"],
++                position=r["position"],
++                # 1 - distance can land a hair outside [-1, 1] from float rounding.
++                similarity=max(-1.0, min(1.0, similarity)),
++            )
+         )
+-        for r in rows
+-    ]
++    return results
+ 
+ 
+ async def list_documents(limit: int = 50) -> list[dict]:
+diff --git a/apps/api/app/engine/pipeline.py b/apps/api/app/engine/pipeline.py
+index af92f81..eafa577 100644
+--- a/apps/api/app/engine/pipeline.py
++++ b/apps/api/app/engine/pipeline.py
+@@ -19,6 +19,7 @@ Python-facing signature is identical either way (§5.4).
+ 
+ from __future__ import annotations
+ 
++import math
+ from dataclasses import dataclass
+ from typing import Any
+ 
+@@ -65,12 +66,28 @@ def validate_bars(bars: list[OHLCVBar]) -> list[str]:
+     is corrupt data. Silently indicator-ing it produces numbers that look
+     authoritative and are meaningless — the exact failure mode this
+     platform exists to avoid.
++
++    Every field must also be a FINITE number. The ordering checks below are
++    not enough on their own: any comparison against NaN is False, and an
++    infinite `high`/`low` still "orders" correctly, so NaN or infinite
++    values used to slip past some of them (`volume` NaN/+inf, `high` +inf,
++    `low` -inf were accepted) and flow into the indicators and from there
++    into response fields that cannot be serialised as JSON.
+     """
+     if not bars:
+         raise MarketDataError("No market data bars were supplied")
+ 
+     warnings: list[str] = []
+     for index, bar in enumerate(bars):
++        for field_name, value in (
++            ("open", bar.open),
++            ("high", bar.high),
++            ("low", bar.low),
++            ("close", bar.close),
++            ("volume", bar.volume),
++        ):
++            if not math.isfinite(value):
++                raise MarketDataError(f"Bar {index} {field_name} ({value}) is not a finite number")
+         if bar.high < bar.low:
+             raise MarketDataError(f"Bar {index} has high ({bar.high}) below low ({bar.low})")
+         if not (bar.low <= bar.close <= bar.high):
+diff --git a/apps/api/app/rag/embeddings.py b/apps/api/app/rag/embeddings.py
+index 16ea4a0..b1507aa 100644
+--- a/apps/api/app/rag/embeddings.py
++++ b/apps/api/app/rag/embeddings.py
+@@ -40,17 +40,15 @@ from __future__ import annotations
+ import hashlib
+ import math
+ import os
+-import re
+ from typing import Protocol
+ 
+ from ..observability import get_logger
++from .tokenize import tokenize
+ 
+ logger = get_logger("rag.embeddings")
+ 
+ EMBEDDING_DIM = 1536  # fixed by the embeddings.vector(1536) column
+ 
+-_WORD_RE = re.compile(r"[a-z0-9]+")
+-
+ 
+ class EmbeddingProvider(Protocol):
+     model_name: str
+@@ -63,6 +61,16 @@ class HashingEmbeddingProvider:
+     """
+     Always-available, dependency-free, deterministic default. See the
+     module docstring for what this can and cannot do.
++
++    Contract worth knowing: text with no tokens at all (only punctuation,
++    emoji, whitespace) has no direction, so `embed` returns the all-zero
++    vector for it. That is an honest "no signal", NOT a storable embedding
++    — cosine similarity against it is undefined (pgvector returns NaN).
++    Callers must check `db.knowledge.is_usable_vector` before storing or
++    searching with a vector; `rag.pipeline` does, for ingestion and for
++    queries. Tokenization is Unicode-aware (`rag/tokenize.py`) so scripts
++    such as Bengali and Hindi are NOT "no signal"; ASCII text tokenizes
++    exactly as it always did, so existing stored vectors are unchanged.
+     """
+ 
+     model_name = "hashing-trick-v1"
+@@ -79,7 +87,7 @@ class HashingEmbeddingProvider:
+ 
+     async def embed(self, text: str) -> list[float]:
+         vector = [0.0] * EMBEDDING_DIM
+-        words = _WORD_RE.findall(text.lower())
++        words = tokenize(text)
+         if not words:
+             return vector
+         for word in words:
+diff --git a/apps/api/app/rag/maintenance.py b/apps/api/app/rag/maintenance.py
+new file mode 100644
+index 0000000..22ee2f5
+--- /dev/null
++++ b/apps/api/app/rag/maintenance.py
+@@ -0,0 +1,121 @@
++"""
++Knowledge-base maintenance — repair for the zero-vector defect.
++
++    python -m app.rag.maintenance reembed-unusable [--dry-run] [--document-id UUID ...]
++
++Background: an earlier version stored an all-zero embedding for any chunk
++with no ASCII letters or digits (a Bengali or Hindi document, for
++example). Cosine similarity against a zero vector is NaN, which is what made
++`POST /api/knowledge/search` fail. New code can no longer write such rows
++and search now skips any that remain, but a skipped row is also an
++UNSEARCHABLE row. This command finds them and re-embeds their text with the
++current embedder:
++
++`--document-id` (repeatable) limits the repair to those documents.
++
++* the chunk now yields a usable vector (e.g. Bengali text, now that
++  tokenization is Unicode-aware) -> the stored vector is replaced and the
++  chunk becomes searchable;
++* the chunk still has nothing embeddable (only punctuation or symbols) ->
++  its embedding row is deleted, since it can never match anything.
++
++The change is one transaction per batch, safe to re-run (the second run
++finds nothing), and `--dry-run` changes nothing. It uses whichever embedder
++is configured now (`GOOGLE_AI_API_KEY` set or not) and records that in
++`embeddings.model_used`. It does NOT re-embed healthy rows — switching
++embedder for the whole corpus is a separate, larger operation.
++"""
++
++from __future__ import annotations
++
++import argparse
++import asyncio
++import sys
++from collections.abc import Sequence
++from dataclasses import dataclass
++
++from ..config import load_env_files
++from ..db.client import close_pool, is_db_configured
++from ..db.knowledge import apply_embedding_repairs, is_usable_vector, list_unusable_embeddings
++from ..observability import get_logger
++from .embeddings import get_embedding_provider
++
++logger = get_logger("rag.maintenance")
++
++DEFAULT_BATCH_SIZE = 64
++
++
++@dataclass(frozen=True)
++class RepairReport:
++    scanned: int  # unusable embeddings found
++    repaired: int  # re-embedded into a usable vector
++    removed: int  # deleted: the chunk has nothing embeddable
++    dry_run: bool
++
++
++async def reembed_unusable(
++    *,
++    dry_run: bool = False,
++    batch_size: int = DEFAULT_BATCH_SIZE,
++    document_ids: Sequence[str] | None = None,
++) -> RepairReport:
++    found = await list_unusable_embeddings(document_ids)
++    if dry_run or not found:
++        return RepairReport(scanned=len(found), repaired=0, removed=0, dry_run=dry_run)
++
++    provider = get_embedding_provider()
++    repaired = removed = 0
++    for start in range(0, len(found), batch_size):
++        batch = found[start : start + batch_size]
++        vectors = await provider.embed_batch([item.content for item in batch])
++        if len(vectors) != len(batch):
++            raise ValueError(f"Embedding provider returned {len(vectors)} vectors for {len(batch)} chunks")
++        replacements = [(i.embedding_id, v) for i, v in zip(batch, vectors) if is_usable_vector(v)]
++        deletions = [i.embedding_id for i, v in zip(batch, vectors) if not is_usable_vector(v)]
++        await apply_embedding_repairs(replacements, deletions, provider.model_name)
++        repaired += len(replacements)
++        removed += len(deletions)
++        logger.info(
++            "re-embedded unusable embeddings",
++            extra={"repaired": len(replacements), "removed": len(deletions), "model": provider.model_name},
++        )
++    return RepairReport(scanned=len(found), repaired=repaired, removed=removed, dry_run=False)
++
++
++async def _run(dry_run: bool, document_ids: Sequence[str] | None) -> RepairReport:
++    try:
++        return await reembed_unusable(dry_run=dry_run, document_ids=document_ids)
++    finally:
++        await close_pool()
++
++
++def main(argv: list[str] | None = None) -> int:
++    load_env_files()
++    parser = argparse.ArgumentParser(prog="python -m app.rag.maintenance", description=__doc__.split("\n\n")[0])
++    sub = parser.add_subparsers(dest="command", required=True)
++    repair = sub.add_parser("reembed-unusable", help="Re-embed (or drop) zero-vector embeddings")
++    repair.add_argument("--dry-run", action="store_true", help="Report what would change; change nothing")
++    repair.add_argument(
++        "--document-id", action="append", metavar="UUID", help="Only repair this document (repeatable)"
++    )
++    args = parser.parse_args(argv)
++
++    if not is_db_configured():
++        print("DATABASE_URL is not set — nothing to do.", file=sys.stderr)
++        return 2
++
++    report = asyncio.run(_run(args.dry_run, args.document_id))
++    if report.dry_run:
++        # A dry run does not compute embeddings, so it cannot know how many
++        # rows would be repaired vs dropped — it reports only what it found.
++        print(f"{report.scanned} unusable embedding(s) found.  [dry run: no changes made]")
++    else:
++        print(
++            f"{report.scanned} unusable embedding(s) found. "
++            f"{report.repaired} were re-embedded, {report.removed} were removed (nothing embeddable)."
++        )
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/apps/api/app/rag/pipeline.py b/apps/api/app/rag/pipeline.py
+index 8b75647..121af1b 100644
+--- a/apps/api/app/rag/pipeline.py
++++ b/apps/api/app/rag/pipeline.py
+@@ -16,11 +16,13 @@ which `providers/prompt.py`'s `_knowledge_block` already reads.
+ 
+ from __future__ import annotations
+ 
++import math
+ from dataclasses import dataclass
+ 
+ from ..db.knowledge import (
+     create_document,
+     insert_chunks_with_embeddings,
++    is_usable_vector,
+     mark_document_status,
+     similarity_search,
+ )
+@@ -32,11 +34,22 @@ from .rerank import RetrievedChunk, rerank
+ logger = get_logger("rag.pipeline")
+ 
+ 
++class NoIndexableContentError(ValueError):
++    """
++    The upload has nothing that can be searched: empty after cleaning, or
++    no chunk produced an embedding with a usable direction (e.g. only
++    punctuation or emoji). A ValueError subclass, so existing
++    `except ValueError` callers keep working; the HTTP layer maps it to 400
++    because it is a problem with the upload, not a server fault.
++    """
++
++
+ @dataclass(frozen=True)
+ class IngestResult:
+     document_id: str
+-    chunk_count: int
++    chunk_count: int  # chunks actually stored (and therefore searchable)
+     embedding_model: str
++    skipped_chunks: int = 0  # chunks dropped because they had nothing embeddable
+ 
+ 
+ async def ingest_text(
+@@ -53,21 +66,52 @@ async def ingest_text(
+         cleaned = clean_text(raw_text)
+         chunks: list[Chunk] = chunk_text(cleaned)
+         if not chunks:
+-            await mark_document_status(document_id, "failed")
+-            raise ValueError("No content to ingest after cleaning — the upload was empty or all whitespace.")
++            raise NoIndexableContentError(
++                "No content to ingest after cleaning — the upload was empty or all whitespace."
++            )
+ 
+         provider = get_embedding_provider()
+         vectors = await provider.embed_batch([c.content for c in chunks])
++        if len(vectors) != len(chunks):
++            raise ValueError(
++                f"Embedding provider returned {len(vectors)} vectors for {len(chunks)} chunks"
++            )
++
++        # A chunk whose embedding has no usable direction (nothing but
++        # punctuation/emoji, or a degenerate provider response) cannot be
++        # ranked by cosine similarity — storing it would later make every
++        # search that touches it fail with a NaN score. Skip it rather
++        # than store it; it had no searchable content anyway.
++        kept = [(c, v) for c, v in zip(chunks, vectors) if is_usable_vector(v)]
++        skipped = len(chunks) - len(kept)
++        if not kept:
++            raise NoIndexableContentError(
++                "None of the document's text could be indexed — it contains no letters or "
++                "digits to search on (only punctuation, symbols, or whitespace)."
++            )
++        if skipped:
++            logger.warning(
++                "skipped chunks with no embeddable content",
++                extra={"documentId": document_id, "skipped": skipped, "kept": len(kept)},
++            )
++
+         await insert_chunks_with_embeddings(
+-            document_id, [c.content for c in chunks], vectors, provider.model_name
++            document_id, [c.content for c, _ in kept], [v for _, v in kept], provider.model_name
+         )
+         await mark_document_status(document_id, "ready")
+         logger.info(
+             "document ingested",
+-            extra={"documentId": document_id, "chunks": len(chunks), "model": provider.model_name},
++            extra={"documentId": document_id, "chunks": len(kept), "skipped": skipped, "model": provider.model_name},
++        )
++        return IngestResult(
++            document_id=document_id,
++            chunk_count=len(kept),
++            embedding_model=provider.model_name,
++            skipped_chunks=skipped,
+         )
+-        return IngestResult(document_id=document_id, chunk_count=len(chunks), embedding_model=provider.model_name)
+     except Exception:
++        # Every failure above — including NoIndexableContentError — lands the
++        # document in 'failed' here, exactly once.
+         await mark_document_status(document_id, "failed")
+         raise
+ 
+@@ -83,11 +127,21 @@ async def retrieve(query: str, top_k: int = 5) -> list[dict]:
+     """
+     provider = get_embedding_provider()
+     query_vector = await provider.embed(query)
++    if not is_usable_vector(query_vector):
++        # No letters/digits in the query (e.g. "???"): nothing to match on,
++        # and cosine similarity against a zero vector is NaN for every row.
++        logger.info("query has no embeddable content; returning no results")
++        return []
+ 
+     # Over-fetch before reranking so the lexical-overlap signal has more
+     # than top_k candidates to actually reorder — reranking a set no
+     # bigger than what you'd return anyway cannot change the outcome.
+     raw = await similarity_search(query_vector, top_k=max(top_k * 3, top_k))
++    # Boundary guarantee for every caller (the search endpoint, the analysis
++    # prompt, the knowledge tool): no non-finite score ever leaves retrieval.
++    finite = [r for r in raw if math.isfinite(r.similarity)]
++    if len(finite) != len(raw):
++        logger.warning("dropped retrieved chunks with a non-finite score", extra={"dropped": len(raw) - len(finite)})
+     candidates = [
+         RetrievedChunk(
+             chunk_id=r.chunk_id,
+@@ -98,7 +152,7 @@ async def retrieve(query: str, top_k: int = 5) -> list[dict]:
+             position=r.position,
+             vector_score=r.similarity,
+         )
+-        for r in raw
++        for r in finite
+     ]
+     ranked = rerank(query, candidates)[:top_k]
+ 
+diff --git a/apps/api/app/rag/rerank.py b/apps/api/app/rag/rerank.py
+index d02bdfa..69c63b6 100644
+--- a/apps/api/app/rag/rerank.py
++++ b/apps/api/app/rag/rerank.py
+@@ -21,10 +21,10 @@ the query and the vector-search results, return them reordered.
+ 
+ from __future__ import annotations
+ 
+-import re
++import math
+ from dataclasses import dataclass
+ 
+-_WORD_RE = re.compile(r"[a-z0-9]+")
++from .tokenize import tokenize
+ 
+ _LEXICAL_WEIGHT = 0.35
+ 
+@@ -41,7 +41,7 @@ class RetrievedChunk:
+ 
+ 
+ def _term_set(text: str) -> set[str]:
+-    return set(_WORD_RE.findall(text.lower()))
++    return set(tokenize(text))
+ 
+ 
+ def _lexical_overlap(query_terms: set[str], chunk_terms: set[str]) -> float:
+@@ -56,12 +56,22 @@ def rerank(query: str, results: list[RetrievedChunk]) -> list[RetrievedChunk]:
+     Returns results reordered by a blended score. Does not mutate
+     vector_score - that field stays the original similarity value; the
+     blended score only determines order.
++
++    The sort key is always a real number. A NaN key makes every comparison
++    False, which leaves a sort in an unspecified order — before this guard
++    a single NaN-scored chunk was left wherever it happened to sit
++    (including first) and could scramble its neighbours. Retrieval no
++    longer passes non-finite scores in (`rag.pipeline.retrieve` drops
++    them), so this is the last line of defence: a non-finite score ranks
++    below every real one instead of poisoning the sort.
+     """
+     query_terms = _term_set(query)
+     if not results:
+         return results
+ 
+     def blended(chunk: RetrievedChunk) -> float:
++        if not math.isfinite(chunk.vector_score):
++            return -math.inf
+         lexical = _lexical_overlap(query_terms, _term_set(chunk.content))
+         return (1 - _LEXICAL_WEIGHT) * chunk.vector_score + _LEXICAL_WEIGHT * lexical
+ 
+diff --git a/apps/api/app/rag/tokenize.py b/apps/api/app/rag/tokenize.py
+new file mode 100644
+index 0000000..e041c2b
+--- /dev/null
++++ b/apps/api/app/rag/tokenize.py
+@@ -0,0 +1,79 @@
++"""
++Shared tokenizer for the RAG layer (embedding + lexical rerank).
++
++Why this exists — the root cause of the "knowledge search returns HTTP
++500 / ValueError: Out of range float values are not JSON compliant: nan"
++failure:
++
++The hashing embedder and the reranker each tokenized with `[a-z0-9]+`, so
++any text containing no ASCII letter or digit — a Bengali or Hindi
++document, an Arabic or CJK note, a chunk of pure punctuation — produced
++ZERO tokens. The embedder answered with the all-zero vector, which was
++stored as-is. pgvector's cosine distance against a zero vector is NaN
++(0/0), so `1 - distance` made the similarity score NaN, and FastAPI's JSON
++encoder refuses NaN. Every search that touched such a chunk (or used such
++a query) failed, while uploads of the same content "succeeded".
++
++This tokenizer is Unicode-aware, so those scripts yield real tokens and a
++real, non-zero embedding. Compatibility is deliberate and tested:
++
++* Pure-ASCII text takes the SAME regex path as before, so every token —
++  and therefore every previously stored hashing vector and its similarity
++  to new queries — is bit-for-bit unchanged.
++* Non-ASCII text is NFKC-normalised and case-folded, then split on any
++  character that is not a letter, number, or combining mark. Keeping
++  combining marks (category M) matters: Indic vowel signs and viragas are
++  marks, so splitting on "non-letters" would shred "বাজার" into single
++  consonants. Zero-width (non-)joiners stay inside words (they occur
++  within Indic and Persian words) but never form a token on their own.
++
++Known limitation, stated rather than hidden: scripts written without
++spaces (Chinese, Japanese, Thai) become one token per run of text, so
++lexical similarity only fires on identical runs. They no longer fail, but
++they are not well served by a hashing-trick embedding; a real embedding
++model (`GOOGLE_AI_API_KEY`) is the right tool for them.
++"""
++
++from __future__ import annotations
++
++import re
++import unicodedata
++
++_ASCII_WORD_RE = re.compile(r"[a-z0-9]+")
++
++# Letters, numbers and combining marks make up words.
++_WORD_CATEGORIES = frozenset("LNM")
++# Joiners keep a word together (Indic conjuncts, Persian compounds) but are
++# not words themselves.
++_JOINERS = frozenset("\u200c\u200d")
++
++
++def _is_word_char(ch: str) -> bool:
++    return ch in _JOINERS or unicodedata.category(ch)[0] in _WORD_CATEGORIES
++
++
++def _has_substance(token: str) -> bool:
++    """A token needs at least one letter or digit; a lone mark or joiner is noise."""
++    return any(unicodedata.category(ch)[0] in "LN" for ch in token)
++
++
++def tokenize(text: str) -> list[str]:
++    """Lower-cased word tokens of `text`, in order. Never raises."""
++    if text.isascii():
++        return _ASCII_WORD_RE.findall(text.lower())
++
++    tokens: list[str] = []
++    current: list[str] = []
++    for ch in unicodedata.normalize("NFKC", text).casefold():
++        if _is_word_char(ch):
++            current.append(ch)
++        elif current:
++            token = "".join(current)
++            if _has_substance(token):
++                tokens.append(token)
++            current.clear()
++    if current:
++        token = "".join(current)
++        if _has_substance(token):
++            tokens.append(token)
++    return tokens
+diff --git a/apps/api/app/routers/knowledge.py b/apps/api/app/routers/knowledge.py
+index 1b7a58f..3ec4f5a 100644
+--- a/apps/api/app/routers/knowledge.py
++++ b/apps/api/app/routers/knowledge.py
+@@ -23,7 +23,7 @@ from fastapi import APIRouter, Depends, File, Form, UploadFile
+ 
+ from ..errors import NotFoundError, ValidationError
+ from ..rag.chunking import UnsupportedFileTypeError, extract_text
+-from ..rag.pipeline import ingest_text, retrieve
++from ..rag.pipeline import NoIndexableContentError, ingest_text, retrieve
+ from ..schemas import KnowledgeChunkResponse, KnowledgeSearchRequest, KnowledgeUploadRequest
+ from ..security.dependencies import AuthenticatedUser, get_current_user, require_role
+ 
+@@ -39,11 +39,15 @@ MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+ async def upload_text(
+     body: KnowledgeUploadRequest, user: AuthenticatedUser = Depends(require_role("admin"))
+ ) -> dict:
+-    result = await ingest_text(body.title, body.content, body.sourceType, uploaded_by=user.id)
++    try:
++        result = await ingest_text(body.title, body.content, body.sourceType, uploaded_by=user.id)
++    except NoIndexableContentError as err:
++        raise ValidationError(str(err)) from err
+     return {
+         "documentId": result.document_id,
+         "chunkCount": result.chunk_count,
+         "embeddingModel": result.embedding_model,
++        "skippedChunks": result.skipped_chunks,
+     }
+ 
+ 
+@@ -63,11 +67,15 @@ async def upload_file(
+     except UnsupportedFileTypeError as err:
+         raise ValidationError(str(err)) from err
+ 
+-    result = await ingest_text(title, text, sourceType, uploaded_by=user.id)
++    try:
++        result = await ingest_text(title, text, sourceType, uploaded_by=user.id)
++    except NoIndexableContentError as err:
++        raise ValidationError(str(err)) from err
+     return {
+         "documentId": result.document_id,
+         "chunkCount": result.chunk_count,
+         "embeddingModel": result.embedding_model,
++        "skippedChunks": result.skipped_chunks,
+     }
+ 
+ 
+diff --git a/apps/api/app/schemas.py b/apps/api/app/schemas.py
+index 6969d6f..1066e34 100644
+--- a/apps/api/app/schemas.py
++++ b/apps/api/app/schemas.py
+@@ -13,10 +13,17 @@ Field naming stays camelCase to match the TypeScript consumer.
+ from __future__ import annotations
+ 
+ from datetime import datetime, timezone
+-from typing import Any, Literal, Optional, Union
++from typing import Annotated, Any, Literal, Optional, Union
+ 
+ from pydantic import BaseModel, Field
+ 
++# JSON has no NaN or Infinity. A float field typed this way rejects them at
++# the model boundary with a precise validation error instead of surfacing
++# later as an opaque "Out of range float values are not JSON compliant"
++# failure inside the response encoder. Used for values derived from
++# external computation (e.g. vector-similarity scores).
++FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
++
+ # ---------------------------------------------------------------------------
+ # Market data
+ # ---------------------------------------------------------------------------
+@@ -404,7 +411,7 @@ class KnowledgeChunkResponse(BaseModel):
+     documentTitle: str
+     sourceType: str
+     content: str
+-    score: float
++    score: FiniteFloat
+     position: int
+ 
+ 
+diff --git a/apps/api/tests/knowledge_support.py b/apps/api/tests/knowledge_support.py
+new file mode 100644
+index 0000000..e7e2dd0
+--- /dev/null
++++ b/apps/api/tests/knowledge_support.py
+@@ -0,0 +1,44 @@
++"""Shared helpers for the knowledge-base integration tests (no fixtures here)."""
++
++from __future__ import annotations
++
++ZERO_VECTOR_LITERAL = "[" + ",".join(["0"] * 1536) + "]"
++TITLE_PREFIX = "zz-nan-"
++
++
++def vector_literal(vector: list[float]) -> str:
++    return "[" + ",".join(repr(float(v)) for v in vector) + "]"
++
++
++async def insert_legacy_chunk(pool, document_id: str, position: int, content: str, vector_text: str) -> tuple[str, str]:
++    """
++    Write a chunk + embedding row DIRECTLY in SQL, bypassing the application
++    guards — this reproduces what versions without validation left behind
++    (a zero vector for text with no ASCII letters/digits). Returns
++    (chunk_id, embedding_id).
++    """
++    chunk_id = await pool.fetchval(
++        "INSERT INTO knowledge_chunks (document_id, content, position, metadata) "
++        "VALUES ($1, $2, $3, '{}'::jsonb) RETURNING id",
++        document_id,
++        content,
++        position,
++    )
++    embedding_id = await pool.fetchval(
++        "INSERT INTO embeddings (chunk_id, vector, model_used) VALUES ($1, $2::vector, 'hashing-trick-v1') RETURNING id",
++        chunk_id,
++        vector_text,
++    )
++    return str(chunk_id), str(embedding_id)
++
++
++async def insert_ready_document(pool, title: str) -> str:
++    document_id = await pool.fetchval(
++        "INSERT INTO knowledge_documents (title, source_type, status) VALUES ($1, 'knowledge', 'ready') RETURNING id",
++        title,
++    )
++    return str(document_id)
++
++
++async def delete_test_documents(pool) -> None:
++    await pool.execute("DELETE FROM knowledge_documents WHERE title LIKE $1", TITLE_PREFIX + "%")
+diff --git a/apps/api/tests/strict_json.py b/apps/api/tests/strict_json.py
+new file mode 100644
+index 0000000..e7b4065
+--- /dev/null
++++ b/apps/api/tests/strict_json.py
+@@ -0,0 +1,35 @@
++"""
++Strict JSON helpers for tests.
++
++Python's `json.loads` quietly accepts the non-standard tokens NaN and
++Infinity, which are not valid JSON and which browsers' `JSON.parse` and
++most other clients reject. These helpers fail on them, so a test asserting
++"the response is valid, finite JSON" means exactly that.
++"""
++
++from __future__ import annotations
++
++import json
++import math
++from typing import Any
++
++
++def _reject_constant(name: str) -> Any:
++    raise ValueError(f"response contains the non-JSON constant {name!r}")
++
++
++def loads_strict(text: str) -> Any:
++    """`json.loads` that raises on NaN / Infinity / -Infinity."""
++    return json.loads(text, parse_constant=_reject_constant)
++
++
++def assert_all_finite(value: Any, path: str = "$") -> None:
++    """Walk a decoded JSON value; every number in it must be finite."""
++    if isinstance(value, float):
++        assert math.isfinite(value), f"non-finite number at {path}: {value!r}"
++    elif isinstance(value, dict):
++        for key, item in value.items():
++            assert_all_finite(item, f"{path}.{key}")
++    elif isinstance(value, (list, tuple)):
++        for index, item in enumerate(value):
++            assert_all_finite(item, f"{path}[{index}]")
+diff --git a/apps/api/tests/test_bar_validation_finite.py b/apps/api/tests/test_bar_validation_finite.py
+new file mode 100644
+index 0000000..6abb504
+--- /dev/null
++++ b/apps/api/tests/test_bar_validation_finite.py
+@@ -0,0 +1,42 @@
++"""
++`validate_bars` must reject every non-finite OHLCV value (no database).
++
++Before this, 4 of the 15 field/value combinations below were accepted:
++high=+inf, low=-inf, volume=NaN, volume=+inf. They are latent with demo data
++(always finite) but would turn real vendor data into non-finite indicators
++and, from there, response fields that cannot be serialised as JSON.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from app.engine.pipeline import MarketDataError, validate_bars
++from app.schemas import OHLCVBar
++
++
++def _bar(index: int, **overrides) -> OHLCVBar:
++    values = dict(
++        timestamp=f"2026-01-{index + 1:02d}T00:00:00Z",
++        open=100.0,
++        high=101.0,
++        low=99.0,
++        close=100.0,
++        volume=1000.0,
++    )
++    values.update(overrides)
++    return OHLCVBar(**values)
++
++
++def test_clean_bars_pass_with_no_warnings():
++    assert validate_bars([_bar(i) for i in range(20)]) == []
++
++
++@pytest.mark.parametrize("field_name", ["open", "high", "low", "close", "volume"])
++@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")], ids=["nan", "+inf", "-inf"])
++def test_any_non_finite_value_is_rejected_with_the_offending_field_named(field_name, bad):
++    bars = [_bar(i) for i in range(20)]
++    bars[7] = _bar(7, **{field_name: bad})
++
++    with pytest.raises(MarketDataError, match=rf"Bar 7 {field_name} .* not a finite number"):
++        validate_bars(bars)
+diff --git a/apps/api/tests/test_knowledge_maintenance.py b/apps/api/tests/test_knowledge_maintenance.py
+new file mode 100644
+index 0000000..4a32a43
+--- /dev/null
++++ b/apps/api/tests/test_knowledge_maintenance.py
+@@ -0,0 +1,224 @@
++"""
++`python -m app.rag.maintenance reembed-unusable` — repair of zero-vector rows
++written by versions that did not validate embeddings.
++
++These tests only ever touch the documents they create (the command is run
++with a document scope), so they are safe to run against a development
++database that holds real knowledge — including real poisoned rows, which
++are exactly what the command exists to repair.
++
++Skipped without DATABASE_URL.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import os
++import subprocess
++import sys
++import uuid
++from pathlib import Path
++
++import asyncpg
++import pytest
++
++from app.db.knowledge import list_unusable_embeddings, similarity_search
++from app.rag.embeddings import HashingEmbeddingProvider
++from app.rag.maintenance import reembed_unusable
++
++from .knowledge_support import (
++    TITLE_PREFIX,
++    ZERO_VECTOR_LITERAL,
++    delete_test_documents,
++    insert_legacy_chunk,
++    insert_ready_document,
++    vector_literal,
++)
++
++pytestmark = pytest.mark.skipif(
++    not os.environ.get("DATABASE_URL"),
++    reason="DATABASE_URL is not set — maintenance tests require a live Postgres instance with pgvector",
++)
++
++API_ROOT = Path(__file__).resolve().parents[1]
++BENGALI = "ভারতীয় শেয়ার বাজার বিশ্লেষণ এবং ঝুঁকি ব্যবস্থাপনা"
++HOPELESS = "?! 😀 ---"
++ASCII = "RSI measures momentum and overbought conditions"
++
++
++@pytest.fixture
++async def pool(monkeypatch):
++    monkeypatch.delenv("GOOGLE_AI_API_KEY", raising=False)  # deterministic hashing embedder
++    import app.db.client as db_client
++
++    db_client._pool = None
++    from app.db.client import get_pool
++
++    p = await get_pool()
++    yield p
++    await delete_test_documents(p)
++    db_client._pool = None
++
++
++async def _seed_legacy_document(pool) -> dict:
++    """A document as an unvalidated version would have left it: one
++    recoverable zero-vector chunk, one hopeless one, one healthy one."""
++    title = f"{TITLE_PREFIX}maint-{uuid.uuid4().hex[:6]}"
++    document_id = await insert_ready_document(pool, title)
++    healthy_vector = await HashingEmbeddingProvider().embed(ASCII)
++    recoverable_chunk, recoverable_embedding = await insert_legacy_chunk(pool, document_id, 0, BENGALI, ZERO_VECTOR_LITERAL)
++    hopeless_chunk, hopeless_embedding = await insert_legacy_chunk(pool, document_id, 1, HOPELESS, ZERO_VECTOR_LITERAL)
++    healthy_chunk, healthy_embedding = await insert_legacy_chunk(pool, document_id, 2, ASCII, vector_literal(healthy_vector))
++    return {
++        "document_id": document_id,
++        "recoverable": (recoverable_chunk, recoverable_embedding),
++        "hopeless": (hopeless_chunk, hopeless_embedding),
++        "healthy": (healthy_chunk, healthy_embedding),
++        "healthy_vector": healthy_vector,
++    }
++
++
++async def _vector_text(pool, embedding_id: str) -> str:
++    return await pool.fetchval("SELECT vector::text FROM embeddings WHERE id = $1", embedding_id)
++
++
++@pytest.mark.asyncio
++async def test_listing_finds_exactly_the_unusable_rows_and_honours_the_scope(pool):
++    seeded = await _seed_legacy_document(pool)
++    other = await _seed_legacy_document(pool)
++
++    found = await list_unusable_embeddings([seeded["document_id"]])
++
++    assert {item.embedding_id for item in found} == {seeded["recoverable"][1], seeded["hopeless"][1]}
++    assert seeded["healthy"][1] not in {item.embedding_id for item in found}
++    everything = {item.embedding_id for item in await list_unusable_embeddings()}
++    assert {other["recoverable"][1], other["hopeless"][1]} <= everything  # unscoped sees all documents
++
++
++@pytest.mark.asyncio
++async def test_dry_run_reports_but_changes_nothing(pool):
++    seeded = await _seed_legacy_document(pool)
++    before = await _vector_text(pool, seeded["recoverable"][1])
++
++    report = await reembed_unusable(dry_run=True, document_ids=[seeded["document_id"]])
++
++    assert (report.scanned, report.repaired, report.removed, report.dry_run) == (2, 0, 0, True)
++    assert await _vector_text(pool, seeded["recoverable"][1]) == before
++    assert len(await list_unusable_embeddings([seeded["document_id"]])) == 2
++
++
++@pytest.mark.asyncio
++async def test_repair_reembeds_recoverable_chunks_and_removes_hopeless_ones(pool):
++    seeded = await _seed_legacy_document(pool)
++    healthy_before = await _vector_text(pool, seeded["healthy"][1])
++
++    report = await reembed_unusable(document_ids=[seeded["document_id"]])
++
++    assert (report.scanned, report.repaired, report.removed) == (2, 1, 1)
++    # The Bengali chunk is searchable now: a usable vector, and a real match.
++    self_distance = await pool.fetchval(
++        "SELECT (vector <=> vector) FROM embeddings WHERE id = $1", seeded["recoverable"][1]
++    )
++    assert self_distance == 0.0  # NaN for a zero vector
++    query = await HashingEmbeddingProvider().embed("শেয়ার বাজার")
++    hits = await similarity_search(query, top_k=50)
++    match = next(h for h in hits if h.chunk_id == seeded["recoverable"][0])
++    assert match.similarity > 0.3
++    # The hopeless chunk lost its embedding row (it can never match); its text remains.
++    assert await pool.fetchval("SELECT count(*) FROM embeddings WHERE chunk_id = $1", seeded["hopeless"][0]) == 0
++    assert await pool.fetchval("SELECT count(*) FROM knowledge_chunks WHERE id = $1", seeded["hopeless"][0]) == 1
++    # The healthy chunk is untouched, and nothing is left to repair.
++    assert await _vector_text(pool, seeded["healthy"][1]) == healthy_before
++    assert await list_unusable_embeddings([seeded["document_id"]]) == []
++
++
++@pytest.mark.asyncio
++async def test_a_second_run_finds_nothing_to_do(pool):
++    seeded = await _seed_legacy_document(pool)
++    await reembed_unusable(document_ids=[seeded["document_id"]])
++
++    again = await reembed_unusable(document_ids=[seeded["document_id"]])
++
++    assert (again.scanned, again.repaired, again.removed) == (0, 0, 0)
++
++
++@pytest.mark.asyncio
++async def test_repair_is_confined_to_the_requested_documents(pool):
++    target = await _seed_legacy_document(pool)
++    bystander = await _seed_legacy_document(pool)
++
++    await reembed_unusable(document_ids=[target["document_id"]])
++
++    still_unusable = {item.embedding_id for item in await list_unusable_embeddings([bystander["document_id"]])}
++    assert still_unusable == {bystander["recoverable"][1], bystander["hopeless"][1]}
++
++
++# --------------------------------------------------------------------------
++# The command line entry point (a real subprocess)
++# --------------------------------------------------------------------------
++
++
++def _run_cli(*args: str, database_url: str | None):
++    env = {k: v for k, v in os.environ.items() if k not in ("DATABASE_URL", "GOOGLE_AI_API_KEY")}
++    env["PYTHONPATH"] = str(API_ROOT)
++    if database_url:
++        env["DATABASE_URL"] = database_url
++    return subprocess.run(
++        [sys.executable, "-m", "app.rag.maintenance", *args],
++        cwd=API_ROOT,
++        env=env,
++        capture_output=True,
++        text=True,
++        timeout=120,
++    )
++
++
++def test_command_line_dry_run_and_repair_round_trip():
++    database_url = os.environ["DATABASE_URL"]
++
++    async def seed() -> dict:
++        connection = await asyncpg.connect(database_url)
++        try:
++            return await _seed_legacy_document(connection)  # a Connection has fetchval/execute like a Pool
++        finally:
++            await connection.close()
++
++    async def count_unusable(document_id: str) -> int:
++        connection = await asyncpg.connect(database_url)
++        try:
++            return await connection.fetchval(
++                "SELECT count(*) FROM embeddings e JOIN knowledge_chunks kc ON kc.id = e.chunk_id "
++                "WHERE kc.document_id = $1 AND (e.vector <=> e.vector) = 'NaN'::float8",
++                document_id,
++            )
++        finally:
++            await connection.close()
++
++    async def cleanup() -> None:
++        connection = await asyncpg.connect(database_url)
++        try:
++            await delete_test_documents(connection)
++        finally:
++            await connection.close()
++
++    seeded = asyncio.run(seed())
++    try:
++        document = seeded["document_id"]
++
++        dry = _run_cli("reembed-unusable", "--dry-run", "--document-id", document, database_url=database_url)
++        assert dry.returncode == 0, dry.stderr
++        assert "2 unusable embedding(s) found" in dry.stdout and "dry run" in dry.stdout
++        assert asyncio.run(count_unusable(document)) == 2
++
++        real = _run_cli("reembed-unusable", "--document-id", document, database_url=database_url)
++        assert real.returncode == 0, real.stderr
++        assert "1 were re-embedded, 1 were removed" in real.stdout
++        assert asyncio.run(count_unusable(document)) == 0
++    finally:
++        asyncio.run(cleanup())
++
++
++def test_command_line_without_a_database_exits_with_a_clear_message():
++    result = _run_cli("reembed-unusable", database_url=None)
++    assert result.returncode == 2
++    assert "DATABASE_URL is not set" in result.stderr
+diff --git a/apps/api/tests/test_knowledge_search_nan.py b/apps/api/tests/test_knowledge_search_nan.py
+new file mode 100644
+index 0000000..3aaca79
+--- /dev/null
++++ b/apps/api/tests/test_knowledge_search_nan.py
+@@ -0,0 +1,221 @@
++"""
++Regression tests for: POST /api/knowledge/search -> HTTP 500,
++"ValueError: Out of range float values are not JSON compliant: nan".
++
++Root cause: text with no ASCII letter/digit (a Bengali document, a
++punctuation-only query, ...) embedded to an all-zero vector; pgvector's
++cosine distance against a zero vector is NaN; the NaN similarity could not
++be serialised. These tests drive the REAL application end to end (ASGI
++transport, real Postgres + pgvector, real hashing embedder) using only the
++public API plus raw SQL, so each scenario is exactly what a user hits.
++
++Skipped without DATABASE_URL, like the other integration modules.
++"""
++
++from __future__ import annotations
++
++import os
++import uuid
++
++import httpx
++import pytest
++
++from .knowledge_support import (
++    TITLE_PREFIX,
++    ZERO_VECTOR_LITERAL,
++    delete_test_documents,
++    insert_legacy_chunk,
++    insert_ready_document,
++)
++from .strict_json import assert_all_finite, loads_strict
++
++pytestmark = pytest.mark.skipif(
++    not os.environ.get("DATABASE_URL"),
++    reason="DATABASE_URL is not set — knowledge search tests require a live Postgres instance with pgvector",
++)
++
++PASSWORD = "correct-horse-battery-staple"
++ASCII_TEXT = "RSI measures momentum. A reading above 70 is overbought and below 30 is oversold."
++BENGALI_TEXT = "ভারতীয় শেয়ার বাজার বিশ্লেষণ এবং ঝুঁকি ব্যবস্থাপনা"
++
++
++@pytest.fixture
++async def pool():
++    import app.db.client as db_client
++
++    db_client._pool = None
++    from app.db.client import get_pool
++
++    p = await get_pool()
++    yield p
++    await delete_test_documents(p)
++    db_client._pool = None
++
++
++@pytest.fixture
++async def client(monkeypatch, pool):
++    monkeypatch.setenv("JWT_SECRET", "test-secret-do-not-use-in-production")
++    monkeypatch.setenv("JWT_ISSUER", "oxygen-ai-test")
++    monkeypatch.delenv("GOOGLE_AI_API_KEY", raising=False)  # pin the deterministic hashing embedder
++    from app.config import get_settings
++
++    get_settings(refresh=True)
++
++    from app.main import app
++
++    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
++        yield c
++    get_settings(refresh=True)
++
++
++@pytest.fixture
++async def admin(client, pool):
++    """An admin account's auth headers (role set in SQL, independent of any app code)."""
++    email = f"zztest-{uuid.uuid4().hex[:12]}@example.com"
++    registered = await client.post("/api/auth/register", json={"email": email, "password": PASSWORD})
++    assert registered.status_code == 200, registered.text
++    await pool.execute(
++        "UPDATE users SET role_id = (SELECT id FROM roles WHERE name = 'admin') WHERE email = $1", email
++    )
++    yield {"Authorization": f"Bearer {registered.json()['accessToken']}"}
++    await pool.execute("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE email = $1)", email)
++    await pool.execute("DELETE FROM users WHERE email = $1", email)
++
++
++def _title(label: str) -> str:
++    return f"{TITLE_PREFIX}{label}-{uuid.uuid4().hex[:6]}"
++
++
++async def _upload(client, admin, title: str, content: str):
++    return await client.post(
++        "/api/knowledge/upload",
++        headers=admin,
++        json={"title": title, "content": content, "sourceType": "knowledge"},
++    )
++
++
++async def _search(client, admin, query: str, top_k: int = 10):
++    response = await client.post("/api/knowledge/search", headers=admin, json={"query": query, "topK": top_k})
++    return response
++
++
++def _ours(hits: list[dict]) -> list[dict]:
++    """Only the documents this test created (the database may hold others)."""
++    return [h for h in hits if h["documentTitle"].startswith(TITLE_PREFIX)]
++
++
++# --------------------------------------------------------------------------
++# The reported failure, reproduced through the public API
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_search_succeeds_when_the_corpus_contains_non_latin_text(client, admin):
++    ascii_title, bengali_title = _title("ascii"), _title("bengali")
++    assert (await _upload(client, admin, ascii_title, ASCII_TEXT)).status_code == 200
++    # The upload always "succeeded" — it was the SEARCH that failed afterwards.
++    uploaded = await _upload(client, admin, bengali_title, BENGALI_TEXT)
++    assert uploaded.status_code == 200 and uploaded.json()["chunkCount"] >= 1
++
++    response = await _search(client, admin, "RSI momentum")
++
++    assert response.status_code == 200, response.text  # was: 500, nan is not JSON compliant
++    hits = loads_strict(response.text)  # strict: rejects NaN / Infinity
++    assert_all_finite(hits)
++    ours = _ours(hits)
++    assert [h["documentTitle"] for h in ours][0] == ascii_title
++    assert {h["documentTitle"] for h in ours} == {ascii_title, bengali_title}
++
++
++@pytest.mark.asyncio
++async def test_a_non_latin_query_finds_the_matching_document(client, admin):
++    ascii_title, bengali_title = _title("ascii"), _title("bengali")
++    await _upload(client, admin, ascii_title, ASCII_TEXT)
++    await _upload(client, admin, bengali_title, BENGALI_TEXT)
++
++    response = await _search(client, admin, "শেয়ার বাজার")  # a Bengali query: previously a zero query vector
++
++    assert response.status_code == 200, response.text
++    hits = _ours(loads_strict(response.text))
++    assert hits[0]["documentTitle"] == bengali_title
++    assert hits[0]["score"] > 0.3  # a genuine lexical match, not a degenerate 0
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("query", ["???", "--- !!!", "😀", "   "])
++async def test_a_query_with_nothing_to_search_on_returns_an_empty_list(client, admin, query):
++    # The corpus must be non-empty: a zero query vector yields a NaN
++    # similarity against every stored row, and with no rows there is
++    # nothing to go wrong (an earlier draft of this test passed on the
++    # broken code for exactly that reason).
++    await _upload(client, admin, _title("ascii"), ASCII_TEXT)
++
++    response = await _search(client, admin, query)
++    assert response.status_code == 200, response.text  # was: 500
++    assert loads_strict(response.text) == []
++
++
++@pytest.mark.asyncio
++async def test_uploading_text_with_nothing_indexable_is_rejected_cleanly(client, admin, pool):
++    title = _title("symbols")
++
++    response = await _upload(client, admin, title, "??? --- !!! 😀😀")
++
++    # Before: accepted (200) and stored a zero vector that broke every later search.
++    assert response.status_code == 400, response.text
++    assert "indexed" in response.json()["error"]
++    status = await pool.fetchval("SELECT status FROM knowledge_documents WHERE title = $1", title)
++    assert status == "failed"  # not left 'processing', not 'ready'
++
++
++# --------------------------------------------------------------------------
++# Data written by the earlier version — the state a real database is in now
++# --------------------------------------------------------------------------
++
++
++async def _seed_legacy_poison(pool) -> str:
++    title = _title("legacy-poison")
++    document_id = await insert_ready_document(pool, title)
++    await insert_legacy_chunk(pool, document_id, 0, BENGALI_TEXT, ZERO_VECTOR_LITERAL)
++    return title
++
++
++@pytest.mark.asyncio
++async def test_search_survives_zero_vector_rows_left_by_older_versions(client, admin, pool):
++    ascii_title = _title("ascii")
++    await _upload(client, admin, ascii_title, ASCII_TEXT)
++    poisoned_title = await _seed_legacy_poison(pool)
++
++    response = await _search(client, admin, "RSI momentum")
++
++    # The tokenizer fix alone cannot help here: the stored vector is already
++    # zero. The SQL-level exclusion is what keeps this 200.
++    assert response.status_code == 200, response.text
++    hits = loads_strict(response.text)
++    assert_all_finite(hits)
++    titles = {h["documentTitle"] for h in _ours(hits)}
++    assert ascii_title in titles
++    assert poisoned_title not in titles  # unrankable rows are excluded, not returned as NaN
++
++
++@pytest.mark.asyncio
++async def test_analysis_and_the_knowledge_tool_are_unaffected_by_poisoned_rows(client, admin, pool):
++    ascii_title = _title("ascii")
++    await _upload(client, admin, ascii_title, ASCII_TEXT)
++    poisoned_title = await _seed_legacy_poison(pool)
++
++    analysis = await client.post("/api/ai/analyze", headers=admin, json={"symbol": "ZZNAN", "provider": "mock"})
++    assert analysis.status_code == 200, analysis.text
++    body = loads_strict(analysis.text)
++    assert_all_finite(body)
++    assert not any(poisoned_title in source for source in body.get("knowledgeSources", []))
++
++    tool = await client.post(
++        "/api/ai/tools/knowledge_retrieval/invoke", headers=admin, json={"query": "RSI momentum", "topK": 10}
++    )
++    assert tool.status_code == 200, tool.text
++    outcome = loads_strict(tool.text)
++    assert outcome["status"] == "ok", outcome
++    assert_all_finite(outcome)
++    assert poisoned_title not in {r["documentTitle"] for r in outcome["output"]["results"]}
+diff --git a/apps/api/tests/test_rag_finite_pipeline.py b/apps/api/tests/test_rag_finite_pipeline.py
+new file mode 100644
+index 0000000..9313823
+--- /dev/null
++++ b/apps/api/tests/test_rag_finite_pipeline.py
+@@ -0,0 +1,229 @@
++"""
++Reranker and retrieval/ingestion pipeline behaviour with degenerate numbers
++(no database — the embedder and the SQL layer are replaced with doubles, so
++every scenario is exact and repeatable).
++
++The headline guarantee: no non-finite score ever leaves `retrieve()`, which
++is what the search endpoint, the analysis prompt and the knowledge tool all
++call.
++"""
++
++from __future__ import annotations
++
++import json
++import math
++
++import pytest
++
++import app.rag.pipeline as pipeline
++from app.db.knowledge import SearchRow
++from app.rag.chunking import Chunk
++from app.rag.rerank import RetrievedChunk, rerank
++
++from .strict_json import assert_all_finite
++
++NAN = float("nan")
++UNIT = [1.0] + [0.0] * 1535
++ZERO = [0.0] * 1536
++
++
++def _rc(chunk_id: str, score: float, content: str = "rsi momentum note") -> RetrievedChunk:
++    return RetrievedChunk(chunk_id, "doc", "title", "knowledge", content, 0, score)
++
++
++def _row(chunk_id: str, similarity: float, content: str = "rsi momentum note") -> SearchRow:
++    return SearchRow(chunk_id, "doc", "title", "knowledge", content, 0, similarity)
++
++
++# ---------------------------------------------------------------- rerank
++
++
++@pytest.mark.parametrize("nan_position", [0, 1, 2, 3, 4])
++def test_a_nan_score_never_disturbs_the_order_of_finite_chunks(nan_position):
++    finite = [_rc("c1", 0.3), _rc("c2", 0.9), _rc("c3", 0.6), _rc("c4", 0.1)]  # deliberately unsorted
++    mixed = list(finite)
++    mixed.insert(nan_position, _rc("bad", NAN))
++
++    ids = [c.chunk_id for c in rerank("rsi momentum", mixed)]
++
++    # Finite chunks in true descending order; the non-finite one ranks last.
++    assert ids == ["c2", "c3", "c1", "c4", "bad"]
++
++
++def test_infinite_scores_are_treated_the_same_way():
++    ids = [c.chunk_id for c in rerank("q", [_rc("inf", math.inf), _rc("a", 0.2), _rc("ninf", -math.inf), _rc("b", 0.8)])]
++    assert ids[:2] == ["b", "a"]
++    assert set(ids[2:]) == {"inf", "ninf"}
++
++
++def test_rerank_does_not_mutate_the_reported_score():
++    original = [_rc("a", 0.4), _rc("b", 0.8)]
++    ranked = rerank("rsi momentum", original)
++    assert {c.chunk_id: c.vector_score for c in ranked} == {"a": 0.4, "b": 0.8}
++
++
++def test_rerank_is_deterministic():
++    items = [_rc(f"c{i}", 0.5) for i in range(6)]
++    runs = {tuple(c.chunk_id for c in rerank("rsi momentum", list(items))) for _ in range(5)}
++    assert len(runs) == 1
++
++
++def test_lexical_overlap_now_works_for_non_ascii_queries():
++    # Equal vector scores: only the lexical term can separate them. With the
++    # old ASCII-only tokenizer both overlaps were 0 and the order was arbitrary.
++    related = _rc("related", 0.5, content="ভারতীয় শেয়ার বাজার বিশ্লেষণ")
++    unrelated = _rc("unrelated", 0.5, content="completely different english text")
++    assert [c.chunk_id for c in rerank("শেয়ার বাজার", [unrelated, related])] == ["related", "unrelated"]
++
++
++# ---------------------------------------------------------------- retrieve
++
++
++class _FakeEmbedder:
++    model_name = "fake-embedder"
++
++    def __init__(self, vector):
++        self._vector = vector
++
++    async def embed(self, text):
++        return list(self._vector)
++
++    async def embed_batch(self, texts):
++        return [list(self._vector) for _ in texts]
++
++
++@pytest.fixture
++def retrieval(monkeypatch):
++    """Install a fake embedder and a fake SQL layer; returns a handle to both."""
++
++    class Handle:
++        rows: list[SearchRow] = []
++        searched = 0
++
++    async def fake_search(vector, top_k):
++        Handle.searched += 1
++        return list(Handle.rows)
++
++    monkeypatch.setattr(pipeline, "similarity_search", fake_search)
++    monkeypatch.setattr(pipeline, "get_embedding_provider", lambda: _FakeEmbedder(UNIT))
++    Handle.rows, Handle.searched = [], 0
++    return Handle
++
++
++@pytest.mark.asyncio
++async def test_non_finite_rows_never_leave_retrieve(retrieval):
++    retrieval.rows = [_row("a", 0.4), _row("nan", NAN), _row("b", 0.9), _row("inf", math.inf)]
++
++    results = await pipeline.retrieve("rsi momentum", top_k=5)
++
++    assert [r["chunkId"] for r in results] == ["b", "a"]
++    assert_all_finite(results)
++    json.dumps(results, allow_nan=False)  # exactly what the JSON encoder requires
++
++
++@pytest.mark.asyncio
++async def test_a_query_with_no_usable_direction_returns_nothing_without_searching(monkeypatch, retrieval):
++    monkeypatch.setattr(pipeline, "get_embedding_provider", lambda: _FakeEmbedder(ZERO))
++    retrieval.rows = [_row("a", 0.9)]
++
++    assert await pipeline.retrieve("???", top_k=5) == []
++    assert retrieval.searched == 0  # never reached the database
++
++
++@pytest.mark.asyncio
++async def test_retrieve_with_the_real_embedder_and_a_tokenless_query_returns_nothing(monkeypatch, retrieval):
++    from app.rag.embeddings import HashingEmbeddingProvider
++
++    monkeypatch.setattr(pipeline, "get_embedding_provider", lambda: HashingEmbeddingProvider())
++    retrieval.rows = [_row("a", 0.9)]
++    for query in ["???", "   ", "😀", "--- !!!"]:
++        assert await pipeline.retrieve(query, top_k=5) == []
++    assert retrieval.searched == 0
++
++
++@pytest.mark.asyncio
++async def test_all_rows_non_finite_yields_an_empty_list_not_an_error(retrieval):
++    retrieval.rows = [_row("x", NAN), _row("y", NAN)]
++    assert await pipeline.retrieve("rsi", top_k=3) == []
++
++
++# ---------------------------------------------------------------- ingest
++
++
++@pytest.fixture
++def ingestion(monkeypatch):
++    """Replace chunking, embedding and every DB write; record what happens."""
++
++    class Handle:
++        statuses: list[str] = []
++        stored: list[tuple[list[str], list[list[float]]]] = []
++        chunks: list[Chunk] = []
++        vectors: list[list[float]] = []
++
++    async def create_document(title, source_type, uploaded_by):
++        return "doc-1"
++
++    async def mark_status(document_id, status):
++        Handle.statuses.append(status)
++
++    async def insert(document_id, contents, vectors, model):
++        Handle.stored.append((contents, vectors))
++
++    class Embedder:
++        model_name = "fake-embedder"
++
++        async def embed_batch(self, texts):
++            return list(Handle.vectors)
++
++    monkeypatch.setattr(pipeline, "create_document", create_document)
++    monkeypatch.setattr(pipeline, "mark_document_status", mark_status)
++    monkeypatch.setattr(pipeline, "insert_chunks_with_embeddings", insert)
++    monkeypatch.setattr(pipeline, "chunk_text", lambda cleaned: list(Handle.chunks))
++    monkeypatch.setattr(pipeline, "get_embedding_provider", lambda: Embedder())
++    Handle.statuses, Handle.stored, Handle.chunks, Handle.vectors = [], [], [], []
++    return Handle
++
++
++@pytest.mark.asyncio
++async def test_unembeddable_chunks_are_skipped_and_the_rest_are_stored(ingestion):
++    ingestion.chunks = [Chunk("real text", 0), Chunk("?!", 1), Chunk("more real text", 2)]
++    ingestion.vectors = [UNIT, ZERO, UNIT]
++
++    result = await pipeline.ingest_text("t", "body", "knowledge")
++
++    assert (result.chunk_count, result.skipped_chunks) == (2, 1)
++    assert ingestion.stored == [(["real text", "more real text"], [UNIT, UNIT])]
++    assert ingestion.statuses == ["ready"]
++
++
++@pytest.mark.asyncio
++async def test_a_document_with_nothing_embeddable_is_rejected_and_marked_failed(ingestion):
++    ingestion.chunks = [Chunk("?!", 0), Chunk("😀", 1)]
++    ingestion.vectors = [ZERO, ZERO]
++
++    with pytest.raises(pipeline.NoIndexableContentError, match="could be indexed"):
++        await pipeline.ingest_text("t", "body", "knowledge")
++
++    assert ingestion.stored == []  # nothing poisonous was written
++    assert ingestion.statuses == ["failed"]
++
++
++@pytest.mark.asyncio
++async def test_an_empty_document_is_the_same_clean_error_and_still_a_value_error(ingestion):
++    ingestion.chunks = []
++    with pytest.raises(ValueError) as caught:  # existing `except ValueError` callers keep working
++        await pipeline.ingest_text("t", "   ", "knowledge")
++    assert isinstance(caught.value, pipeline.NoIndexableContentError)
++    assert ingestion.statuses == ["failed"]
++
++
++@pytest.mark.asyncio
++async def test_a_short_provider_response_is_an_error_not_silent_data_loss(ingestion):
++    ingestion.chunks = [Chunk("a", 0), Chunk("b", 1)]
++    ingestion.vectors = [UNIT]  # one vector for two chunks; zip() would have dropped a chunk silently
++
++    with pytest.raises(ValueError, match="1 vectors for 2 chunks"):
++        await pipeline.ingest_text("t", "body", "knowledge")
++
++    assert ingestion.stored == []
++    assert ingestion.statuses == ["failed"]
+diff --git a/apps/api/tests/test_rag_tokenize.py b/apps/api/tests/test_rag_tokenize.py
+new file mode 100644
+index 0000000..71e4385
+--- /dev/null
++++ b/apps/api/tests/test_rag_tokenize.py
+@@ -0,0 +1,199 @@
++"""
++Tokenizer and hashing-embedder regression tests (no database).
++
++Root cause of the knowledge-search failure: the embedder tokenized with
++`[a-z0-9]+`, so text with no ASCII letter/digit — Bengali, Hindi, Arabic,
++CJK, punctuation-only — produced no tokens, hence an all-zero vector, hence
++NaN similarity in pgvector, hence an un-serialisable response. These tests
++pin (1) that those scripts now embed to a usable vector, and (2) that
++nothing changed for ASCII text, so every vector stored by earlier versions
++stays valid.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import math
++import random
++import re
++
++import pytest
++
++from app.db.knowledge import is_usable_vector
++from app.rag.embeddings import EMBEDDING_DIM, HashingEmbeddingProvider
++from app.rag.tokenize import tokenize
++
++
++# --- Frozen copy of the PREVIOUS implementation: the compatibility reference.
++# Deliberately duplicated here (not imported) so that if the production
++# algorithm ever drifts, this test notices.
++def _legacy_tokens(text: str) -> list[str]:
++    return re.findall(r"[a-z0-9]+", text.lower())
++
++
++def _legacy_embed(text: str) -> list[float]:
++    vector = [0.0] * EMBEDDING_DIM
++    words = _legacy_tokens(text)
++    if not words:
++        return vector
++    for word in words:
++        digest = hashlib.sha256(word.encode("utf-8")).digest()
++        bucket = int.from_bytes(digest[:4], "big") % EMBEDDING_DIM
++        vector[bucket] += 1.0 if digest[4] & 1 else -1.0
++    norm = math.sqrt(sum(v * v for v in vector))
++    if norm == 0:
++        return vector
++    return [v / norm for v in vector]
++
++
++ASCII_SAMPLES = [
++    "RSI measures momentum. A reading above 70 is overbought.",
++    "Position sizing: risk 1% of equity per trade; ATR-based stops.",
++    "UPPER lower MiXeD case, snake_case_words and kebab-case-words",
++    "don't, can't, won't — it's 100% about 2.5R targets & 3 R:R.",
++    "NIFTY50 / BANKNIFTY 22,450.75 (+1.2%)",
++    "",
++    "   \t\n  ",
++    "!!! ??? ---",
++]
++
++
++def _random_ascii(rng: random.Random) -> str:
++    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 \t\n.,;:!?'\"-_()[]{}<>/\\@#$%^&*+=~`|"
++    return "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 80)))
++
++
++# ---------------------------------------------------------------- compatibility
++
++
++def test_ascii_tokenization_is_identical_to_the_legacy_regex():
++    rng = random.Random(20261016)
++    corpus = ASCII_SAMPLES + [_random_ascii(rng) for _ in range(500)]
++    for text in corpus:
++        assert tokenize(text) == _legacy_tokens(text), repr(text)
++
++
++@pytest.mark.asyncio
++async def test_ascii_embeddings_are_bit_identical_to_the_legacy_algorithm():
++    # Exact equality, not approximate: previously stored vectors must remain
++    # valid for similarity against freshly computed query vectors.
++    provider = HashingEmbeddingProvider()
++    rng = random.Random(7)
++    for text in ASCII_SAMPLES + [_random_ascii(rng) for _ in range(60)]:
++        assert await provider.embed(text) == _legacy_embed(text), repr(text)
++
++
++def test_model_name_is_unchanged_so_existing_rows_stay_valid():
++    assert HashingEmbeddingProvider.model_name == "hashing-trick-v1"
++
++
++# ---------------------------------------------------------------- the actual bug
++
++
++NON_ASCII_SAMPLES = {
++    "bengali": ("ভারতীয় শেয়ার বাজার বিশ্লেষণ", ["ভারতীয়", "শেয়ার", "বাজার", "বিশ্লেষণ"]),
++    "hindi + english": ("RSI और MACD का उपयोग", ["rsi", "और", "macd", "का", "उपयोग"]),
++    "cyrillic": ("Индекс Относительной Силы", ["индекс", "относительной", "силы"]),
++    "greek": ("Μέση τιμή", ["μέση", "τιμή"]),
++    "arabic": ("مؤشر القوة النسبية", ["مؤشر", "القوة", "النسبية"]),
++    "accented latin": ("Café naïve", ["café", "naïve"]),
++    "fullwidth latin": ("ＲＳＩ ７０", ["rsi", "70"]),
++    "ligature": ("ﬁnance", ["finance"]),
++}
++
++
++@pytest.mark.parametrize("name", list(NON_ASCII_SAMPLES))
++def test_non_ascii_text_tokenizes_into_whole_words(name):
++    text, expected = NON_ASCII_SAMPLES[name]
++    assert tokenize(text) == expected
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("name", list(NON_ASCII_SAMPLES))
++async def test_non_ascii_text_embeds_to_a_usable_vector(name):
++    # Before the fix every sample here except 'hindi + english' and the
++    # Latin-accent cases came back as the all-zero vector.
++    text, _ = NON_ASCII_SAMPLES[name]
++    vector = await HashingEmbeddingProvider().embed(text)
++    assert len(vector) == EMBEDDING_DIM
++    assert is_usable_vector(vector)
++    assert math.isclose(math.sqrt(sum(v * v for v in vector)), 1.0, rel_tol=1e-9)
++
++
++@pytest.mark.asyncio
++async def test_a_bengali_query_is_most_similar_to_a_bengali_document():
++    provider = HashingEmbeddingProvider()
++    doc_bn = await provider.embed("ভারতীয় শেয়ার বাজার বিশ্লেষণ এবং ঝুঁকি ব্যবস্থাপনা")
++    doc_en = await provider.embed("RSI measures momentum and overbought conditions")
++    query = await provider.embed("শেয়ার বাজার")
++
++    def cosine(a, b):
++        return sum(x * y for x, y in zip(a, b))  # both unit length
++
++    assert cosine(query, doc_bn) > 0.3
++    assert cosine(query, doc_en) == 0.0
++
++
++def test_combining_marks_stay_attached_so_indic_words_are_not_shredded():
++    # "বাজার" contains vowel signs (category Mc). Splitting on "non-letters"
++    # would have produced single consonants.
++    assert tokenize("বাজার") == ["বাজার"]
++
++
++def test_composed_and_decomposed_forms_tokenize_identically():
++    assert tokenize("caf\u00e9") == tokenize("cafe\u0301") == ["café"]
++
++
++def test_a_joiner_keeps_an_indic_conjunct_in_one_token():
++    tokens = tokenize("ক্\u200dষ")
++    assert len(tokens) == 1 and "\u200d" in tokens[0]
++
++
++# ---------------------------------------------------------------- genuinely empty
++
++
++CONTENTLESS = ["", "   \n\t", "???", "--- !!! ...", "😀😀", "\u0301\u0301", "\u200d", "\u200c\u200d"]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("text", CONTENTLESS)
++async def test_contentless_text_has_no_tokens_and_no_usable_vector(text):
++    assert tokenize(text) == []
++    vector = await HashingEmbeddingProvider().embed(text)
++    assert all(v == 0.0 for v in vector)  # an honest "no signal" ...
++    assert not is_usable_vector(vector)  # ... that callers must not store or search with
++
++
++def test_circled_digits_normalise_to_real_digits_so_they_are_not_contentless():
++    assert tokenize("①②③") == ["123"]
++
++
++def test_tokenizer_never_raises_on_malformed_unicode():
++    # A lone surrogate can arrive in a JSON body ("\ud800"); it must be a
++    # separator, not a crash (and never end up inside a hashed token).
++    assert tokenize("a\ud800b") == ["a", "b"]
++
++
++@pytest.mark.asyncio
++async def test_lone_surrogate_does_not_break_embedding():
++    assert is_usable_vector(await HashingEmbeddingProvider().embed("rsi\ud800momentum"))
++
++
++@pytest.mark.asyncio
++async def test_exact_bucket_cancellation_yields_the_zero_vector_not_a_crash():
++    """Two different words can land in the same bucket with opposite signs,
++    summing to exactly zero. Found deterministically here rather than assumed."""
++    provider = HashingEmbeddingProvider()
++    seen: dict[int, tuple[str, float]] = {}
++    pair = None
++    for i in range(20000):
++        word = f"w{i}"
++        bucket, sign = provider._hash_bucket(word)
++        if bucket in seen and seen[bucket][1] != sign:
++            pair = (seen[bucket][0], word)
++            break
++        seen.setdefault(bucket, (word, sign))
++    assert pair is not None, "no colliding pair found"
++    vector = await provider.embed(" ".join(pair))
++    assert all(v == 0.0 for v in vector)
++    assert not is_usable_vector(vector)
+diff --git a/apps/api/tests/test_vector_guards.py b/apps/api/tests/test_vector_guards.py
+new file mode 100644
+index 0000000..4794dfc
+--- /dev/null
++++ b/apps/api/tests/test_vector_guards.py
+@@ -0,0 +1,91 @@
++"""
++Finite-number guards at the storage and response boundaries (no database).
++"""
++
++from __future__ import annotations
++
++import math
++
++import pytest
++from pydantic import ValidationError
++
++import app.db.knowledge as knowledge_db
++from app.db.knowledge import apply_embedding_repairs, insert_chunks_with_embeddings, is_usable_vector, similarity_search
++from app.schemas import KnowledgeChunkResponse
++
++UNIT = [1.0] + [0.0] * 1535
++ZERO = [0.0] * 1536
++
++
++@pytest.mark.parametrize(
++    "vector, usable",
++    [
++        (UNIT, True),
++        ([0.6, 0.8], True),
++        ([1, 2, 3], True),  # ints are fine
++        (ZERO, False),
++        ([], False),
++        ([float("nan"), 1.0], False),
++        ([float("inf"), 1.0], False),
++        ([float("-inf")], False),
++        ([1e-9, 0.0], False),  # norm far below float32-safe range
++        ([1e30, 1e30], False),  # norm beyond float32-safe range
++        ([1e200, 1e200], False),  # squared norm overflows float64
++        (["a", "b"], False),  # not numbers
++        ([None, 1.0], False),
++    ],
++)
++def test_is_usable_vector(vector, usable):
++    assert is_usable_vector(vector) is usable
++
++
++def test_is_usable_vector_never_raises():
++    assert is_usable_vector(object()) is False  # type: ignore[arg-type]
++
++
++def _chunk_response(score):
++    return KnowledgeChunkResponse(
++        chunkId="c", documentId="d", documentTitle="t", sourceType="knowledge", content="x", score=score, position=0
++    )
++
++
++@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
++def test_response_model_rejects_non_finite_scores(bad):
++    with pytest.raises(ValidationError):
++        _chunk_response(bad)
++
++
++def test_response_model_accepts_finite_scores_and_serialises_to_valid_json():
++    response = _chunk_response(0.5)
++    assert response.score == 0.5
++    assert '"score":0.5' in response.model_dump_json()
++
++
++@pytest.mark.asyncio
++async def test_storing_an_unusable_vector_is_refused_before_any_database_work(monkeypatch):
++    async def must_not_be_called():
++        raise AssertionError("the database must not be touched for an invalid vector")
++
++    monkeypatch.setattr(knowledge_db, "get_pool", must_not_be_called)
++    with pytest.raises(ValueError, match="chunk 1"):
++        await insert_chunks_with_embeddings("doc-id", ["fine", "no signal"], [UNIT, ZERO], "model")
++
++
++@pytest.mark.asyncio
++async def test_a_query_without_a_usable_direction_matches_nothing_without_querying(monkeypatch):
++    async def must_not_be_called():
++        raise AssertionError("the database must not be queried with an unusable vector")
++
++    monkeypatch.setattr(knowledge_db, "get_pool", must_not_be_called)
++    for bad in (ZERO, [math.nan] * 1536, []):
++        assert await similarity_search(bad, top_k=5) == []
++
++
++@pytest.mark.asyncio
++async def test_a_repair_with_an_unusable_replacement_is_refused_before_any_database_work(monkeypatch):
++    async def must_not_be_called():
++        raise AssertionError("the database must not be touched for an invalid replacement vector")
++
++    monkeypatch.setattr(knowledge_db, "get_pool", must_not_be_called)
++    with pytest.raises(ValueError, match="not usable"):
++        await apply_embedding_repairs([("embedding-id", ZERO)], [], "model")
+diff --git a/docs/implementation/ENDPOINT_CHECKLIST.md b/docs/implementation/ENDPOINT_CHECKLIST.md
+index 322f6be..51cb83a 100644
+--- a/docs/implementation/ENDPOINT_CHECKLIST.md
++++ b/docs/implementation/ENDPOINT_CHECKLIST.md
+@@ -28,9 +28,9 @@ test/health) · `default` 120/min.
+ | POST `/api/ai/tools/{name}/invoke` | tool input → tool output | JWT + **admin** | 404 unknown tool. Tool failures are **HTTP 200** with the outcome in the body: `{tool, status: ok\|error\|timeout, output, error, latencyMs, available}`; runs as `provider_id="custom"` for permission checks | `tool_calls` | Done · registry-level ✔ (HTTP test → P6) |
+ | POST `/api/ai/{provider_id}/test` | — → `HealthResponse{ok, latencyMs, modelChecked, detail, transport}` | JWT + **admin** · `admin` bucket | 404 unknown provider | provider call | Done* · admin gating ✔. *P4 §6.2 wants `{ok, latency_ms, model_checked}` → snake_case alias in P3 |
+ | GET `/api/ai/{provider_id}/health` | — → `HealthResponse` | JWT + **admin** · `admin` bucket | as above | provider call; `ai_health_checks` write → P2 | Done* · same note |
+-| POST `/api/knowledge/upload` | `KnowledgeUploadRequest{title, content, sourceType}` | JWT + **admin** | 400 · 403 | `knowledge_documents/chunks`, `embeddings` | Done · authz ✔ |
++| POST `/api/knowledge/upload` | `KnowledgeUploadRequest{title, content, sourceType}` → `{documentId, chunkCount, embeddingModel, skippedChunks}` | JWT + **admin** | 400 invalid **or nothing indexable** (e.g. only punctuation/emoji; the document is stored as `failed`) · 403 | `knowledge_documents/chunks`, `embeddings` (never a zero vector) | Done · authz ✔, H1 regression ✔ |
+ | POST `/api/knowledge/upload/file` | multipart PDF/TXT/CSV | JWT + **admin** | 400 unsupported · size limit (**reads whole file before checking** → P9) | same | Done · authz ✔ |
+-| POST `/api/knowledge/search` | `KnowledgeSearchRequest{query, topK}` → chunks | JWT (any role) | 400 | pgvector | Done · authz ✔ |
++| POST `/api/knowledge/search` | `KnowledgeSearchRequest{query, topK}` → `KnowledgeChunkResponse[]` (`score` is a finite number, enforced by the schema) | JWT (any role) | 400 · a query with no letters/digits returns `[]` (200) | pgvector; rows with undefined similarity are never returned | Done · authz ✔, H1 regression ✔ |
+ | GET `/api/knowledge/documents` | → documents | JWT (any role) | — | — | Done · authz ✔ |
+ | DELETE `/api/knowledge/documents/{id}` | — | JWT + **admin** | 404 | cascades chunks/embeddings | Done · authz ✔ |
+ 
+diff --git a/docs/implementation/PLAN.md b/docs/implementation/PLAN.md
+index 90d05ea..c321786 100644
+--- a/docs/implementation/PLAN.md
++++ b/docs/implementation/PLAN.md
+@@ -188,7 +188,8 @@ the Admin Panel is split: provider/model administration (P5) lands as soon as it
+ 
+ ### P9 — Redis infrastructure + RAG hardening
+ - **P1 §:** 3, 7, 8. **P4:** G07 (Redis role). **Depends on:** P1.
+-- **Work:** Redis client + health; shared rate-limit counters; cache; session-memory store; pub/sub primitive for P11; (real Redis available via apt in the sandbox). RAG: filter by `model_used`, split oversize chunks (a 20k-row CSV currently becomes one 180k-word chunk), `RETRIEVAL_QUERY` task type, embedding batching, rerank decision.
++- **Work:** Redis client + health; shared rate-limit counters; cache; session-memory store; pub/sub primitive for P11; (real Redis available via apt in the sandbox). RAG: filter by `model_used`, split oversize chunks (a 20k-row CSV currently becomes one 180k-word chunk), `RETRIEVAL_QUERY` task type, embedding batching, rerank decision, re-index `ivfflat` after data load (defect 17), size-check uploads before reading them into memory.
++- **Already done by hotfix H1 (do not redo):** Unicode-aware tokenizer, zero/non-finite vector handling at ingest/query/SQL/rerank/schema, `app.rag.maintenance reembed-unusable`.
+ 
+ ### P10 — Memory layers
+ - **P1 §:** 8. **Depends on:** P9, P2. **Work:** short-term/session (Redis), long-term (`memories`), system (`system_settings`, versioned), trading (read path over signals/outcomes), knowledge (existing); user-scoped delete/export endpoints; retention.
+@@ -223,6 +224,9 @@ the Admin Panel is split: provider/model administration (P5) lands as soon as it
+ | 7 | Fallback-to-mock overwrites `mock-v1` display name with "Grok (xAI)" | P2 |
+ | 8 | Duplicate `technical_indicators` rows on every request | P2 |
+ | 9 | 20k-row CSV → one 180,000-word chunk | P9 |
++| 16 | **Knowledge search → HTTP 500 `Out of range float values are not JSON compliant: nan`** (all-zero embedding for text with no ASCII letters/digits → pgvector NaN similarity). Also silently put the degenerate chunk into the analysis prompt context and returned `score: null` from the knowledge tool | **Hotfix H1 ✔** |
++| 18 | `validate_bars` accepted `high=+inf`, `low=-inf`, `volume`=NaN/+inf (4 of 15 non-finite combinations) — latent with demo data, would produce non-finite indicators/response fields with real vendor data | **Hotfix H1 ✔** |
++| 17 | `ivfflat` index was created on an empty table (pgvector's own notice: "low recall"); under an index plan a 4-row corpus returns 0 rows with the old *and* new query — pre-existing, unrelated to H1 | P9 |
+ | 10 | Negative stop-loss accepted as a valid setup | P2 |
+ | 11 | RAG ignores `model_used`; switching embedding provider corrupts retrieval | P9 |
+ | 12 | Unhandled-error responses lack CORS headers | **P1 ✔** |
+@@ -239,4 +243,5 @@ the Admin Panel is split: provider/model administration (P5) lands as soon as it
+ | Phase | Status |
+ |---|---|
+ | P1 | **DONE** — delivered with this document |
++| H1 — knowledge-search NaN hotfix | **DONE** — requires P1; see `apps/api/app/rag/{tokenize,maintenance}.py` |
+ | P2 – P15 | Pending (resume at **P2**) |
