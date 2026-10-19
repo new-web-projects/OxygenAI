@@ -21,10 +21,10 @@ the query and the vector-search results, return them reordered.
 
 from __future__ import annotations
 
-import re
+import math
 from dataclasses import dataclass
 
-_WORD_RE = re.compile(r"[a-z0-9]+")
+from .tokenize import tokenize
 
 _LEXICAL_WEIGHT = 0.35
 
@@ -41,7 +41,7 @@ class RetrievedChunk:
 
 
 def _term_set(text: str) -> set[str]:
-    return set(_WORD_RE.findall(text.lower()))
+    return set(tokenize(text))
 
 
 def _lexical_overlap(query_terms: set[str], chunk_terms: set[str]) -> float:
@@ -56,12 +56,22 @@ def rerank(query: str, results: list[RetrievedChunk]) -> list[RetrievedChunk]:
     Returns results reordered by a blended score. Does not mutate
     vector_score - that field stays the original similarity value; the
     blended score only determines order.
+
+    The sort key is always a real number. A NaN key makes every comparison
+    False, which leaves a sort in an unspecified order — before this guard
+    a single NaN-scored chunk was left wherever it happened to sit
+    (including first) and could scramble its neighbours. Retrieval no
+    longer passes non-finite scores in (`rag.pipeline.retrieve` drops
+    them), so this is the last line of defence: a non-finite score ranks
+    below every real one instead of poisoning the sort.
     """
     query_terms = _term_set(query)
     if not results:
         return results
 
     def blended(chunk: RetrievedChunk) -> float:
+        if not math.isfinite(chunk.vector_score):
+            return -math.inf
         lexical = _lexical_overlap(query_terms, _term_set(chunk.content))
         return (1 - _LEXICAL_WEIGHT) * chunk.vector_score + _LEXICAL_WEIGHT * lexical
 

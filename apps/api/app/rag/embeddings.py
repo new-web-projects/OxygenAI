@@ -40,16 +40,14 @@ from __future__ import annotations
 import hashlib
 import math
 import os
-import re
 from typing import Protocol
 
 from ..observability import get_logger
+from .tokenize import tokenize
 
 logger = get_logger("rag.embeddings")
 
 EMBEDDING_DIM = 1536  # fixed by the embeddings.vector(1536) column
-
-_WORD_RE = re.compile(r"[a-z0-9]+")
 
 
 class EmbeddingProvider(Protocol):
@@ -63,6 +61,16 @@ class HashingEmbeddingProvider:
     """
     Always-available, dependency-free, deterministic default. See the
     module docstring for what this can and cannot do.
+
+    Contract worth knowing: text with no tokens at all (only punctuation,
+    emoji, whitespace) has no direction, so `embed` returns the all-zero
+    vector for it. That is an honest "no signal", NOT a storable embedding
+    — cosine similarity against it is undefined (pgvector returns NaN).
+    Callers must check `db.knowledge.is_usable_vector` before storing or
+    searching with a vector; `rag.pipeline` does, for ingestion and for
+    queries. Tokenization is Unicode-aware (`rag/tokenize.py`) so scripts
+    such as Bengali and Hindi are NOT "no signal"; ASCII text tokenizes
+    exactly as it always did, so existing stored vectors are unchanged.
     """
 
     model_name = "hashing-trick-v1"
@@ -79,7 +87,7 @@ class HashingEmbeddingProvider:
 
     async def embed(self, text: str) -> list[float]:
         vector = [0.0] * EMBEDDING_DIM
-        words = _WORD_RE.findall(text.lower())
+        words = tokenize(text)
         if not words:
             return vector
         for word in words:

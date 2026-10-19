@@ -19,6 +19,7 @@ Python-facing signature is identical either way (§5.4).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -65,12 +66,28 @@ def validate_bars(bars: list[OHLCVBar]) -> list[str]:
     is corrupt data. Silently indicator-ing it produces numbers that look
     authoritative and are meaningless — the exact failure mode this
     platform exists to avoid.
+
+    Every field must also be a FINITE number. The ordering checks below are
+    not enough on their own: any comparison against NaN is False, and an
+    infinite `high`/`low` still "orders" correctly, so NaN or infinite
+    values used to slip past some of them (`volume` NaN/+inf, `high` +inf,
+    `low` -inf were accepted) and flow into the indicators and from there
+    into response fields that cannot be serialised as JSON.
     """
     if not bars:
         raise MarketDataError("No market data bars were supplied")
 
     warnings: list[str] = []
     for index, bar in enumerate(bars):
+        for field_name, value in (
+            ("open", bar.open),
+            ("high", bar.high),
+            ("low", bar.low),
+            ("close", bar.close),
+            ("volume", bar.volume),
+        ):
+            if not math.isfinite(value):
+                raise MarketDataError(f"Bar {index} {field_name} ({value}) is not a finite number")
         if bar.high < bar.low:
             raise MarketDataError(f"Bar {index} has high ({bar.high}) below low ({bar.low})")
         if not (bar.low <= bar.close <= bar.high):

@@ -28,9 +28,9 @@ test/health) · `default` 120/min.
 | POST `/api/ai/tools/{name}/invoke` | tool input → tool output | JWT + **admin** | 404 unknown tool. Tool failures are **HTTP 200** with the outcome in the body: `{tool, status: ok\|error\|timeout, output, error, latencyMs, available}`; runs as `provider_id="custom"` for permission checks | `tool_calls` | Done · registry-level ✔ (HTTP test → P6) |
 | POST `/api/ai/{provider_id}/test` | — → `HealthResponse{ok, latencyMs, modelChecked, detail, transport}` | JWT + **admin** · `admin` bucket | 404 unknown provider | provider call | Done* · admin gating ✔. *P4 §6.2 wants `{ok, latency_ms, model_checked}` → snake_case alias in P3 |
 | GET `/api/ai/{provider_id}/health` | — → `HealthResponse` | JWT + **admin** · `admin` bucket | as above | provider call; `ai_health_checks` write → P2 | Done* · same note |
-| POST `/api/knowledge/upload` | `KnowledgeUploadRequest{title, content, sourceType}` | JWT + **admin** | 400 · 403 | `knowledge_documents/chunks`, `embeddings` | Done · authz ✔ |
+| POST `/api/knowledge/upload` | `KnowledgeUploadRequest{title, content, sourceType}` → `{documentId, chunkCount, embeddingModel, skippedChunks}` | JWT + **admin** | 400 invalid **or nothing indexable** (e.g. only punctuation/emoji; the document is stored as `failed`) · 403 | `knowledge_documents/chunks`, `embeddings` (never a zero vector) | Done · authz ✔, H1 regression ✔ |
 | POST `/api/knowledge/upload/file` | multipart PDF/TXT/CSV | JWT + **admin** | 400 unsupported · size limit (**reads whole file before checking** → P9) | same | Done · authz ✔ |
-| POST `/api/knowledge/search` | `KnowledgeSearchRequest{query, topK}` → chunks | JWT (any role) | 400 | pgvector | Done · authz ✔ |
+| POST `/api/knowledge/search` | `KnowledgeSearchRequest{query, topK}` → `KnowledgeChunkResponse[]` (`score` is a finite number, enforced by the schema) | JWT (any role) | 400 · a query with no letters/digits returns `[]` (200) | pgvector; rows with undefined similarity are never returned | Done · authz ✔, H1 regression ✔ |
 | GET `/api/knowledge/documents` | → documents | JWT (any role) | — | — | Done · authz ✔ |
 | DELETE `/api/knowledge/documents/{id}` | — | JWT + **admin** | 404 | cascades chunks/embeddings | Done · authz ✔ |
 

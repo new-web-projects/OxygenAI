@@ -97,3 +97,23 @@ analyse, search/list knowledge, and rate their own comparisons.
 only (the API logs a warning at startup). Behind a reverse proxy set
 `TRUSTED_PROXY_COUNT` (and start uvicorn with `--no-proxy-headers`) so rate
 limits key off the real client address — see `app/security/network.py`.
+
+## Knowledge base maintenance
+
+Earlier versions stored an all-zero embedding for any chunk with no ASCII
+letters or digits (for example a Bengali or Hindi document). Cosine
+similarity against a zero vector is NaN, which made `POST
+/api/knowledge/search` fail with `Out of range float values are not JSON
+compliant: nan`. New code cannot write such rows and search skips any that
+remain, but a skipped row is also unsearchable. To repair rows already in your
+database:
+
+```bash
+cd apps/api
+python -m app.rag.maintenance reembed-unusable --dry-run   # report only
+python -m app.rag.maintenance reembed-unusable             # re-embed (or drop, if nothing embeddable)
+python -m app.rag.maintenance reembed-unusable --document-id <uuid>   # one document
+```
+
+It is safe to re-run. It uses whichever embedder is configured now and does
+not touch healthy rows.

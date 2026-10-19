@@ -13,9 +13,16 @@ Field naming stays camelCase to match the TypeScript consumer.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Literal, Optional, Union
+from typing import Annotated, Any, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
+
+# JSON has no NaN or Infinity. A float field typed this way rejects them at
+# the model boundary with a precise validation error instead of surfacing
+# later as an opaque "Out of range float values are not JSON compliant"
+# failure inside the response encoder. Used for values derived from
+# external computation (e.g. vector-similarity scores).
+FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
 
 # ---------------------------------------------------------------------------
 # Market data
@@ -404,7 +411,7 @@ class KnowledgeChunkResponse(BaseModel):
     documentTitle: str
     sourceType: str
     content: str
-    score: float
+    score: FiniteFloat
     position: int
 
 

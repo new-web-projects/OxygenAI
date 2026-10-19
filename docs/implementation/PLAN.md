@@ -188,7 +188,8 @@ the Admin Panel is split: provider/model administration (P5) lands as soon as it
 
 ### P9 — Redis infrastructure + RAG hardening
 - **P1 §:** 3, 7, 8. **P4:** G07 (Redis role). **Depends on:** P1.
-- **Work:** Redis client + health; shared rate-limit counters; cache; session-memory store; pub/sub primitive for P11; (real Redis available via apt in the sandbox). RAG: filter by `model_used`, split oversize chunks (a 20k-row CSV currently becomes one 180k-word chunk), `RETRIEVAL_QUERY` task type, embedding batching, rerank decision.
+- **Work:** Redis client + health; shared rate-limit counters; cache; session-memory store; pub/sub primitive for P11; (real Redis available via apt in the sandbox). RAG: filter by `model_used`, split oversize chunks (a 20k-row CSV currently becomes one 180k-word chunk), `RETRIEVAL_QUERY` task type, embedding batching, rerank decision, re-index `ivfflat` after data load (defect 17), size-check uploads before reading them into memory.
+- **Already done by hotfix H1 (do not redo):** Unicode-aware tokenizer, zero/non-finite vector handling at ingest/query/SQL/rerank/schema, `app.rag.maintenance reembed-unusable`.
 
 ### P10 — Memory layers
 - **P1 §:** 8. **Depends on:** P9, P2. **Work:** short-term/session (Redis), long-term (`memories`), system (`system_settings`, versioned), trading (read path over signals/outcomes), knowledge (existing); user-scoped delete/export endpoints; retention.
@@ -223,6 +224,9 @@ the Admin Panel is split: provider/model administration (P5) lands as soon as it
 | 7 | Fallback-to-mock overwrites `mock-v1` display name with "Grok (xAI)" | P2 |
 | 8 | Duplicate `technical_indicators` rows on every request | P2 |
 | 9 | 20k-row CSV → one 180,000-word chunk | P9 |
+| 16 | **Knowledge search → HTTP 500 `Out of range float values are not JSON compliant: nan`** (all-zero embedding for text with no ASCII letters/digits → pgvector NaN similarity). Also silently put the degenerate chunk into the analysis prompt context and returned `score: null` from the knowledge tool | **Hotfix H1 ✔** |
+| 18 | `validate_bars` accepted `high=+inf`, `low=-inf`, `volume`=NaN/+inf (4 of 15 non-finite combinations) — latent with demo data, would produce non-finite indicators/response fields with real vendor data | **Hotfix H1 ✔** |
+| 17 | `ivfflat` index was created on an empty table (pgvector's own notice: "low recall"); under an index plan a 4-row corpus returns 0 rows with the old *and* new query — pre-existing, unrelated to H1 | P9 |
 | 10 | Negative stop-loss accepted as a valid setup | P2 |
 | 11 | RAG ignores `model_used`; switching embedding provider corrupts retrieval | P9 |
 | 12 | Unhandled-error responses lack CORS headers | **P1 ✔** |
@@ -239,4 +243,5 @@ the Admin Panel is split: provider/model administration (P5) lands as soon as it
 | Phase | Status |
 |---|---|
 | P1 | **DONE** — delivered with this document |
+| H1 — knowledge-search NaN hotfix | **DONE** — requires P1; see `apps/api/app/rag/{tokenize,maintenance}.py` |
 | P2 – P15 | Pending (resume at **P2**) |

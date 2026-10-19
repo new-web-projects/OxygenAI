@@ -23,7 +23,7 @@ from fastapi import APIRouter, Depends, File, Form, UploadFile
 
 from ..errors import NotFoundError, ValidationError
 from ..rag.chunking import UnsupportedFileTypeError, extract_text
-from ..rag.pipeline import ingest_text, retrieve
+from ..rag.pipeline import NoIndexableContentError, ingest_text, retrieve
 from ..schemas import KnowledgeChunkResponse, KnowledgeSearchRequest, KnowledgeUploadRequest
 from ..security.dependencies import AuthenticatedUser, get_current_user, require_role
 
@@ -39,11 +39,15 @@ MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 async def upload_text(
     body: KnowledgeUploadRequest, user: AuthenticatedUser = Depends(require_role("admin"))
 ) -> dict:
-    result = await ingest_text(body.title, body.content, body.sourceType, uploaded_by=user.id)
+    try:
+        result = await ingest_text(body.title, body.content, body.sourceType, uploaded_by=user.id)
+    except NoIndexableContentError as err:
+        raise ValidationError(str(err)) from err
     return {
         "documentId": result.document_id,
         "chunkCount": result.chunk_count,
         "embeddingModel": result.embedding_model,
+        "skippedChunks": result.skipped_chunks,
     }
 
 
@@ -63,11 +67,15 @@ async def upload_file(
     except UnsupportedFileTypeError as err:
         raise ValidationError(str(err)) from err
 
-    result = await ingest_text(title, text, sourceType, uploaded_by=user.id)
+    try:
+        result = await ingest_text(title, text, sourceType, uploaded_by=user.id)
+    except NoIndexableContentError as err:
+        raise ValidationError(str(err)) from err
     return {
         "documentId": result.document_id,
         "chunkCount": result.chunk_count,
         "embeddingModel": result.embedding_model,
+        "skippedChunks": result.skipped_chunks,
     }
 
 
