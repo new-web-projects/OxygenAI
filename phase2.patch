@@ -1,0 +1,2455 @@
+diff --git a/apps/api/.env.example b/apps/api/.env.example
+index 2224167..4616115 100644
+--- a/apps/api/.env.example
++++ b/apps/api/.env.example
+@@ -30,6 +30,11 @@ TRUSTED_PROXY_COUNT=0
+ # RATE_LIMIT_ANALYZE=30
+ # RATE_LIMIT_AUTH=10
+ 
++# Retention job: how often (seconds) the API process purges expired sessions and
++# expired short-lived memories. 0 disables the loop; `python -m app.cli purge-expired`
++# still works on demand. Default 3600.
++# RETENTION_INTERVAL_SECONDS=3600
++
+ # Optional. Without these, the app falls back to the offline Mock
+ # provider for that provider id -- nothing breaks if you leave them blank.
+ 
+diff --git a/apps/api/README.md b/apps/api/README.md
+index 8f150d2..ede598b 100644
+--- a/apps/api/README.md
++++ b/apps/api/README.md
+@@ -81,7 +81,8 @@ bearer token (Passage 4 §6.2). Setup, once per environment:
+ python -c "import secrets; print(secrets.token_urlsafe(48))"   # -> JWT_SECRET=
+ # DATABASE_URL=postgresql://...   (sessions live in Postgres)
+ 
+-# 2. Apply every migration in order (0005 adds the session indexes)
++# 2. Apply every migration in order (0005 adds the session indexes; 0006 de-duplicates and
++#    constrains technical_indicators and repairs ai_models display names — idempotent)
+ for f in ../../infra/migrations/000*.sql; do psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"; done
+ 
+ # 3. Create the first admin — registration only ever yields the `user` role
+@@ -89,6 +90,26 @@ python -m app.cli create-admin --email you@example.com      # prompts for the pa
+ python -m app.cli set-role --email someone@example.com --role admin
+ ```
+ 
++Operational behaviour added in P2 (Passage 1 §9, Passage 4 §5.2–§5.3):
++
++- **Retention.** Expired `sessions` rows and expired short-lived `memories` rows are
++  deleted by `app/db/retention.py` — every `RETENTION_INTERVAL_SECONDS` (default
++  3600, `0` disables) inside the API process, or on demand with
++  `python -m app.cli purge-expired`. `audit_logs` and `trade_results` are never
++  purged; long-term memory (`expires_at IS NULL`) is never purged.
++- **Audit trail.** Knowledge upload/delete, manual tool invocations and CLI role
++  changes write `audit_logs` rows (`db/audit.py`). Writes are best-effort and
++  never fail the action they describe. Note `audit_logs.actor_id` is
++  `ON DELETE RESTRICT` by specification, so an account that has an audit trail
++  cannot be hard-deleted.
++- **Error Center feed.** An unhandled exception returns `errorId`; the same id is
++  the `error_id` of a durable `error_logs` row (type, message, stack, route, user).
++- **Provider health history.** `POST /api/ai/{id}/test` and `GET /api/ai/{id}/health`
++  each append an `ai_health_checks` row (`ok` / `down`).
++- **Circuit breaker.** A provider that is simply *not configured* is no longer
++  counted as a failure, so it reports `not_configured` instead of drifting to
++  `circuit_open`.
++
+ Roles: `admin` can upload/delete knowledge documents, call provider
+ `/test` and `/health`, and use the tool endpoints; any signed-in user can
+ analyse, search/list knowledge, and rate their own comparisons.
+diff --git a/apps/api/app/cli.py b/apps/api/app/cli.py
+index 6bce881..4eb0f62 100644
+--- a/apps/api/app/cli.py
++++ b/apps/api/app/cli.py
+@@ -9,6 +9,7 @@ unreachable on a fresh install short of hand-written SQL.
+ 
+     python -m app.cli create-admin --email you@example.com
+     python -m app.cli set-role --email you@example.com --role admin
++    python -m app.cli purge-expired
+ 
+ The password is read from an interactive prompt (or, for scripted use,
+ one line on stdin with --password-stdin). It is never accepted as a
+@@ -41,6 +42,7 @@ def _read_password(from_stdin: bool) -> str:
+ 
+ 
+ async def _create_admin(email: str, password: str) -> str:
++    from .db.audit import record_audit
+     from .db.client import close_pool
+     from .db.users import create_user, get_user_by_email, set_user_role
+     from .security.passwords import hash_password
+@@ -50,24 +52,63 @@ async def _create_admin(email: str, password: str) -> str:
+         existing = await get_user_by_email(email)
+         if existing is not None:
+             await set_user_role(email, "admin")
++            await record_audit(
++                actor_id=None,
++                action="user.role_set",
++                resource=f"user:{existing.id}",
++                before={"role": existing.role_name},
++                after={"role": "admin", "via": "cli"},
++            )
+             return f"User {email} already existed — role set to admin (password unchanged)."
+-        await create_user(email, hash_password(password), role_name="admin")
++        created = await create_user(email, hash_password(password), role_name="admin")
++        await record_audit(
++            actor_id=None,
++            action="user.create_admin",
++            resource=f"user:{created.id}",
++            after={"role": "admin", "via": "cli"},
++        )
+         return f"Admin account created for {email}."
+     finally:
+         await close_pool()
+ 
+ 
+ async def _set_role(email: str, role: str) -> str:
++    from .db.audit import record_audit
+     from .db.client import close_pool
+-    from .db.users import set_user_role
++    from .db.users import get_user_by_email, set_user_role
+ 
++    email = email.strip().lower()
+     try:
+-        ok = await set_user_role(email.strip().lower(), role)
++        before = await get_user_by_email(email)
++        ok = await set_user_role(email, role)
++        if ok and before is not None:
++            await record_audit(
++                actor_id=None,
++                action="user.role_set",
++                resource=f"user:{before.id}",
++                before={"role": before.role_name},
++                after={"role": role, "via": "cli"},
++            )
+     finally:
+         await close_pool()
+     return f"{email} is now '{role}'." if ok else f"No such user '{email}' or role '{role}' — nothing changed."
+ 
+ 
++async def _purge_expired() -> str:
++    from .db.client import close_pool
++    from .db.retention import run_retention_once
++
++    try:
++        report = await run_retention_once()
++    finally:
++        await close_pool()
++    suffix = f" ({report.errors} purge step(s) failed — see the log)" if report.errors else ""
++    return (
++        f"Deleted {report.sessions_deleted} expired session(s) and "
++        f"{report.memories_deleted} expired memory row(s).{suffix}"
++    )
++
++
+ def main(argv: list[str] | None = None) -> int:
+     load_env_files()
+     parser = argparse.ArgumentParser(prog="python -m app.cli", description=__doc__.split("\n\n")[0])
+@@ -81,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
+     role.add_argument("--email", required=True)
+     role.add_argument("--role", required=True, choices=["admin", "user"])
+ 
++    sub.add_parser("purge-expired", help="Delete expired sessions and expired short-lived memories")
++
+     args = parser.parse_args(argv)
+ 
+     from .db.client import is_db_configured
+@@ -91,6 +134,8 @@ def main(argv: list[str] | None = None) -> int:
+ 
+     if args.command == "create-admin":
+         message = asyncio.run(_create_admin(args.email, _read_password(args.password_stdin)))
++    elif args.command == "purge-expired":
++        message = asyncio.run(_purge_expired())
+     else:
+         message = asyncio.run(_set_role(args.email, args.role))
+     print(message)
+diff --git a/apps/api/app/comparison.py b/apps/api/app/comparison.py
+index cfc5ae2..f3d616a 100644
+--- a/apps/api/app/comparison.py
++++ b/apps/api/app/comparison.py
+@@ -32,7 +32,7 @@ import time
+ from dataclasses import dataclass
+ from typing import Callable
+ 
+-from .providers.base import AnalysisContext
++from .providers.base import AnalysisContext, ProviderNotConfiguredError
+ from .providers.circuit_breaker import CircuitBreakerOpen
+ from .providers.registry import execute_provider
+ from .schemas import (
+@@ -81,6 +81,10 @@ def _classify_failure(provider_id: str, err: BaseException) -> ComparisonSlotUna
+             reasonCode="circuit_open",
+             retryAfterSeconds=err.retry_after,
+         )
++    if isinstance(err, ProviderNotConfiguredError):
++        return ComparisonSlotUnavailable(
++            providerId=provider_id, reason=str(err), reasonCode="not_configured"
++        )
+     if isinstance(err, KeyError):
+         return ComparisonSlotUnavailable(
+             providerId=provider_id, reason=str(err), reasonCode="unknown_provider"
+diff --git a/apps/api/app/config.py b/apps/api/app/config.py
+index a9fae5b..d95acc1 100644
+--- a/apps/api/app/config.py
++++ b/apps/api/app/config.py
+@@ -200,6 +200,12 @@ class Settings:
+     # Passage 1 §5: the native layer is always present as a boundary, but
+     # a missing/unbuilt binary degrades performance, never correctness.
+     native_enabled: bool = field(default_factory=lambda: _env_bool("NATIVE_ENABLED", True))
++    # How often the in-process retention job purges expired sessions/memories
++    # (db/retention.py). 0 or negative disables the loop; `python -m app.cli
++    # purge-expired` still works on demand.
++    retention_interval_seconds: float = field(
++        default_factory=lambda: _env_float("RETENTION_INTERVAL_SECONDS", 3600.0)
++    )
+ 
+     circuit_breaker: CircuitBreakerSettings = field(default_factory=CircuitBreakerSettings)
+     risk: RiskSettings = field(default_factory=RiskSettings)
+diff --git a/apps/api/app/db/audit.py b/apps/api/app/db/audit.py
+new file mode 100644
+index 0000000..808361d
+--- /dev/null
++++ b/apps/api/app/db/audit.py
+@@ -0,0 +1,60 @@
++"""
++`audit_logs` writer — Passage 4 §5.2: audit_logs(id, actor_id, action, resource,
++before jsonb, after jsonb, ts), kept indefinitely and never silently lost
++(`actor_id` is ON DELETE RESTRICT, §5.3).
++
++First application code to write this table (G12 ownership: the Ops subsystem).
++Admin-visible mutations call `record_audit`; the read side (admin audit-log
++viewer) is a later phase.
++
++Best-effort by design: an audit-write failure is logged loudly but never fails
++or reverts the action it describes — the same rule `db/tools.log_tool_call`
++follows. Returns whether the row was written so callers and tests can tell.
++"""
++
++from __future__ import annotations
++
++import json
++from typing import Any
++
++from ..observability import get_logger
++from .client import get_pool, is_db_configured
++
++logger = get_logger("db.audit")
++
++
++def _clean(value: str) -> str:
++    # Postgres text cannot hold NUL.
++    return value.replace("\x00", "")
++
++
++async def record_audit(
++    *,
++    actor_id: str | None,
++    action: str,
++    resource: str,
++    before: dict[str, Any] | None = None,
++    after: dict[str, Any] | None = None,
++) -> bool:
++    if not is_db_configured():
++        return False
++    try:
++        pool = await get_pool()
++        await pool.execute(
++            """
++            INSERT INTO audit_logs (actor_id, action, resource, before, after)
++            VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
++            """,
++            actor_id,
++            _clean(action)[:200],
++            _clean(resource)[:500],
++            json.dumps(before, default=str) if before is not None else None,
++            json.dumps(after, default=str) if after is not None else None,
++        )
++        return True
++    except Exception as err:  # noqa: BLE001 — auditing must never break the audited action
++        logger.error(
++            "failed to write audit log",
++            extra={"action": action, "resource": resource, "error": str(err)},
++        )
++        return False
+diff --git a/apps/api/app/db/client.py b/apps/api/app/db/client.py
+index c2a4cf4..76e0163 100644
+--- a/apps/api/app/db/client.py
++++ b/apps/api/app/db/client.py
+@@ -1,16 +1,37 @@
+ """
+ Port of lib/db/client.ts. Lazily-created connection pool, gated on
+ DATABASE_URL being set.
++
++Pool creation is serialised: before P2, two requests arriving together on a
++cold process each saw `_pool is None`, each awaited `create_pool`, and the
++second assignment orphaned the first pool (its connections leaked until
++process exit). Reproduced with a counting stand-in for `asyncpg.create_pool`.
++`main.py`'s lifespan now also calls `close_pool()` on shutdown.
+ """
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import os
+ 
+ import asyncpg
+ 
+ _pool: asyncpg.Pool | None = None
+ 
++# asyncio.Lock is bound to the loop it is first contended on, and the test
++# suite gives every test its own loop, so the lock is recreated per loop.
++_pool_lock: asyncio.Lock | None = None
++_pool_lock_loop: asyncio.AbstractEventLoop | None = None
++
++
++def _creation_lock() -> asyncio.Lock:
++    global _pool_lock, _pool_lock_loop
++    loop = asyncio.get_running_loop()
++    if _pool_lock is None or _pool_lock_loop is not loop:
++        _pool_lock = asyncio.Lock()
++        _pool_lock_loop = loop
++    return _pool_lock
++
+ 
+ def is_db_configured() -> bool:
+     return bool(os.environ.get("DATABASE_URL"))
+@@ -20,8 +41,11 @@ async def get_pool() -> asyncpg.Pool:
+     global _pool
+     if not os.environ.get("DATABASE_URL"):
+         raise RuntimeError("DATABASE_URL is not set")
+-    if _pool is None:
+-        _pool = await asyncpg.create_pool(dsn=os.environ["DATABASE_URL"], min_size=1, max_size=5)
++    if _pool is not None:
++        return _pool
++    async with _creation_lock():
++        if _pool is None:  # re-check: another task may have created it while we waited
++            _pool = await asyncpg.create_pool(dsn=os.environ["DATABASE_URL"], min_size=1, max_size=5)
+     return _pool
+ 
+ 
+diff --git a/apps/api/app/db/comparisons.py b/apps/api/app/db/comparisons.py
+index ee8104d..a412186 100644
+--- a/apps/api/app/db/comparisons.py
++++ b/apps/api/app/db/comparisons.py
+@@ -41,7 +41,7 @@ async def save_comparison(
+ 
+     for provider_id in provider_ids:
+         seeded = await get_or_seed_model(
+-            provider_id, model_id_by_provider.get(provider_id, "unknown"), provider_id
++            provider_id, model_id_by_provider.get(provider_id, "unknown")
+         )
+         await pool.execute(
+             """
+diff --git a/apps/api/app/db/errors.py b/apps/api/app/db/errors.py
+new file mode 100644
+index 0000000..5c5a7c0
+--- /dev/null
++++ b/apps/api/app/db/errors.py
+@@ -0,0 +1,73 @@
++"""
++`error_logs` writer — Passage 4 §5.2: error_logs(id, error_id, ts, type, message,
++stack, route, user_id, provider, severity, status).
++
++The unhandled-error handler (`app/errors.py`) gives the client a short
++`errorId` to quote. Before this module that id existed only in the response
++body and in a log line; now the same id is the `error_id` column of a durable
++row, which is what the Error Center (a later phase) reads and triages
++(`status`: open -> ack -> closed; the partial index from migration 0001 covers
++the open backlog).
++
++Best-effort: failing to record an error must never turn into a second failure
++inside the error handler.
++"""
++
++from __future__ import annotations
++
++from ..observability import get_logger
++from .client import get_pool, is_db_configured
++
++logger = get_logger("db.errors")
++
++SEVERITIES = ("low", "medium", "high", "critical")
++
++_MAX_MESSAGE = 2_000
++_MAX_STACK = 20_000
++
++
++def _clean(value: str | None, limit: int) -> str | None:
++    if value is None:
++        return None
++    return value.replace("\x00", "")[:limit]
++
++
++async def record_error(
++    *,
++    error_id: str,
++    error_type: str,
++    message: str,
++    stack: str | None = None,
++    route: str | None = None,
++    user_id: str | None = None,
++    provider: str | None = None,
++    severity: str = "high",
++) -> bool:
++    if severity not in SEVERITIES:
++        raise ValueError(f"severity must be one of {SEVERITIES}")
++    if not is_db_configured():
++        return False
++    try:
++        pool = await get_pool()
++        # The sub-select turns a validly-signed token for an account that no
++        # longer exists into NULL instead of a foreign-key failure that would
++        # lose the row.
++        await pool.execute(
++            """
++            INSERT INTO error_logs
++              (error_id, type, message, stack, route, user_id, provider, severity)
++            VALUES ($1, $2, $3, $4, $5, (SELECT id FROM users WHERE id = $6::uuid), $7, $8)
++            """,
++            error_id,
++            _clean(error_type, 200),
++            _clean(message, _MAX_MESSAGE) or "",
++            _clean(stack, _MAX_STACK),
++            _clean(route, 500),
++            user_id,
++            provider,
++            severity,
++        )
++        return True
++    except Exception as err:  # noqa: BLE001
++        logger.warning("failed to persist error log", extra={"errorId": error_id, "error": str(err)})
++        return False
+diff --git a/apps/api/app/db/health.py b/apps/api/app/db/health.py
+new file mode 100644
+index 0000000..7c555d0
+--- /dev/null
++++ b/apps/api/app/db/health.py
+@@ -0,0 +1,57 @@
++"""
++`ai_health_checks` writer — Passage 1 §9.1: "health-check history (was
++runtime-only behavior in Revision 2, now persisted so the Passage-2 admin
++monitoring dashboard has something to render)".
++
++Written by every provider probe (`POST /api/ai/{id}/test`, `GET
++/api/ai/{id}/health`). `status` is 'ok' or 'down' here; 'degraded' is reserved
++for the monitoring phase, which can judge it against a latency baseline this
++module does not have.
++
++Best-effort: a probe's result is returned to the admin whether or not it could
++be recorded.
++"""
++
++from __future__ import annotations
++
++from ..observability import get_logger
++from .client import get_pool, is_db_configured
++from .signals import get_or_seed_model, get_or_seed_provider
++
++logger = get_logger("db.health")
++
++_NO_MODEL = (None, "", "unset")
++
++
++async def record_health_check(
++    provider_name: str,
++    model_id: str | None,
++    ok: bool,
++    latency_ms: float | None,
++    detail: str | None,
++) -> bool:
++    if not is_db_configured():
++        return False
++    try:
++        provider_db_id = await get_or_seed_provider(provider_name)
++        # "unset" (a Custom AI endpoint with no model id configured) is not a
++        # model; do not invent an ai_models row for it.
++        model_db_id = None if model_id in _NO_MODEL else (await get_or_seed_model(provider_name, str(model_id))).model_db_id
++        pool = await get_pool()
++        await pool.execute(
++            """
++            INSERT INTO ai_health_checks (provider_id, model_id, status, latency_ms, error_detail)
++            VALUES ($1, $2, $3, $4, $5)
++            """,
++            provider_db_id,
++            model_db_id,
++            "ok" if ok else "down",
++            round(latency_ms) if latency_ms is not None else None,
++            None if ok else (detail or "")[:1000].replace("\x00", ""),
++        )
++        return True
++    except Exception as err:  # noqa: BLE001
++        logger.warning(
++            "failed to persist health check", extra={"provider": provider_name, "error": str(err)}
++        )
++        return False
+diff --git a/apps/api/app/db/indicators_db.py b/apps/api/app/db/indicators_db.py
+index 84397fd..90511ee 100644
+--- a/apps/api/app/db/indicators_db.py
++++ b/apps/api/app/db/indicators_db.py
+@@ -6,6 +6,10 @@ normalized shape — `indicator_name`, `value jsonb` — rather than one row
+ per bundle), and the Technical Indicator tool (`tools/market_tools.py`)
+ reads it back.
+ 
++Idempotent per (instrument, ts, timeframe, indicator) since migration 0006:
++re-analysing the same bars updates the stored value in place instead of
++appending a duplicate row on every request.
++
+ This is what makes that tool's contract literal rather than aspirational
+ — Passage 4 §3.5 (G05) specifies it as "Read-only access to
+ already-computed indicator values (never computes new ones itself)",
+@@ -73,6 +77,8 @@ async def persist_indicator_bundle(
+         """
+         INSERT INTO technical_indicators (instrument_id, ts, timeframe, indicator_name, value)
+         VALUES ($1, $2, $3, $4, $5::jsonb)
++        ON CONFLICT (instrument_id, ts, timeframe, indicator_name)
++        DO UPDATE SET value = EXCLUDED.value
+         """,
+         [(instrument_id, _parse_ts(ts), timeframe, name, json.dumps(value)) for name, value in rows],
+     )
+diff --git a/apps/api/app/db/retention.py b/apps/api/app/db/retention.py
+new file mode 100644
+index 0000000..24638d8
+--- /dev/null
++++ b/apps/api/app/db/retention.py
+@@ -0,0 +1,93 @@
++"""
++Retention — Passage 4 §5.3 / PLAN.md G12: sessions and short-lived memories
++expire; `audit_logs` and `trade_results` are kept indefinitely (nothing in this
++module touches them); there is no tick-level `market_data` to roll up.
++
++`run_retention_once()` is the unit of work. It runs three ways, all calling the
++same function: periodically inside the API process (`RETENTION_INTERVAL_SECONDS`,
++see `main.py`), on demand with `python -m app.cli purge-expired`, and from
++tests. Deletes are idempotent, so several API instances running the loop at
++once is harmless — it only costs redundant no-op statements.
++
++`sessions` already could not authenticate once expired (`session_is_valid`
++checks `expires_at > now()`); this reclaims the rows, which are otherwise one
++per login forever.
++"""
++
++from __future__ import annotations
++
++import asyncio
++from dataclasses import dataclass
++
++from ..observability import get_logger
++from .client import get_pool, is_db_configured
++
++logger = get_logger("db.retention")
++
++
++@dataclass(frozen=True)
++class RetentionReport:
++    sessions_deleted: int
++    memories_deleted: int
++    errors: int = 0
++
++    @property
++    def total(self) -> int:
++        return self.sessions_deleted + self.memories_deleted
++
++
++def _deleted_count(command_tag: str) -> int:
++    # asyncpg returns the command tag, e.g. "DELETE 3".
++    try:
++        return int(command_tag.split()[-1])
++    except (ValueError, IndexError):
++        return 0
++
++
++async def purge_expired_sessions() -> int:
++    pool = await get_pool()
++    return _deleted_count(await pool.execute("DELETE FROM sessions WHERE expires_at <= now()"))
++
++
++async def purge_expired_memories() -> int:
++    """Only rows that HAVE an expiry: long-term memory (`expires_at IS NULL`) lives until the user deletes it."""
++    pool = await get_pool()
++    return _deleted_count(
++        await pool.execute("DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at <= now()")
++    )
++
++
++async def run_retention_once() -> RetentionReport:
++    """One pass. A failure in one purge is logged and counted; it never blocks the other."""
++    if not is_db_configured():
++        return RetentionReport(0, 0)
++    sessions = memories = errors = 0
++    try:
++        sessions = await purge_expired_sessions()
++    except Exception as err:  # noqa: BLE001
++        errors += 1
++        logger.warning("session purge failed", extra={"error": str(err)})
++    try:
++        memories = await purge_expired_memories()
++    except Exception as err:  # noqa: BLE001
++        errors += 1
++        logger.warning("memory purge failed", extra={"error": str(err)})
++    report = RetentionReport(sessions, memories, errors)
++    if report.total:
++        logger.info(
++            "retention purge",
++            extra={"sessionsDeleted": sessions, "memoriesDeleted": memories},
++        )
++    return report
++
++
++async def retention_loop(interval_seconds: float) -> None:
++    """Runs `run_retention_once` immediately, then every `interval_seconds`, until cancelled."""
++    while True:
++        try:
++            await run_retention_once()
++        except asyncio.CancelledError:
++            raise
++        except Exception as err:  # noqa: BLE001 — the loop must outlive any single failure
++            logger.warning("retention pass crashed", extra={"error": str(err)})
++        await asyncio.sleep(interval_seconds)
+diff --git a/apps/api/app/db/signals.py b/apps/api/app/db/signals.py
+index 34183dd..cdcd36f 100644
+--- a/apps/api/app/db/signals.py
++++ b/apps/api/app/db/signals.py
+@@ -23,16 +23,8 @@ class SeededModel:
+     model_db_id: str  # ai_models.id
+ 
+ 
+-async def get_or_seed_model(provider_name: str, model_id: str, display_name: str) -> SeededModel:
+-    """
+-    Upserts the ai_providers/ai_models rows this app's four provider ids
+-    map to, and returns both ids — ai_models.id for
+-    trading_signals.generated_by, ai_providers.id for
+-    ai_comparison_results.provider_id. Requires the 0002 migration
+-    (unique constraint on (provider_id, model_id)) — without it this
+-    would insert a duplicate model row on every call instead of updating
+-    one.
+-    """
++async def get_or_seed_provider(provider_name: str) -> str:
++    """Upserts the ai_providers row for `provider_name` and returns its id."""
+     pool = await get_pool()
+     provider_row = await pool.fetchrow(
+         """
+@@ -44,18 +36,49 @@ async def get_or_seed_model(provider_name: str, model_id: str, display_name: str
+         provider_name,
+         PROVIDER_TYPE.get(provider_name, provider_name),
+     )
+-    provider_id = str(provider_row["id"])
++    return str(provider_row["id"])
++
++
++def _default_display_name(provider_name: str, model_id: str) -> str:
++    """The model catalogue's own name for a known model, else the model id itself."""
++    from ..providers.model_registry import get_model_registry
++
++    entry = get_model_registry().get(provider_name, model_id)
++    return entry.display_name if entry is not None else model_id
+ 
++
++async def get_or_seed_model(
++    provider_name: str, model_id: str, display_name: str | None = None
++) -> SeededModel:
++    """
++    Upserts the ai_providers/ai_models rows this app's four provider ids
++    map to, and returns both ids — ai_models.id for
++    trading_signals.generated_by, ai_providers.id for
++    ai_comparison_results.provider_id. Requires the 0002 migration
++    (unique constraint on (provider_id, model_id)) — without it this
++    would insert a duplicate model row on every call instead of updating
++    one.
++
++    `display_name` is only used when the row is CREATED. An existing row's name
++    is never overwritten: the two callers used to disagree (the requested
++    provider's label vs. the bare provider id) and the last writer won on every
++    request, so a Grok request that fell back to mock renamed the mock-v1 row
++    "Grok (xAI)". With the database becoming the model registry's system of
++    record, a name an admin sets must not be reverted by ordinary traffic
++    either. When omitted, the catalogue's name for a known model is used.
++    """
++    provider_id = await get_or_seed_provider(provider_name)
++    pool = await get_pool()
+     model_row = await pool.fetchrow(
+         """
+         INSERT INTO ai_models (provider_id, model_id, display_name)
+         VALUES ($1, $2, $3)
+-        ON CONFLICT (provider_id, model_id) DO UPDATE SET display_name = EXCLUDED.display_name
++        ON CONFLICT (provider_id, model_id) DO UPDATE SET model_id = ai_models.model_id
+         RETURNING id
+         """,
+         provider_id,
+         model_id,
+-        display_name,
++        display_name or _default_display_name(provider_name, model_id),
+     )
+     return SeededModel(provider_id=provider_id, model_db_id=str(model_row["id"]))
+ 
+diff --git a/apps/api/app/engine/risk_engine.py b/apps/api/app/engine/risk_engine.py
+index 17270d2..cfce3aa 100644
+--- a/apps/api/app/engine/risk_engine.py
++++ b/apps/api/app/engine/risk_engine.py
+@@ -260,10 +260,46 @@ def assess(
+     """
+     stop_loss = compute_stop_loss(entry, atr, direction, settings.atr_stop_multiple)
+     risk_per_unit = abs(entry - stop_loss)
++
++    # A price cannot be zero or negative. With a volatile instrument the
++    # ATR-based stop of a LONG can land there (entry 10, ATR 8, 1.5x -> -2), and
++    # every other check passed it: "below entry" is true of -2. Reproduced
++    # before this guard: such a setup came back SETUP_FOUND with a negative stop.
++    if stop_loss <= 0:
++        return RiskAssessment(
++            direction=direction,
++            entry=entry,
++            stop_loss=stop_loss,
++            targets=[],
++            risk_per_unit=risk_per_unit,
++            reward_per_unit=0.0,
++            risk_reward=0.0,
++            position=PositionSize(
++                0, 0.0, 0.0, 0.0, settings.sizing_method, "Stop-loss is not a positive price"
++            ),
++            passes_min_rr=False,
++            passes_max_risk=False,
++            target_basis="none (stop-loss is not a positive price)",
++            rejected_reason=(
++                f"The ATR-based stop ({stop_loss:.2f}) would sit at or below zero — the stop "
++                "distance is too large relative to price to define a valid setup"
++            ),
++        )
++
+     targets, target_basis = select_targets(
+         entry, risk_per_unit, direction, settings, structural_level
+     )
+ 
++    # The same applies to targets: a SHORT's 3R/4R target can be at or below
++    # zero on a volatile instrument, and "below entry" accepted it. A target
++    # price that cannot be reached is dropped; if none remain the setup is
++    # rejected rather than returned with an impossible first target.
++    positive_targets = [t for t in targets if t > 0]
++    if targets and len(positive_targets) != len(targets):
++        target_basis = f"{target_basis}; targets at or below zero dropped"
++    had_targets = bool(targets)
++    targets = positive_targets
++
+     if not targets:
+         return RiskAssessment(
+             direction=direction,
+@@ -277,7 +313,11 @@ def assess(
+             passes_min_rr=False,
+             passes_max_risk=False,
+             target_basis=target_basis,
+-            rejected_reason="Risk distance is zero — no target can be placed",
++            rejected_reason=(
++                "Every target price would be at or below zero — no reachable target exists"
++                if had_targets
++                else "Risk distance is zero — no target can be placed"
++            ),
+         )
+ 
+     reward_per_unit = abs(targets[0] - entry)
+diff --git a/apps/api/app/errors.py b/apps/api/app/errors.py
+index 0b118e4..e656279 100644
+--- a/apps/api/app/errors.py
++++ b/apps/api/app/errors.py
+@@ -20,7 +20,9 @@ unavailable · 429 rate limited · 503 provider unavailable.
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import logging
++import traceback
+ import uuid
+ from collections.abc import Sequence
+ from typing import Any
+@@ -193,6 +195,7 @@ def install_error_handlers(app: FastAPI, allowed_origins: Sequence[str] | None =
+         logger.exception(
+             "unhandled error", extra={"error_id": error_id, "path": str(request.url.path)}
+         )
++        await _persist_unhandled(request, exc, error_id)
+         # The traceback goes to the log, never to the client.
+         return JSONResponse(
+             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+@@ -205,6 +208,53 @@ def install_error_handlers(app: FastAPI, allowed_origins: Sequence[str] | None =
+         )
+ 
+ 
++def _user_id_from_bearer(request: Request) -> str | None:
++    """
++    Best-effort caller identity for the error row: the `sub` of a validly signed,
++    unexpired bearer token (signature/expiry only, no database hit — the same
++    approach the rate limiter takes). None for anything else.
++    """
++    try:
++        from .security.jwt import decode_access_token
++
++        scheme, _, token = request.headers.get("authorization", "").partition(" ")
++        if scheme.lower() != "bearer" or not token.strip():
++            return None
++        return decode_access_token(token.strip()).user_id
++    except Exception:  # noqa: BLE001 — identity is a nicety, never load-bearing
++        return None
++
++
++async def _persist_unhandled(request: Request, exc: Exception, error_id: str) -> None:
++    """
++    Writes the `error_logs` row whose `error_id` is the id the client was told to
++    quote (Passage 4 §5.2). Bounded to two seconds and fully guarded: the 500
++    response must go out whether or not the database is healthy — an error
++    handler that can itself fail or hang would hide the original error.
++    """
++    try:
++        from .db.client import is_db_configured
++
++        if not is_db_configured():
++            return
++        from .db.errors import record_error
++
++        await asyncio.wait_for(
++            record_error(
++                error_id=error_id,
++                error_type=type(exc).__name__,
++                message=str(exc) or type(exc).__name__,
++                stack="".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
++                route=f"{request.method} {request.url.path}",
++                user_id=_user_id_from_bearer(request),
++                severity="high",
++            ),
++            timeout=2.0,
++        )
++    except Exception as err:  # noqa: BLE001
++        logger.warning("could not persist unhandled error", extra={"error_id": error_id, "error": str(err)})
++
++
+ def _safe_details(errors: Any) -> Any:
+     """
+     Pydantic error dicts can carry a non-serialisable `ctx.error`
+diff --git a/apps/api/app/main.py b/apps/api/app/main.py
+index e747649..f7e762f 100644
+--- a/apps/api/app/main.py
++++ b/apps/api/app/main.py
+@@ -46,7 +46,9 @@ from .config import load_env_files
+ 
+ _loaded_env_files = load_env_files()
+ 
+-from contextlib import asynccontextmanager
++import asyncio  # noqa: E402
++import contextlib  # noqa: E402
++from contextlib import asynccontextmanager  # noqa: E402
+ 
+ from fastapi import FastAPI  # noqa: E402
+ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+@@ -83,6 +85,16 @@ async def _lifespan(app: FastAPI):
+             "authenticated endpoint will return 401. Set JWT_SECRET (see apps/api/.env.example)."
+         )
+ 
++    # Retention (db/retention.py): purge expired sessions/memories on a timer.
++    # Not started without a database or with RETENTION_INTERVAL_SECONDS <= 0.
++    from .db.client import is_db_configured
++    from .db.retention import retention_loop
++
++    retention_task: asyncio.Task | None = None
++    retention_interval = get_settings().retention_interval_seconds
++    if retention_interval > 0 and is_db_configured():
++        retention_task = asyncio.create_task(retention_loop(retention_interval))
++
+     logger.info(
+         "oxygen-ai api starting",
+         extra={
+@@ -94,9 +106,21 @@ async def _lifespan(app: FastAPI):
+             "nativeLayerAvailable": native_status.available,
+             "nativeLayerDetail": native_status.reason,
+             "toolsRegistered": len(tool_registry.all()),
++            "retentionIntervalSeconds": retention_interval if retention_task else None,
+         },
+     )
+-    yield
++    try:
++        yield
++    finally:
++        if retention_task is not None:
++            retention_task.cancel()
++            with contextlib.suppress(asyncio.CancelledError):
++                await retention_task
++        # Release the asyncpg pool's connections instead of leaving them to
++        # process exit (P2: `close_pool()` previously had no caller in the server).
++        from .db.client import close_pool
++
++        await close_pool()
+ 
+ 
+ app = FastAPI(title="Oxygen AI API Gateway", version="0.3.0", lifespan=_lifespan)
+diff --git a/apps/api/app/providers/base.py b/apps/api/app/providers/base.py
+index af1ba10..7c9f68c 100644
+--- a/apps/api/app/providers/base.py
++++ b/apps/api/app/providers/base.py
+@@ -31,6 +31,22 @@ from ..schemas import IndicatorBundle
+ SourceTag = Literal["mock", "hosted_api", "local_model", "cache", "fallback"]
+ 
+ 
++class ProviderNotConfiguredError(RuntimeError):
++    """
++    The provider has no usable credentials/endpoint. This is a configuration
++    state, not a provider failure: it must never be counted by the circuit
++    breaker (before P2 it was, so a few comparisons that merely included an
++    unconfigured Grok reported it as `circuit_open` instead of
++    `not_configured`, hiding the real, fixable cause).
++    """
++
++    def __init__(self, provider_id: str, missing: list[str]) -> None:
++        self.provider_id = provider_id
++        self.missing = list(missing)
++        detail = ", ".join(self.missing) if self.missing else "required configuration"
++        super().__init__(f"'{provider_id}' is not configured. Missing: {detail}")
++
++
+ @dataclass
+ class AnalysisContext:
+     symbol: str
+diff --git a/apps/api/app/providers/registry.py b/apps/api/app/providers/registry.py
+index bee45e2..8c953e1 100644
+--- a/apps/api/app/providers/registry.py
++++ b/apps/api/app/providers/registry.py
+@@ -25,7 +25,13 @@ from dataclasses import dataclass, field
+ from typing import Any, Literal
+ 
+ from ..observability import get_logger
+-from .base import AIProvider, AnalysisContext, HealthResult, ProviderReasoning
++from .base import (
++    AIProvider,
++    AnalysisContext,
++    HealthResult,
++    ProviderNotConfiguredError,
++    ProviderReasoning,
++)
+ from .circuit_breaker import CircuitBreakerOpen, get_circuit_breakers
+ from .custom_ai_provider import custom_ai_provider
+ from .gemma_provider import gemma_provider
+@@ -211,12 +217,35 @@ async def execute_provider(
+ 
+     `allow_fallback=False` is the comparison path: a failure must surface
+     as that provider's own failure, not be papered over with mock.
++
++    A provider that is not configured is neither called nor recorded against
++    the breaker — "no key set" is a configuration state, not an outage. With
++    `allow_fallback` it degrades to mock exactly like any other unavailability;
++    without it, `ProviderNotConfiguredError` carries the real, specific reason.
+     """
+     breakers = get_circuit_breakers()
+     provider = get_provider_strict(provider_id)
+     model_id = configured_model_id(provider_id)
+     started = time.perf_counter()
+ 
++    if not provider.is_configured():
++        missing = provider.missing_configuration()
++        if not allow_fallback:
++            raise ProviderNotConfiguredError(provider_id, missing)
++        logger.warning(
++            "falling back to mock; provider not configured",
++            extra={"provider": provider_id, "missing": missing},
++        )
++        reasoning = await mock_provider.reason(context)
++        return ExecutionResult(
++            provider_id="mock",
++            model_id="mock-v1",
++            source_tag="fallback",
++            reasoning=reasoning,
++            latency_ms=round((time.perf_counter() - started) * 1000, 2),
++            fell_back=True,
++        )
++
+     try:
+         await breakers.ensure_closed(provider_id)
+     except CircuitBreakerOpen:
+diff --git a/apps/api/app/routers/analyze.py b/apps/api/app/routers/analyze.py
+index 76878d5..75e36bc 100644
+--- a/apps/api/app/routers/analyze.py
++++ b/apps/api/app/routers/analyze.py
+@@ -189,15 +189,27 @@ async def analyze(body: AnalyzeRequest, user: AuthenticatedUser | None = Depends
+                 model_id_by_provider: dict[str, str] = {}
+                 for slot in results:
+                     model_id_by_provider[slot.providerId] = configured_model_id(slot.providerId)
+-                    if slot.outcome == "ok" and slot.analysis.status == "SETUP_FOUND":
+-                        seeded = await get_or_seed_model(
+-                            slot.providerId, model_id_by_provider[slot.providerId], slot.providerId
+-                        )
+-                        signal_id_by_provider[slot.providerId] = await save_signal(
+-                            instrument_id, seeded.model_db_id, slot.analysis
+-                        )
+-                    else:
++                    if slot.outcome != "ok":
+                         signal_id_by_provider[slot.providerId] = None
++                        continue
++                    seeded = await get_or_seed_model(slot.providerId, slot.analysis.model)
++                    signal_id_by_provider[slot.providerId] = (
++                        await save_signal(instrument_id, seeded.model_db_id, slot.analysis)
++                        if slot.analysis.status == "SETUP_FOUND"
++                        else None
++                    )
++                    # Usage is attributed per participating provider that actually
++                    # answered — single mode always did this; multi mode wrote
++                    # nothing to usage_logs before P2. Its own try/except: a
++                    # failed usage row must not cost the comparison its persistence.
++                    if user is not None:
++                        try:
++                            await record_usage(user.id, seeded.provider_id, seeded.model_db_id)
++                        except Exception as err:  # noqa: BLE001
++                            logger.warning(
++                                "Failed to record usage (comparison continues)",
++                                extra={"provider": slot.providerId, "error": str(err)},
++                            )
+                 # An authenticated user's comparison hangs off one of
+                 # their conversations, which is what lets the feedback
+                 # endpoint restrict rating/preference to its owner.
+@@ -274,9 +286,10 @@ async def analyze(body: AnalyzeRequest, user: AuthenticatedUser | None = Depends
+ 
+     if persisted and instrument_id:
+         try:
+-            seeded = await get_or_seed_model(
+-                result.provider_id, result.model_id, provider.display_name
+-            )
++            # Named for the provider/model that ACTUALLY answered
++            # (result.*), not the one requested: after a fallback these differ,
++            # and the requested provider's label used to overwrite the mock row.
++            seeded = await get_or_seed_model(result.provider_id, result.model_id)
+             if analysis.status == "SETUP_FOUND":
+                 await save_signal(instrument_id, seeded.model_db_id, analysis)
+             if user is not None:
+diff --git a/apps/api/app/routers/knowledge.py b/apps/api/app/routers/knowledge.py
+index 3ec4f5a..bd17864 100644
+--- a/apps/api/app/routers/knowledge.py
++++ b/apps/api/app/routers/knowledge.py
+@@ -21,6 +21,7 @@ from __future__ import annotations
+ 
+ from fastapi import APIRouter, Depends, File, Form, UploadFile
+ 
++from ..db.audit import record_audit
+ from ..errors import NotFoundError, ValidationError
+ from ..rag.chunking import UnsupportedFileTypeError, extract_text
+ from ..rag.pipeline import NoIndexableContentError, ingest_text, retrieve
+@@ -43,6 +44,12 @@ async def upload_text(
+         result = await ingest_text(body.title, body.content, body.sourceType, uploaded_by=user.id)
+     except NoIndexableContentError as err:
+         raise ValidationError(str(err)) from err
++    await record_audit(
++        actor_id=user.id,
++        action="knowledge.upload",
++        resource=f"knowledge_document:{result.document_id}",
++        after={"title": body.title, "sourceType": body.sourceType, "chunkCount": result.chunk_count},
++    )
+     return {
+         "documentId": result.document_id,
+         "chunkCount": result.chunk_count,
+@@ -71,6 +78,17 @@ async def upload_file(
+         result = await ingest_text(title, text, sourceType, uploaded_by=user.id)
+     except NoIndexableContentError as err:
+         raise ValidationError(str(err)) from err
++    await record_audit(
++        actor_id=user.id,
++        action="knowledge.upload",
++        resource=f"knowledge_document:{result.document_id}",
++        after={
++            "title": title,
++            "sourceType": sourceType,
++            "filename": file.filename,
++            "chunkCount": result.chunk_count,
++        },
++    )
+     return {
+         "documentId": result.document_id,
+         "chunkCount": result.chunk_count,
+@@ -116,4 +134,7 @@ async def delete_knowledge_document(
+     deleted = await delete_document(document_id)
+     if not deleted:
+         raise NotFoundError(f"No knowledge document with id '{document_id}'")
++    await record_audit(
++        actor_id=user.id, action="knowledge.delete", resource=f"knowledge_document:{document_id}"
++    )
+     return {"ok": True}
+\ No newline at end of file
+diff --git a/apps/api/app/routers/providers.py b/apps/api/app/routers/providers.py
+index 6a9a914..5b58360 100644
+--- a/apps/api/app/routers/providers.py
++++ b/apps/api/app/routers/providers.py
+@@ -34,6 +34,7 @@ from __future__ import annotations
+ 
+ from fastapi import APIRouter, Depends
+ 
++from ..db.health import record_health_check
+ from ..errors import NotFoundError
+ from ..providers.registry import (
+     describe_route,
+@@ -95,6 +96,11 @@ async def test_provider(provider_id: str) -> HealthResponse:
+     from ..providers.registry import get_provider_strict
+ 
+     result = await get_provider_strict(provider_id).health_check()
++    # Passage 1 §9.1: probe history is persisted for the monitoring dashboard.
++    # Best-effort — the probe result below is returned either way.
++    await record_health_check(
++        provider_id, result.model_checked, result.ok, result.latency_ms, result.detail
++    )
+     return HealthResponse(
+         ok=result.ok,
+         latencyMs=result.latency_ms,
+diff --git a/apps/api/app/routers/tools.py b/apps/api/app/routers/tools.py
+index 705a10b..98d94c7 100644
+--- a/apps/api/app/routers/tools.py
++++ b/apps/api/app/routers/tools.py
+@@ -16,8 +16,9 @@ from __future__ import annotations
+ 
+ from fastapi import APIRouter, Depends
+ 
++from ..db.audit import record_audit
+ from ..errors import NotFoundError
+-from ..security.dependencies import require_role
++from ..security.dependencies import AuthenticatedUser, require_role
+ from ..tools.registry import get_tool_registry
+ from ..tools.schemas import ToolContext
+ 
+@@ -45,7 +46,9 @@ async def list_tools() -> list[dict]:
+ 
+ 
+ @router.post("/{name}/invoke")
+-async def invoke_tool(name: str, input_data: dict) -> dict:
++async def invoke_tool(
++    name: str, input_data: dict, user: AuthenticatedUser = Depends(require_role("admin"))
++) -> dict:
+     """
+     Manual invocation for admin debugging/verification — goes through
+     the exact same `execute()` governance path a provider would use,
+@@ -57,6 +60,12 @@ async def invoke_tool(name: str, input_data: dict) -> dict:
+     if registry.get(name) is None:
+         raise NotFoundError(f"Unknown tool: '{name}'")
+     outcome = await registry.execute(name, input_data, ToolContext(provider_id="custom"))
++    await record_audit(
++        actor_id=user.id,
++        action="tool.invoke",
++        resource=f"tool:{name}",
++        after={"status": outcome.status, "available": outcome.available},
++    )
+     return {
+         "tool": outcome.tool_name,
+         "status": outcome.status,
+diff --git a/apps/api/tests/test_auth_enforcement.py b/apps/api/tests/test_auth_enforcement.py
+index 1d3443d..91d36a5 100644
+--- a/apps/api/tests/test_auth_enforcement.py
++++ b/apps/api/tests/test_auth_enforcement.py
+@@ -99,6 +99,9 @@ async def accounts(pool):
+         await pool.execute(
+             "DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE email = $1)", email
+         )
++        await pool.execute(
++            "DELETE FROM audit_logs WHERE actor_id IN (SELECT id FROM users WHERE email = $1)", email
++        )
+         await pool.execute("DELETE FROM users WHERE email = $1", email)
+ 
+ 
+@@ -148,6 +151,9 @@ async def test_hostile_forwarded_for_cannot_break_registration_or_login(
+         await pool.execute(
+             "DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE email = $1)", email
+         )
++        await pool.execute(
++            "DELETE FROM audit_logs WHERE actor_id IN (SELECT id FROM users WHERE email = $1)", email
++        )
+         await pool.execute("DELETE FROM users WHERE email = $1", email)
+ 
+ 
+@@ -278,4 +284,7 @@ async def test_cli_create_admin_yields_an_account_that_can_log_in_as_admin(clien
+ 
+         p = await get_pool()
+         await p.execute("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE email = $1)", email)
++        await p.execute(
++            "DELETE FROM audit_logs WHERE actor_id IN (SELECT id FROM users WHERE email = $1)", email
++        )
+         await p.execute("DELETE FROM users WHERE email = $1", email)
+diff --git a/apps/api/tests/test_auth_integration.py b/apps/api/tests/test_auth_integration.py
+index acffd85..0034bc8 100644
+--- a/apps/api/tests/test_auth_integration.py
++++ b/apps/api/tests/test_auth_integration.py
+@@ -71,6 +71,9 @@ async def _cleanup(pool, email: str) -> None:
+     await pool.execute(
+         "DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE email = $1)", email
+     )
++    await pool.execute(
++        "DELETE FROM audit_logs WHERE actor_id IN (SELECT id FROM users WHERE email = $1)", email
++    )
+     await pool.execute("DELETE FROM users WHERE email = $1", email)
+ 
+ 
+diff --git a/apps/api/tests/test_integration_db.py b/apps/api/tests/test_integration_db.py
+index e6f48fc..6ced9e8 100644
+--- a/apps/api/tests/test_integration_db.py
++++ b/apps/api/tests/test_integration_db.py
+@@ -123,7 +123,7 @@ async def test_get_or_seed_model_upserts_without_duplicating(pool):
+     Requires the 0002 migration (unique constraint on provider_id,
+     model_id) — this is exactly the regression that migration exists to
+     prevent: without it, this test would insert a second model row on
+-    the second call instead of updating the first.
++    the second call instead of reusing the first.
+     """
+     from app.db.signals import get_or_seed_model
+ 
+@@ -137,7 +137,9 @@ async def test_get_or_seed_model_upserts_without_duplicating(pool):
+         row = await pool.fetchrow(
+             "SELECT display_name FROM ai_models WHERE id = $1", first.model_db_id
+         )
+-        assert row["display_name"] == "Display Two"  # the update side of the upsert took effect
++        # Since P2 an existing row's name is NOT overwritten on conflict (the
++        # old "last writer wins" upsert let a fallback rename mock-v1 "Grok (xAI)").
++        assert row["display_name"] == "Display One"
+     finally:
+         await pool.execute(
+             "DELETE FROM ai_models WHERE provider_id IN "
+diff --git a/apps/api/tests/test_knowledge_search_nan.py b/apps/api/tests/test_knowledge_search_nan.py
+index 3aaca79..98cf021 100644
+--- a/apps/api/tests/test_knowledge_search_nan.py
++++ b/apps/api/tests/test_knowledge_search_nan.py
+@@ -80,6 +80,9 @@ async def admin(client, pool):
+     )
+     yield {"Authorization": f"Bearer {registered.json()['accessToken']}"}
+     await pool.execute("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE email = $1)", email)
++    await pool.execute(
++        "DELETE FROM audit_logs WHERE actor_id IN (SELECT id FROM users WHERE email = $1)", email
++    )
+     await pool.execute("DELETE FROM users WHERE email = $1", email)
+ 
+ 
+diff --git a/apps/api/tests/test_p2_foundations.py b/apps/api/tests/test_p2_foundations.py
+new file mode 100644
+index 0000000..9c61eb3
+--- /dev/null
++++ b/apps/api/tests/test_p2_foundations.py
+@@ -0,0 +1,394 @@
++"""
++Phase P2 — operational foundations that need no database.
++
++Each test here pins a defect that was reproduced against the pre-P2 code (see
++docs/implementation/PLAN.md, section D):
++
++* a provider that is merely *not configured* was counted by the circuit
++  breaker, so a few comparisons later it reported `circuit_open`;
++* a LONG whose ATR stop lands at or below zero (and a SHORT whose far targets
++  do) was accepted as a valid setup;
++* two simultaneous cold-start requests each created a connection pool and
++  orphaned one;
++* the pool was never closed on shutdown and nothing ran the retention job.
++"""
++
++from __future__ import annotations
++
++import asyncio
++
++import pytest
++
++from app.config import RiskSettings
++from app.engine.risk_engine import assess
++from app.providers.base import AnalysisContext, ProviderNotConfiguredError
++
++
++@pytest.fixture(autouse=True)
++def _clean_provider_env(monkeypatch):
++    # (conftest.py already resets the circuit breakers around every test.)
++    for name in (
++        "XAI_API_KEY",
++        "GOOGLE_AI_API_KEY",
++        "GEMMA_TRANSPORT",
++        "CUSTOM_AI_BASE_URL",
++        "CUSTOM_AI_MODEL_ID",
++        "CUSTOM_AI_API_KEY",
++    ):
++        monkeypatch.delenv(name, raising=False)
++    yield
++
++
++def _context() -> AnalysisContext:
++    from app.indicators import compute_indicators, generate_synthetic_ohlcv
++
++    bars = generate_synthetic_ohlcv("P2UNIT", 60)
++    return AnalysisContext(
++        symbol="P2UNIT",
++        indicators=compute_indicators(bars),
++        last_bars=[{"timestamp": b.timestamp, "close": b.close} for b in bars[-5:]],
++    )
++
++
++# --------------------------------------------------------------------------
++# Circuit breaker vs. configuration
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_an_unconfigured_provider_is_never_counted_by_the_circuit_breaker():
++    from app.providers.circuit_breaker import get_circuit_breakers
++    from app.providers.registry import execute_provider
++
++    for _ in range(12):  # the default threshold is 5 failures
++        with pytest.raises(ProviderNotConfiguredError) as raised:
++            await execute_provider("grok", _context(), allow_fallback=False)
++        assert "XAI_API_KEY" in str(raised.value)
++
++    snapshot = await get_circuit_breakers().snapshot("grok")
++    assert snapshot.state == "closed"
++    assert snapshot.recent_failures == 0
++    assert snapshot.total_failures == 0
++
++
++@pytest.mark.asyncio
++async def test_unconfigured_with_fallback_degrades_to_mock_tagged_fallback_and_does_not_trip_the_breaker():
++    from app.providers.circuit_breaker import get_circuit_breakers
++    from app.providers.registry import execute_provider
++
++    for _ in range(8):
++        result = await execute_provider("gemma", _context(), allow_fallback=True)
++        assert result.fell_back is True
++        assert (result.provider_id, result.model_id, result.source_tag) == ("mock", "mock-v1", "fallback")
++
++    snapshot = await get_circuit_breakers().snapshot("gemma")
++    assert snapshot.state == "closed"
++    assert snapshot.total_failures == 0
++
++
++@pytest.mark.asyncio
++async def test_comparison_keeps_reporting_not_configured_instead_of_circuit_open():
++    from app.comparison import run_comparison
++    from app.indicators import compute_indicators, generate_synthetic_ohlcv
++
++    bars = generate_synthetic_ohlcv("P2CMP", 60)
++    indicators = compute_indicators(bars)
++    last_bars = [{"timestamp": b.timestamp, "close": b.close} for b in bars[-5:]]
++
++    codes: list[str] = []
++    for _ in range(10):  # well past the 5-failure threshold that used to open the breaker
++        results = await run_comparison(
++            ["mock", "grok"], "P2CMP", indicators, last_bars, lambda pid: f"{pid}-m", False, bars[-1].timestamp, False
++        )
++        by_id = {r.providerId: r for r in results}
++        assert by_id["mock"].outcome == "ok"
++        codes.append(by_id["grok"].reasonCode)
++
++    assert set(codes) == {"not_configured"}
++
++
++@pytest.mark.asyncio
++async def test_a_real_provider_failure_still_trips_the_breaker(monkeypatch):
++    """The fix must not exempt genuine outages — only configuration states."""
++    from app.providers.circuit_breaker import CircuitBreakerOpen, get_circuit_breakers
++    from app.providers.grok_provider import GrokProvider
++    from app.providers.registry import execute_provider
++
++    monkeypatch.setenv("XAI_API_KEY", "test-key-not-real")
++
++    async def boom(self, context):  # noqa: ANN001
++        raise RuntimeError("upstream 503")
++
++    monkeypatch.setattr(GrokProvider, "reason", boom)
++
++    for _ in range(5):
++        with pytest.raises(RuntimeError, match="upstream 503"):
++            await execute_provider("grok", _context(), allow_fallback=False)
++    with pytest.raises(CircuitBreakerOpen):
++        await execute_provider("grok", _context(), allow_fallback=False)
++    assert (await get_circuit_breakers().snapshot("grok")).state == "open"
++
++
++# --------------------------------------------------------------------------
++# Risk engine: prices must be positive
++# --------------------------------------------------------------------------
++
++
++def _settings() -> RiskSettings:
++    return RiskSettings(
++        account_equity=1_000_000.0,
++        max_risk_per_trade_pct=1.0,
++        sizing_method="atr_based",
++        atr_stop_multiple=1.5,
++        min_risk_reward=1.5,
++    )
++
++
++def test_a_long_whose_atr_stop_is_not_a_positive_price_is_rejected():
++    result = assess(entry=10.0, atr=8.0, direction="LONG", settings=_settings())  # stop = 10 - 12 = -2
++    assert result.stop_loss == -2.0
++    assert result.is_tradeable is False
++    assert result.targets == []
++    assert "at or below zero" in (result.rejected_reason or "")
++
++
++def test_a_short_keeps_only_the_positive_targets():
++    result = assess(entry=100.0, atr=20.0, direction="SHORT", settings=_settings())  # R=30: 40, 10, -20
++    assert result.targets == [40.0, 10.0]
++    assert all(t > 0 for t in result.targets)
++    assert "dropped" in result.target_basis
++    assert result.is_tradeable is True
++
++
++def test_a_short_with_no_reachable_target_is_rejected():
++    result = assess(entry=10.0, atr=4.0, direction="SHORT", settings=_settings())  # R=6: -2, -8, -14
++    assert result.is_tradeable is False
++    assert result.targets == []
++    assert "no reachable target" in (result.rejected_reason or "")
++
++
++def test_an_ordinary_setup_is_unchanged_by_the_guard():
++    result = assess(entry=100.0, atr=2.0, direction="LONG", settings=_settings())
++    assert result.stop_loss == 97.0
++    assert result.targets == [106.0, 109.0, 112.0]
++    assert result.is_tradeable is True
++    assert "dropped" not in result.target_basis
++
++
++def _verify(direction: str, atr_multiple_of_price: float):
++    from app.indicators import compute_indicators, generate_synthetic_ohlcv
++    from app.providers.base import ProviderReasoning
++    from app.verify import build_trade_analysis
++
++    bars = generate_synthetic_ohlcv("P2NEG", 60)
++    indicators = compute_indicators(bars)
++    indicators = indicators.model_copy(update={"atr14": indicators.lastClose * atr_multiple_of_price})
++    reasoning = ProviderReasoning(
++        direction=direction,  # type: ignore[arg-type]
++        confidence=70,
++        reasoning_summary="momentum and trend agree",
++        supporting_evidence=["rsi14"],
++    )
++    return build_trade_analysis(
++        indicators, reasoning, "mock", "mock", "mock-v1", False, bars[-1].timestamp, False
++    )
++
++
++def test_verification_turns_a_negative_stop_into_no_valid_setup_with_null_prices():
++    analysis = _verify("LONG", 2.0)  # stop = price - 1.5 * 2 * price < 0
++    assert analysis.status == "NO_VALID_SETUP"
++    assert analysis.entry is None and analysis.stopLoss is None and analysis.targets == []
++    assert "at or below zero" in analysis.reasoningSummary
++    assert analysis.risk is not None and analysis.risk.rejectedReason
++
++
++def test_verification_turns_an_unreachable_short_into_no_valid_setup():
++    analysis = _verify("SHORT", 0.4)  # R = 0.6 * price: every target at 2R or beyond is <= 0
++    assert analysis.status == "NO_VALID_SETUP"
++    assert analysis.targets == []
++
++
++# --------------------------------------------------------------------------
++# Connection pool
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_concurrent_cold_start_requests_create_exactly_one_pool(monkeypatch):
++    import app.db.client as client
++
++    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:1/none")
++    monkeypatch.setattr(client, "_pool", None)
++    created: list[object] = []
++
++    async def slow_create_pool(**kwargs):  # noqa: ANN003
++        await asyncio.sleep(0.05)  # long enough for every caller to pass the `is None` check
++        pool = object()
++        created.append(pool)
++        return pool
++
++    monkeypatch.setattr(client.asyncpg, "create_pool", slow_create_pool)
++
++    pools = await asyncio.gather(*(client.get_pool() for _ in range(8)))
++    assert len(created) == 1
++    assert all(p is created[0] for p in pools)
++    monkeypatch.setattr(client, "_pool", None)
++
++
++@pytest.mark.asyncio
++async def test_lifespan_closes_the_pool_and_cancels_the_retention_loop(monkeypatch):
++    import app.db.client as client
++    import app.db.retention as retention
++    from app.config import get_settings
++    from app.main import _lifespan, app
++
++    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:1/none")
++    monkeypatch.setenv("RETENTION_INTERVAL_SECONDS", "0.01")
++    get_settings(refresh=True)
++
++    passes = 0
++
++    async def fake_once():
++        nonlocal passes
++        passes += 1
++        return retention.RetentionReport(0, 0)
++
++    closed = 0
++
++    async def fake_close():
++        nonlocal closed
++        closed += 1
++
++    monkeypatch.setattr(retention, "run_retention_once", fake_once)
++    monkeypatch.setattr(client, "close_pool", fake_close)
++
++    async with _lifespan(app):
++        await asyncio.sleep(0.12)
++    assert passes >= 2, "the loop should have run repeatedly while the app was up"
++    assert closed == 1
++    settled = passes
++    await asyncio.sleep(0.05)
++    assert passes == settled, "the loop must be cancelled on shutdown"
++    get_settings(refresh=True)
++
++
++@pytest.mark.asyncio
++async def test_retention_is_not_started_when_disabled(monkeypatch):
++    import app.db.retention as retention
++    from app.config import get_settings
++    from app.main import _lifespan, app
++
++    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:1/none")
++    monkeypatch.setenv("RETENTION_INTERVAL_SECONDS", "0")
++    get_settings(refresh=True)
++    called = False
++
++    async def fake_once():
++        nonlocal called
++        called = True
++        return retention.RetentionReport(0, 0)
++
++    monkeypatch.setattr(retention, "run_retention_once", fake_once)
++    async with _lifespan(app):
++        await asyncio.sleep(0.05)
++    assert called is False
++    get_settings(refresh=True)
++
++
++def test_retention_interval_defaults_to_hourly(monkeypatch):
++    from app.config import get_settings
++
++    monkeypatch.delenv("RETENTION_INTERVAL_SECONDS", raising=False)
++    assert get_settings(refresh=True).retention_interval_seconds == 3600.0
++    get_settings(refresh=True)
++
++
++# --------------------------------------------------------------------------
++# Best-effort writers without a database
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_writers_are_noops_without_a_database(monkeypatch):
++    monkeypatch.delenv("DATABASE_URL", raising=False)
++    from app.db.audit import record_audit
++    from app.db.errors import record_error
++    from app.db.health import record_health_check
++    from app.db.retention import run_retention_once
++
++    assert await record_audit(actor_id=None, action="x", resource="y") is False
++    assert await record_error(error_id="abc", error_type="E", message="m") is False
++    assert await record_health_check("mock", "mock-v1", True, 1.0, None) is False
++    report = await run_retention_once()
++    assert (report.sessions_deleted, report.memories_deleted, report.errors) == (0, 0, 0)
++
++
++@pytest.mark.asyncio
++async def test_record_error_rejects_an_unknown_severity():
++    from app.db.errors import record_error
++
++    with pytest.raises(ValueError):
++        await record_error(error_id="abc", error_type="E", message="m", severity="catastrophic")
++
++
++@pytest.mark.asyncio
++async def test_a_failing_error_writer_cannot_break_the_500_response(monkeypatch):
++    import httpx
++    from fastapi import FastAPI
++
++    from app.errors import install_error_handlers
++
++    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:1/none")
++
++    async def broken(**kwargs):  # noqa: ANN003
++        raise RuntimeError("database exploded")
++
++    import app.db.errors as db_errors
++
++    monkeypatch.setattr(db_errors, "record_error", broken)
++
++    app = FastAPI()
++    install_error_handlers(app)
++
++    @app.get("/boom")
++    async def boom():
++        raise RuntimeError("original failure")
++
++    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
++    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
++        response = await c.get("/boom")
++    assert response.status_code == 500
++    assert response.json()["code"] == "internal_error"
++    assert response.json()["errorId"]
++
++
++def test_bearer_identity_for_the_error_row_ignores_junk():
++    from starlette.requests import Request
++
++    from app.errors import _user_id_from_bearer
++
++    def req(header: str | None) -> Request:
++        headers = [(b"authorization", header.encode())] if header else []
++        return Request({"type": "http", "headers": headers, "method": "GET", "path": "/"})
++
++    assert _user_id_from_bearer(req(None)) is None
++    assert _user_id_from_bearer(req("Bearer not-a-jwt")) is None
++    assert _user_id_from_bearer(req("Basic abc")) is None
++
++
++# --------------------------------------------------------------------------
++# GET /health (ENDPOINT_CHECKLIST: "automated test planned (P2)")
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_health_endpoint_reports_ok_without_a_database(monkeypatch):
++    import httpx
++
++    from app.main import app
++
++    monkeypatch.delenv("DATABASE_URL", raising=False)
++    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
++        response = await c.get("/health")
++    assert response.status_code == 200
++    assert response.json()["status"] == "ok"
+diff --git a/apps/api/tests/test_p2_persistence.py b/apps/api/tests/test_p2_persistence.py
+new file mode 100644
+index 0000000..be7a366
+--- /dev/null
++++ b/apps/api/tests/test_p2_persistence.py
+@@ -0,0 +1,632 @@
++"""
++Phase P2 — persistence hygiene and operational foundations, against a real
++Postgres (skipped without DATABASE_URL, like the other integration modules).
++
++What these prove, each against live rows:
++
++* `technical_indicators` is idempotent per (instrument, ts, timeframe,
++  indicator) and migration 0006 removes pre-existing duplicates;
++* `audit_logs`, `error_logs` and `ai_health_checks` now have writers, wired to
++  the actions that should leave a trail;
++* multi-provider comparisons write `usage_logs` for every provider that
++  answered;
++* an `ai_models` display name is never overwritten by ordinary traffic;
++* the retention job deletes expired sessions/memories and nothing else.
++
++Every row created here is prefixed ZZP2/zzp2 and removed in teardown.
++"""
++
++from __future__ import annotations
++
++import os
++import uuid
++from datetime import datetime, timedelta, timezone
++from pathlib import Path
++
++import pytest
++
++pytestmark = pytest.mark.skipif(
++    not os.environ.get("DATABASE_URL"),
++    reason="DATABASE_URL is not set — P2 persistence tests require a live Postgres instance",
++)
++
++PASSWORD = "correct-horse-battery-staple"
++MIGRATION_0006 = Path(__file__).resolve().parents[3] / "infra" / "migrations" / "0006_persistence_hygiene.sql"
++
++
++@pytest.fixture
++async def client(monkeypatch):
++    monkeypatch.setenv("JWT_SECRET", "test-secret-do-not-use-in-production")
++    monkeypatch.setenv("JWT_ISSUER", "oxygen-ai-test")
++    monkeypatch.setenv("ACCESS_TOKEN_TTL_SECONDS", "3600")
++    monkeypatch.setenv("TRUSTED_PROXY_COUNT", "0")
++    from app.config import get_settings
++
++    get_settings(refresh=True)
++
++    import app.db.client as db_client
++
++    db_client._pool = None
++
++    import httpx
++
++    from app.main import app
++
++    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
++        yield c
++
++    db_client._pool = None
++    get_settings(refresh=True)
++
++
++@pytest.fixture
++async def pool():
++    import app.db.client as db_client
++
++    db_client._pool = None
++    from app.db.client import get_pool
++
++    p = await get_pool()
++    yield p
++    db_client._pool = None
++
++
++@pytest.fixture
++async def accounts(pool):
++    created: list[str] = []
++
++    async def make(client, *, role: str = "user") -> tuple[str, str, dict[str, str]]:
++        email = f"zzp2-{uuid.uuid4().hex[:12]}@example.com"
++        created.append(email)
++        registered = await client.post("/api/auth/register", json={"email": email, "password": PASSWORD})
++        assert registered.status_code == 200, registered.text
++        if role != "user":
++            from app.db.users import set_user_role
++
++            assert await set_user_role(email, role)
++        user_id = str(await pool.fetchval("SELECT id FROM users WHERE email = $1", email))
++        return email, user_id, {"Authorization": f"Bearer {registered.json()['accessToken']}"}
++
++    yield make
++
++    for email in created:
++        sub = "(SELECT id FROM users WHERE email = $1)"
++        await pool.execute(f"DELETE FROM audit_logs WHERE actor_id IN {sub}", email)
++        await pool.execute(f"DELETE FROM conversations WHERE user_id IN {sub}", email)
++        await pool.execute(f"DELETE FROM usage_logs WHERE user_id IN {sub}", email)
++        await pool.execute(f"DELETE FROM error_logs WHERE user_id IN {sub}", email)
++        await pool.execute("DELETE FROM users WHERE email = $1", email)
++
++
++async def _drop_instrument(pool, symbol: str) -> None:
++    for table in ("trading_signals", "technical_indicators", "market_data"):
++        await pool.execute(
++            f"DELETE FROM {table} WHERE instrument_id IN (SELECT id FROM market_instruments WHERE symbol = $1)",
++            symbol,
++        )
++    await pool.execute("DELETE FROM market_instruments WHERE symbol = $1", symbol)
++
++
++# --------------------------------------------------------------------------
++# technical_indicators — unique key + upsert + migration dedupe
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_persisting_the_same_bundle_twice_does_not_duplicate_rows(pool):
++    from app.db.indicators_db import persist_indicator_bundle
++    from app.db.market_data import get_or_create_instrument
++    from app.indicators import compute_indicators, generate_synthetic_ohlcv
++
++    symbol = "ZZP2IND"
++    try:
++        instrument_id = await get_or_create_instrument(symbol)
++        bars = generate_synthetic_ohlcv(symbol, 60)
++        bundle = compute_indicators(bars)
++        ts = bars[-1].timestamp
++
++        await persist_indicator_bundle(instrument_id, ts, "1d", bundle)
++        first = await pool.fetchval("SELECT count(*) FROM technical_indicators WHERE instrument_id = $1", instrument_id)
++        assert first > 0
++        for _ in range(3):
++            await persist_indicator_bundle(instrument_id, ts, "1d", bundle)
++        assert await pool.fetchval("SELECT count(*) FROM technical_indicators WHERE instrument_id = $1", instrument_id) == first
++    finally:
++        await _drop_instrument(pool, symbol)
++
++
++@pytest.mark.asyncio
++async def test_re_persisting_updates_the_stored_value_in_place(pool):
++    import json
++
++    from app.db.indicators_db import persist_indicator_bundle
++    from app.db.market_data import get_or_create_instrument
++    from app.indicators import compute_indicators, generate_synthetic_ohlcv
++
++    symbol = "ZZP2UPD"
++    try:
++        instrument_id = await get_or_create_instrument(symbol)
++        bars = generate_synthetic_ohlcv(symbol, 60)
++        bundle = compute_indicators(bars)
++        ts = bars[-1].timestamp
++
++        await persist_indicator_bundle(instrument_id, ts, "1d", bundle)
++        await persist_indicator_bundle(instrument_id, ts, "1d", bundle.model_copy(update={"rsi14": 12.5}))
++
++        rows = await pool.fetch(
++            "SELECT value FROM technical_indicators WHERE instrument_id = $1 AND indicator_name = 'rsi14'", instrument_id
++        )
++        assert len(rows) == 1
++        assert json.loads(rows[0]["value"]) == 12.5
++    finally:
++        await _drop_instrument(pool, symbol)
++
++
++@pytest.mark.asyncio
++async def test_migration_0006_removes_existing_duplicates_and_is_idempotent(pool):
++    """
++    Runs the real migration file inside a transaction that is rolled back, so the
++    shared database is untouched: drop the unique index, plant duplicates the way
++    pre-P2 code produced them, apply the migration, check, roll back.
++    """
++    from app.db.market_data import get_or_create_instrument
++
++    symbol = "ZZP2MIG"
++    instrument_id = await get_or_create_instrument(symbol)
++    sql = MIGRATION_0006.read_text()
++    ts = datetime(2026, 1, 2, tzinfo=timezone.utc)
++    try:
++        async with pool.acquire() as conn:
++            tx = conn.transaction()
++            await tx.start()
++            try:
++                await conn.execute("DROP INDEX IF EXISTS uq_technical_indicators_key")
++                for value in ("1.0", "2.0", "3.0"):  # three copies of one key; the last (newest id) must survive
++                    await conn.execute(
++                        "INSERT INTO technical_indicators (instrument_id, ts, timeframe, indicator_name, value) "
++                        "VALUES ($1, $2, '1d', 'rsi14', $3::jsonb)",
++                        instrument_id, ts, value,
++                    )
++                await conn.execute(
++                    "INSERT INTO technical_indicators (instrument_id, ts, timeframe, indicator_name, value) "
++                    "VALUES ($1, $2, '1d', 'atr14', '9.0'::jsonb)", instrument_id, ts,
++                )
++
++                await conn.execute(sql)
++                rows = await conn.fetch(
++                    "SELECT indicator_name, value::text AS v FROM technical_indicators WHERE instrument_id = $1 ORDER BY indicator_name",
++                    instrument_id,
++                )
++                assert [(r["indicator_name"], r["v"]) for r in rows] == [("atr14", "9.0"), ("rsi14", "3.0")]
++
++                await conn.execute(sql)  # idempotent: a second run changes nothing and does not error
++                assert await conn.fetchval("SELECT count(*) FROM technical_indicators WHERE instrument_id = $1", instrument_id) == 2
++
++                with pytest.raises(Exception, match="uq_technical_indicators_key"):
++                    async with conn.transaction():
++                        await conn.execute(
++                            "INSERT INTO technical_indicators (instrument_id, ts, timeframe, indicator_name, value) "
++                            "VALUES ($1, $2, '1d', 'rsi14', '4.0'::jsonb)", instrument_id, ts,
++                        )
++            finally:
++                await tx.rollback()
++        assert await pool.fetchval("SELECT count(*) FROM pg_indexes WHERE indexname = 'uq_technical_indicators_key'") == 1
++    finally:
++        await _drop_instrument(pool, symbol)
++
++
++@pytest.mark.asyncio
++async def test_migration_0006_repairs_corrupted_display_names_only(pool):
++    from app.db.signals import get_or_seed_provider
++
++    sql = MIGRATION_0006.read_text()
++    provider_id = await get_or_seed_provider("mock")
++    async with pool.acquire() as conn:
++        tx = conn.transaction()
++        await tx.start()
++        try:
++            await conn.execute("UPDATE ai_models SET display_name = 'Grok (xAI)' WHERE provider_id = $1 AND model_id = 'mock-v1'", provider_id)
++            await conn.execute(
++                "INSERT INTO ai_models (provider_id, model_id, display_name) VALUES ($1, 'zzp2-named-like-provider', 'mock')", provider_id
++            )
++            await conn.execute(
++                "INSERT INTO ai_models (provider_id, model_id, display_name) VALUES ($1, 'zzp2-admin-named', 'Chosen By An Admin')", provider_id
++            )
++            await conn.execute(sql)
++            names = {
++                r["model_id"]: r["display_name"]
++                for r in await conn.fetch("SELECT model_id, display_name FROM ai_models WHERE provider_id = $1", provider_id)
++            }
++            assert names.get("mock-v1", "Mock Reasoner (offline)") == "Mock Reasoner (offline)"
++            assert names["zzp2-named-like-provider"] == "zzp2-named-like-provider"
++            assert names["zzp2-admin-named"] == "Chosen By An Admin"  # a deliberate name is never touched
++        finally:
++            await tx.rollback()
++
++
++# --------------------------------------------------------------------------
++# audit_logs
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_record_audit_writes_actor_before_and_after(client, accounts, pool):
++    from app.db.audit import record_audit
++
++    _, user_id, _ = await accounts(client, role="admin")
++    resource = f"zzp2:{uuid.uuid4().hex[:8]}"
++    assert await record_audit(actor_id=user_id, action="zzp2.update", resource=resource, before={"a": 1}, after={"a": 2, "when": datetime(2026, 1, 1)})
++    assert await record_audit(actor_id=None, action="zzp2.system", resource=resource)
++
++    import json
++
++    rows = await pool.fetch("SELECT actor_id, action, before, after FROM audit_logs WHERE resource = $1 ORDER BY ts", resource)
++    try:
++        assert [r["action"] for r in rows] == ["zzp2.update", "zzp2.system"]
++        assert str(rows[0]["actor_id"]) == user_id and rows[1]["actor_id"] is None
++        assert json.loads(rows[0]["before"]) == {"a": 1}
++        assert json.loads(rows[0]["after"])["a"] == 2  # a non-JSON value (datetime) was serialised, not fatal
++        assert rows[1]["before"] is None and rows[1]["after"] is None
++    finally:
++        await pool.execute("DELETE FROM audit_logs WHERE resource = $1", resource)
++
++
++@pytest.mark.asyncio
++async def test_a_failed_audit_write_returns_false_instead_of_raising(pool):
++    from app.db.audit import record_audit
++
++    # actor_id is a uuid column: a malformed value makes the INSERT fail.
++    assert await record_audit(actor_id="not-a-uuid", action="zzp2.bad", resource="zzp2:bad") is False
++
++
++@pytest.mark.asyncio
++async def test_knowledge_upload_delete_and_tool_invoke_leave_an_audit_trail(client, accounts, pool):
++    _, admin_id, admin = await accounts(client, role="admin")
++    uploaded = await client.post(
++        "/api/knowledge/upload",
++        json={"title": "zzp2 note", "content": "Position sizing must cap risk per trade.", "sourceType": "knowledge"},
++        headers=admin,
++    )
++    assert uploaded.status_code == 200, uploaded.text
++    document_id = uploaded.json()["documentId"]
++    try:
++        invoked = await client.post(
++            "/api/ai/tools/knowledge_retrieval/invoke", headers=admin, json={"query": "risk per trade", "topK": 1}
++        )
++        assert invoked.status_code == 200, invoked.text
++        assert (await client.delete(f"/api/knowledge/documents/{document_id}", headers=admin)).status_code == 200
++
++        rows = await pool.fetch("SELECT action, resource FROM audit_logs WHERE actor_id = $1 ORDER BY ts", admin_id)
++        assert [r["action"] for r in rows] == ["knowledge.upload", "tool.invoke", "knowledge.delete"]
++        assert rows[0]["resource"] == rows[2]["resource"] == f"knowledge_document:{document_id}"
++        assert rows[1]["resource"] == "tool:knowledge_retrieval"
++    finally:
++        await pool.execute("DELETE FROM knowledge_documents WHERE id = $1", document_id)
++
++
++@pytest.mark.asyncio
++async def test_cli_role_changes_are_audited_with_a_null_actor(pool):
++    from app.cli import _create_admin, _set_role
++    from app.db.client import get_pool
++
++    email = f"zzp2-cli-{uuid.uuid4().hex[:8]}@example.com"
++    user_id = None
++    try:
++        await _create_admin(email, PASSWORD)
++        p = await get_pool()
++        user_id = str(await p.fetchval("SELECT id FROM users WHERE email = $1", email))
++        await _set_role(email, "user")
++        p = await get_pool()
++        rows = await p.fetch("SELECT actor_id, action, after FROM audit_logs WHERE resource = $1 ORDER BY ts", f"user:{user_id}")
++        assert [r["action"] for r in rows] == ["user.create_admin", "user.role_set"]
++        assert all(r["actor_id"] is None for r in rows)
++    finally:
++        p = await get_pool()
++        if user_id:
++            await p.execute("DELETE FROM audit_logs WHERE resource = $1", f"user:{user_id}")
++        await p.execute("DELETE FROM users WHERE email = $1", email)
++
++
++# --------------------------------------------------------------------------
++# error_logs
++# --------------------------------------------------------------------------
++
++
++@pytest.fixture
++def exploding_app():
++    from fastapi import FastAPI
++
++    from app.errors import install_error_handlers
++
++    app = FastAPI()
++    install_error_handlers(app)
++
++    @app.get("/boom")
++    async def boom():
++        raise RuntimeError("zzp2 deliberate failure \x00 with a NUL")
++
++    return app
++
++
++@pytest.mark.asyncio
++async def test_the_error_id_in_a_500_response_is_a_durable_error_logs_row(exploding_app, pool):
++    import httpx
++
++    transport = httpx.ASGITransport(app=exploding_app, raise_app_exceptions=False)
++    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
++        response = await c.get("/boom")
++    assert response.status_code == 500
++    error_id = response.json()["errorId"]
++    try:
++        row = await pool.fetchrow("SELECT * FROM error_logs WHERE error_id = $1", error_id)
++        assert row is not None
++        assert row["type"] == "RuntimeError"
++        assert row["route"] == "GET /boom"
++        assert row["severity"] == "high" and row["status"] == "open"
++        assert "zzp2 deliberate failure" in row["message"] and "\x00" not in row["message"]
++        assert "Traceback" in row["stack"]
++        assert row["user_id"] is None
++    finally:
++        await pool.execute("DELETE FROM error_logs WHERE error_id = $1", error_id)
++
++
++@pytest.mark.asyncio
++async def test_a_500_from_an_authenticated_caller_records_who_hit_it(client, accounts, exploding_app, pool):
++    import httpx
++
++    _, user_id, headers = await accounts(client)
++    transport = httpx.ASGITransport(app=exploding_app, raise_app_exceptions=False)
++    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
++        response = await c.get("/boom", headers=headers)
++    error_id = response.json()["errorId"]
++    try:
++        assert str(await pool.fetchval("SELECT user_id FROM error_logs WHERE error_id = $1", error_id)) == user_id
++    finally:
++        await pool.execute("DELETE FROM error_logs WHERE error_id = $1", error_id)
++
++
++@pytest.mark.asyncio
++async def test_a_token_for_a_deleted_account_does_not_lose_the_error_row(client, exploding_app, pool):
++    import httpx
++
++    from app.security.jwt import create_access_token
++
++    # Validly signed, but the account does not exist: the foreign key would reject
++    # the row if the id were inserted as-is; the writer must null it instead.
++    token, _ = create_access_token(str(uuid.uuid4()), "ghost@example.com", "user")
++    transport = httpx.ASGITransport(app=exploding_app, raise_app_exceptions=False)
++    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
++        response = await c.get("/boom", headers={"Authorization": f"Bearer {token}"})
++    error_id = response.json()["errorId"]
++    try:
++        row = await pool.fetchrow("SELECT user_id FROM error_logs WHERE error_id = $1", error_id)
++        assert row is not None and row["user_id"] is None
++    finally:
++        await pool.execute("DELETE FROM error_logs WHERE error_id = $1", error_id)
++
++
++# --------------------------------------------------------------------------
++# ai_health_checks
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_provider_probes_are_persisted(client, accounts, pool, monkeypatch):
++    for name in ("XAI_API_KEY", "CUSTOM_AI_BASE_URL", "CUSTOM_AI_MODEL_ID", "CUSTOM_AI_API_KEY"):
++        monkeypatch.delenv(name, raising=False)
++    _, _, admin = await accounts(client, role="admin")
++    started = await pool.fetchval("SELECT now()")
++    try:
++        assert (await client.post("/api/ai/mock/test", headers=admin)).json()["ok"] is True
++        assert (await client.get("/api/ai/grok/health", headers=admin)).json()["ok"] is False
++        assert (await client.get("/api/ai/custom/health", headers=admin)).json()["ok"] is False
++        assert (await client.get("/api/ai/nope/health", headers=admin)).status_code == 404
++
++        rows = await pool.fetch(
++            """
++            SELECT p.name AS provider, h.status, h.latency_ms, h.error_detail, h.model_id
++              FROM ai_health_checks h JOIN ai_providers p ON p.id = h.provider_id
++             WHERE h.checked_at >= $1 ORDER BY h.checked_at
++            """,
++            started,
++        )
++        by_provider = {r["provider"]: r for r in rows}
++        assert [r["provider"] for r in rows] == ["mock", "grok", "custom"]  # the 404 wrote nothing
++        assert by_provider["mock"]["status"] == "ok" and by_provider["mock"]["error_detail"] is None
++        assert by_provider["mock"]["model_id"] is not None
++        assert by_provider["grok"]["status"] == "down" and by_provider["grok"]["error_detail"]
++        assert by_provider["custom"]["status"] == "down"
++        assert by_provider["custom"]["model_id"] is None  # an unconfigured "unset" model is not invented as a row
++    finally:
++        await pool.execute("DELETE FROM ai_health_checks WHERE checked_at >= $1", started)
++
++
++# --------------------------------------------------------------------------
++# usage_logs in multi-provider mode + ai_models naming
++# --------------------------------------------------------------------------
++
++
++@pytest.fixture
++def custom_provider_online(monkeypatch):
++    """Configures Custom AI against an endpoint that is never contacted: `reason` is replaced."""
++    from app.providers.base import ProviderReasoning
++    from app.providers.custom_ai_provider import CustomAIProvider
++
++    monkeypatch.setenv("CUSTOM_AI_BASE_URL", "http://127.0.0.1:9/v1")
++    monkeypatch.setenv("CUSTOM_AI_MODEL_ID", "zzp2-custom-model")
++    monkeypatch.delenv("CUSTOM_AI_API_KEY", raising=False)
++
++    async def reason(self, context):  # noqa: ANN001
++        return ProviderReasoning(direction=None, confidence=None, reasoning_summary="declined", supporting_evidence=[])
++
++    monkeypatch.setattr(CustomAIProvider, "reason", reason)
++
++
++@pytest.mark.asyncio
++async def test_multi_provider_comparison_writes_usage_for_every_provider_that_answered(
++    client, accounts, pool, custom_provider_online
++):
++    _, user_id, headers = await accounts(client)
++    symbol = "ZZP2USAGE"
++    try:
++        response = await client.post(
++            "/api/ai/analyze", json={"symbol": symbol, "providers": ["mock", "custom", "grok"]}, headers=headers
++        )
++        assert response.status_code == 200, response.text
++        outcomes = {r["providerId"]: r["outcome"] for r in response.json()["results"]}
++        assert outcomes == {"mock": "ok", "custom": "ok", "grok": "unavailable"}
++        assert response.json()["comparisonId"]
++
++        rows = await pool.fetch(
++            """
++            SELECT p.name AS provider, m.model_id, m.display_name
++              FROM usage_logs u
++              JOIN ai_providers p ON p.id = u.provider_id
++              JOIN ai_models m ON m.id = u.model_id
++             WHERE u.user_id = $1 ORDER BY p.name
++            """,
++            user_id,
++        )
++        assert [(r["provider"], r["model_id"]) for r in rows] == [("custom", "zzp2-custom-model"), ("mock", "mock-v1")]
++        assert {r["provider"]: r["display_name"] for r in rows}["mock"] == "Mock Reasoner (offline)"
++    finally:
++        await _drop_instrument(pool, symbol)
++        await pool.execute(
++            "DELETE FROM ai_models WHERE model_id = 'zzp2-custom-model' AND provider_id IN (SELECT id FROM ai_providers WHERE name = 'custom')"
++        )
++
++
++@pytest.mark.asyncio
++async def test_a_fallback_never_renames_the_mock_model_row(client, accounts, pool, monkeypatch):
++    from app.db.signals import get_or_seed_model
++    from app.providers.grok_provider import GrokProvider
++
++    monkeypatch.setenv("XAI_API_KEY", "zzp2-not-a-real-key")
++
++    async def broken(self, context):  # noqa: ANN001
++        raise RuntimeError("upstream unavailable")
++
++    monkeypatch.setattr(GrokProvider, "reason", broken)
++
++    seeded = await get_or_seed_model("mock", "mock-v1")
++    original = await pool.fetchval("SELECT display_name FROM ai_models WHERE id = $1", seeded.model_db_id)
++    await pool.execute("UPDATE ai_models SET display_name = 'zzp2 sentinel name' WHERE id = $1", seeded.model_db_id)
++    _, _, headers = await accounts(client)
++    symbol = "ZZP2FALL"
++    try:
++        response = await client.post("/api/ai/analyze", json={"symbol": symbol, "provider": "grok"}, headers=headers)
++        assert response.status_code == 200, response.text
++        body = response.json()
++        assert (body["provider"], body["source"]) == ("mock", "fallback")  # the fallback really happened
++        assert await pool.fetchval("SELECT display_name FROM ai_models WHERE id = $1", seeded.model_db_id) == "zzp2 sentinel name"
++    finally:
++        await pool.execute("UPDATE ai_models SET display_name = $2 WHERE id = $1", seeded.model_db_id, original)
++        await _drop_instrument(pool, symbol)
++
++
++def test_default_display_name_comes_from_the_catalogue_for_known_models_else_the_model_id():
++    from app.db.signals import _default_display_name
++    from app.providers.model_registry import get_model_registry
++
++    entry = get_model_registry().get("grok", "grok-4.6")
++    assert entry is not None
++    assert _default_display_name("grok", "grok-4.6") == entry.display_name
++    assert _default_display_name("mock", "mock-v1") == "Mock Reasoner (offline)"
++    assert _default_display_name("grok", "zzp2-unlisted-model") == "zzp2-unlisted-model"
++
++
++@pytest.mark.asyncio
++async def test_a_new_unlisted_model_row_is_named_by_its_model_id_and_keeps_that_name(pool):
++    from app.db.signals import get_or_seed_model
++
++    first = await get_or_seed_model("grok", "zzp2-unlisted-model")
++    try:
++        await get_or_seed_model("grok", "zzp2-unlisted-model", "A Later Caller's Label")
++        assert (
++            await pool.fetchval("SELECT display_name FROM ai_models WHERE id = $1", first.model_db_id)
++            == "zzp2-unlisted-model"
++        )
++    finally:
++        await pool.execute("DELETE FROM ai_models WHERE id = $1", first.model_db_id)
++
++
++# --------------------------------------------------------------------------
++# Retention
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_retention_purges_only_expired_rows(client, accounts, pool):
++    from app.db.retention import run_retention_once
++
++    _, user_id, _ = await accounts(client)
++    now = datetime.now(timezone.utc)
++
++    async def session(name: str, delta: timedelta) -> str:
++        return str(await pool.fetchval(
++            "INSERT INTO sessions (user_id, token_hash, expires_at) VALUES ($1, $2, $3) RETURNING id",
++            user_id, f"zzp2-{name}-{uuid.uuid4().hex}", now + delta,
++        ))
++
++    async def memory(key: str, delta: timedelta | None) -> str:
++        return str(await pool.fetchval(
++            "INSERT INTO memories (user_id, layer, key, value, expires_at) VALUES ($1, 'session', $2, '{}'::jsonb, $3) RETURNING id",
++            user_id, key, None if delta is None else now + delta,
++        ))
++
++    expired_session = await session("old", timedelta(minutes=-5))
++    live_session = await session("live", timedelta(hours=1))
++    expired_memory = await memory("old", timedelta(minutes=-5))
++    live_memory = await memory("live", timedelta(hours=1))
++    forever_memory = await memory("forever", None)
++
++    report = await run_retention_once()
++    assert report.errors == 0
++    assert report.sessions_deleted >= 1 and report.memories_deleted >= 1
++
++    remaining_sessions = {str(r["id"]) for r in await pool.fetch("SELECT id FROM sessions WHERE user_id = $1", user_id)}
++    remaining_memories = {str(r["id"]) for r in await pool.fetch("SELECT id FROM memories WHERE user_id = $1", user_id)}
++    assert expired_session not in remaining_sessions and live_session in remaining_sessions
++    assert expired_memory not in remaining_memories
++    assert {live_memory, forever_memory} <= remaining_memories  # long-term memory (NULL expiry) is never purged
++
++    after_first = {str(r["id"]) for r in await pool.fetch("SELECT id FROM sessions WHERE user_id = $1", user_id)}
++    again = await run_retention_once()  # idempotent: nothing of ours is left to delete
++    assert again.errors == 0
++    assert {str(r["id"]) for r in await pool.fetch("SELECT id FROM sessions WHERE user_id = $1", user_id)} == after_first
++
++
++@pytest.mark.asyncio
++async def test_retention_never_touches_audit_logs_or_trade_results(pool):
++    from app.db.audit import record_audit
++    from app.db.retention import run_retention_once
++
++    resource = f"zzp2:{uuid.uuid4().hex[:8]}"
++    await record_audit(actor_id=None, action="zzp2.keep", resource=resource)
++    try:
++        await run_retention_once()
++        assert await pool.fetchval("SELECT count(*) FROM audit_logs WHERE resource = $1", resource) == 1
++    finally:
++        await pool.execute("DELETE FROM audit_logs WHERE resource = $1", resource)
++
++
++@pytest.mark.asyncio
++async def test_cli_purge_expired_reports_what_it_deleted(pool):
++    from app.cli import _purge_expired
++
++    message = await _purge_expired()
++    assert message.startswith("Deleted ") and "expired session(s)" in message and "expired memory row(s)" in message
++
++
++@pytest.mark.asyncio
++async def test_a_failing_purge_step_is_counted_and_does_not_block_the_other(monkeypatch, pool):
++    import app.db.retention as retention
++
++    async def broken():
++        raise RuntimeError("table is locked")
++
++    monkeypatch.setattr(retention, "purge_expired_sessions", broken)
++    report = await retention.run_retention_once()
++    assert report.errors == 1
++    assert report.sessions_deleted == 0
++    assert report.memories_deleted >= 0
+diff --git a/docs/implementation/ENDPOINT_CHECKLIST.md b/docs/implementation/ENDPOINT_CHECKLIST.md
+index 51cb83a..899fd08 100644
+--- a/docs/implementation/ENDPOINT_CHECKLIST.md
++++ b/docs/implementation/ENDPOINT_CHECKLIST.md
+@@ -15,7 +15,7 @@ test/health) · `default` 120/min.
+ 
+ | Method · Path | Request → Response | Authn / Authz | Validation & errors | Persistence · deps | Status · Tests |
+ |---|---|---|---|---|---|
+-| GET `/health` | — → `{status, service, databaseConfigured, authConfigured, authRequired, nativeLayerAvailable}` | none | — | — | Done · smoke-run against real uvicorn; automated test planned (P2) |
++| GET `/health` | — → `{status, service, databaseConfigured, authConfigured, authRequired, nativeLayerAvailable}` | none | — | — | Done · smoke-run against real uvicorn; automated test added in P2 (`test_p2_foundations.py`) |
+ | POST `/api/auth/register` | `RegisterRequest{email, password 12–256}` → `TokenResponse{accessToken, tokenType, expiresIn, user}` | none · `auth` bucket | 400 invalid **or email already registered** · 503 auth not configured | `users`, `sessions` (IP validated) | Done · integration ✔ |
+ | POST `/api/auth/login` | `LoginRequest` → `TokenResponse` | none · `auth` bucket | 401 identical for unknown/wrong/inactive; constant-time | `sessions` | Done · integration ✔, timing-decoy ✔ |
+ | POST `/api/auth/logout` | — → `{ok}` | JWT (scheme case-insensitive) | idempotent | deletes `sessions` row | Done · integration ✔ (3 scheme casings) |
+@@ -25,14 +25,14 @@ test/health) · `default` 120/min.
+ | GET `/api/ai/providers` | — → provider list | **none (public)** — reveals which providers are configured; tighten decision → P12 | — | registry | Done · no HTTP test (P12) |
+ | POST `/api/ai/route` | `RouteRequest{mode?, provider?, providers?, allowFallback}` → `RouteResponse{mode, decisions[]}` | JWT (any role) · `admin` bucket | 400 | registry + breaker (no execution) | Done · integration ✔ |
+ | GET `/api/ai/tools` | — → tool list | JWT + **admin** | 401/403 | `tool_registry` | Done · registry-level tests (HTTP test → P6) |
+-| POST `/api/ai/tools/{name}/invoke` | tool input → tool output | JWT + **admin** | 404 unknown tool. Tool failures are **HTTP 200** with the outcome in the body: `{tool, status: ok\|error\|timeout, output, error, latencyMs, available}`; runs as `provider_id="custom"` for permission checks | `tool_calls` | Done · registry-level ✔ (HTTP test → P6) |
+-| POST `/api/ai/{provider_id}/test` | — → `HealthResponse{ok, latencyMs, modelChecked, detail, transport}` | JWT + **admin** · `admin` bucket | 404 unknown provider | provider call | Done* · admin gating ✔. *P4 §6.2 wants `{ok, latency_ms, model_checked}` → snake_case alias in P3 |
+-| GET `/api/ai/{provider_id}/health` | — → `HealthResponse` | JWT + **admin** · `admin` bucket | as above | provider call; `ai_health_checks` write → P2 | Done* · same note |
+-| POST `/api/knowledge/upload` | `KnowledgeUploadRequest{title, content, sourceType}` → `{documentId, chunkCount, embeddingModel, skippedChunks}` | JWT + **admin** | 400 invalid **or nothing indexable** (e.g. only punctuation/emoji; the document is stored as `failed`) · 403 | `knowledge_documents/chunks`, `embeddings` (never a zero vector) | Done · authz ✔, H1 regression ✔ |
+-| POST `/api/knowledge/upload/file` | multipart PDF/TXT/CSV | JWT + **admin** | 400 unsupported · size limit (**reads whole file before checking** → P9) | same | Done · authz ✔ |
++| POST `/api/ai/tools/{name}/invoke` | tool input → tool output | JWT + **admin** | 404 unknown tool. Tool failures are **HTTP 200** with the outcome in the body: `{tool, status: ok\|error\|timeout, output, error, latencyMs, available}`; runs as `provider_id="custom"` for permission checks | `tool_calls`; `audit_logs` row `tool.invoke` (P2 ✔) | Done · registry-level ✔, audit ✔ (HTTP test → P6) |
++| POST `/api/ai/{provider_id}/test` | — → `HealthResponse{ok, latencyMs, modelChecked, detail, transport}` | JWT + **admin** · `admin` bucket | 404 unknown provider | provider call; `ai_health_checks` row (P2 ✔) | Done* · admin gating ✔. *P4 §6.2 wants `{ok, latency_ms, model_checked}` → snake_case alias in P3 |
++| GET `/api/ai/{provider_id}/health` | — → `HealthResponse` | JWT + **admin** · `admin` bucket | as above | provider call; writes an `ai_health_checks` row (P2 ✔, `ok`/`down`) | Done* · same note |
++| POST `/api/knowledge/upload` | `KnowledgeUploadRequest{title, content, sourceType}` → `{documentId, chunkCount, embeddingModel, skippedChunks}` | JWT + **admin** | 400 invalid **or nothing indexable** (e.g. only punctuation/emoji; the document is stored as `failed`) · 403 | `knowledge_documents/chunks`, `embeddings` (never a zero vector); `audit_logs` row `knowledge.upload` (P2 ✔) | Done · authz ✔, H1 regression ✔, audit ✔ |
++| POST `/api/knowledge/upload/file` | multipart PDF/TXT/CSV | JWT + **admin** | 400 unsupported · size limit (**reads whole file before checking** → P9) | same; `audit_logs` row `knowledge.upload` (P2 ✔) | Done · authz ✔, audit ✔ |
+ | POST `/api/knowledge/search` | `KnowledgeSearchRequest{query, topK}` → `KnowledgeChunkResponse[]` (`score` is a finite number, enforced by the schema) | JWT (any role) | 400 · a query with no letters/digits returns `[]` (200) | pgvector; rows with undefined similarity are never returned | Done · authz ✔, H1 regression ✔ |
+ | GET `/api/knowledge/documents` | → documents | JWT (any role) | — | — | Done · authz ✔ |
+-| DELETE `/api/knowledge/documents/{id}` | — | JWT + **admin** | 404 | cascades chunks/embeddings | Done · authz ✔ |
++| DELETE `/api/knowledge/documents/{id}` | — | JWT + **admin** | 404 | cascades chunks/embeddings; `audit_logs` row `knowledge.delete` (P2 ✔) | Done · authz ✔, audit ✔ |
+ 
+ **Spec ambiguity recorded (not silently resolved):** P4 §6.2 lists "409 market data unavailable →
+ engine returns NO_VALID_SETUP, not an HTTP error". Those two halves conflict. The baseline raises
+diff --git a/docs/implementation/PLAN.md b/docs/implementation/PLAN.md
+index c321786..cef87b5 100644
+--- a/docs/implementation/PLAN.md
++++ b/docs/implementation/PLAN.md
+@@ -86,13 +86,13 @@ frontend build):
+ 
+ | Table | Owner subsystem | Operational today? | Plan |
+ |---|---|---|---|
+-| users, roles, permissions, sessions | Auth | Yes | P1 (+purge P2) |
++| users, roles, permissions, sessions | Auth | Yes | P1; expired-session purge **P2 ✔** |
+ | ai_providers, ai_models | Router/registry | Yes (seeded on use) | P3 makes DB the registry's system of record |
+ | ai_provider_settings | Provider admin | No | P3/P4 |
+ | ai_routing_rules, ai_fallback_rules | Router | No | P3 decides: use for admin-configurable fallback, else document as dormant |
+-| ai_health_checks | Router monitoring | No | P2 writes, P12/P13 reads |
++| ai_health_checks | Router monitoring | **Yes — written by provider probes (P2 ✔)** | P12/P13 read it |
+ | ai_comparisons, ai_comparison_results | Comparison | Yes | — |
+-| market_instruments, market_data, technical_indicators | Market data / engine | Yes (dedupe missing) | P2 (unique+upsert), P7 |
++| market_instruments, market_data, technical_indicators | Market data / engine | Yes. `technical_indicators`: unique key + upsert **P2 ✔** (migration 0006) | `market_data` unique key lands with the P7 adapters — on today's synthetic bars (timestamps anchored to *now*) a unique key could not prevent duplicates; real vendor bars have stable timestamps |
+ | trading_signals, feedback | Engine / evaluation | signals yes; feedback no | P12 |
+ | knowledge_*, embeddings | RAG | Yes | P9 |
+ | conversations | Conversation/WebSocket | **Started in P1** (comparison ownership) | P11 |
+@@ -100,12 +100,12 @@ frontend build):
+ | memories | Memory | No | P10 |
+ | tool_registry, tool_calls | Tools | Yes | P6 |
+ | custom_indicator_definitions | Custom indicators | No | P8 |
+-| error_logs, audit_logs, usage_logs | Ops | usage partial; error/audit no | P2 |
+-| system_settings | System memory | No | P2/P12 |
++| error_logs, audit_logs, usage_logs | Ops | **Yes (P2 ✔)**: usage in single + multi mode; `error_logs` from the 500 handler; `audit_logs` from knowledge upload/delete, tool invoke, CLI role changes | P3 adds models-CRUD/provider-settings audit; P12 adds the read endpoints |
++| system_settings | System memory | No — *not* in P2's work list (the earlier "P2/P12" here was an over-assignment) | P3 (breaker/registry settings) / P12 |
+ | feature_flags | Ops | No | Dormant until an owning feature exists |
+ | strategies, strategy_versions, backtests, trade_setups, trade_results | Backtesting / paper trading (P2 §18) | No | **Intentionally dormant** — owner subsystem not in this scope |
+ | voice_settings | Voice (P2) | No | **Intentionally dormant** |
+-| Retention | audit_logs/trade_results indefinite; sessions/memories expire; tick roll-up N/A (no tick data) | — | P2 job |
++| Retention | audit_logs/trade_results indefinite; sessions/memories expire; tick roll-up N/A (no tick data) | **Yes (P2 ✔)** — `db/retention.py`, in-process loop + `app.cli purge-expired` | — |
+ 
+ ### Not specified in the supplied sources (not implemented, not forgotten)
+ 
+@@ -140,7 +140,7 @@ the Admin Panel is split: provider/model administration (P5) lands as soon as it
+ - **DB:** `0005_auth_hardening.sql` (indexes only, idempotent). **API:** auth now enforced; ownership on comparison feedback; knowledge RBAC. **Frontend:** login/register/sign-out gate.
+ - **Tests / Verification / Completion:** see PHASE1 report in the delivery; 280 backend + 13 client tests; all green.
+ 
+-### P2 — Persistence hygiene & operational foundations
++### P2 — Persistence hygiene & operational foundations — **DONE**
+ - **Objective:** fix the correctness/ops defects later phases build on; give G12's operational tables their writers.
+ - **P1 §:** 4.5 (health checks persisted), 9 (indexing, retention). **P4:** G12 (b,c,d), G03.
+ - **Depends on:** P1.
+@@ -148,12 +148,19 @@ the Admin Panel is split: provider/model administration (P5) lands as soon as it
+ - **Files:** `db/{indicators_db,audit,errors,health,usage,retention}.py`, `providers/{circuit_breaker,registry}.py` (minimal), `engine/risk_engine.py`/`verify.py` (guard), `main.py` lifespan.
+ - **DB:** `0006_*` (unique index on technical_indicators with dedupe of existing rows; partial index `error_logs(status) WHERE status!='CLOSED'`). **API:** none. **Frontend:** none.
+ - **Tests:** DB integration for each writer; breaker config-error regression; retention. **Verify:** full suite + mypy. **Complete when:** every item has a failing-before/passing-after test.
++- **Delivered (deviations from the plan above, with reasons):**
++  - *No partial index on `error_logs`* — `idx_error_logs_open` already exists from 0001 (and uses the lowercase `'closed'` the CHECK constraint requires, not the spec's `'CLOSED'`).
++  - *`market_data` unique key deferred to P7* — see the G12 table.
++  - *Breaker fix lives in `providers/{base,registry}.py`* (`ProviderNotConfiguredError`, checked before the breaker is touched), not in `circuit_breaker.py`, which is unchanged.
++  - *Also fixed (negative-price family):* a SHORT's far targets at or below zero are dropped, and the setup is rejected if none remain — same root cause as the negative stop, found while writing its test.
++  - *New files:* `db/{audit,errors,health,retention}.py`, `infra/migrations/0006_persistence_hygiene.sql`, `tests/test_p2_{foundations,persistence}.py`. *Modified:* `db/{client,signals,comparisons,indicators_db}.py`, `providers/{base,registry}.py`, `comparison.py`, `engine/risk_engine.py`, `errors.py`, `main.py`, `cli.py`, `config.py`, `routers/{analyze,providers,knowledge,tools}.py`, three test files whose cleanup now has to clear the (RESTRICT) audit trail, one test that pinned the overwrite-on-conflict display-name defect, READMEs/env example/checklist.
++  - *Every fix was mutation-checked:* reverting it individually makes a named test fail (10/10).
+ 
+ ### P3 — Provider settings, model registry persistence, Models CRUD, named endpoints
+ - **Objective:** DB becomes the registry's system of record; admins manage models/providers through the API.
+ - **P1 §:** 4.2, 4.5, 9.1, 10. **P4:** G02g, G03 (admin-configurable breaker), G08a/b, G12.
+ - **Depends on:** P2 (audit writer).
+-- **Work:** registry loads/syncs `ai_models` + seven-value status enum; `GET/POST/PATCH/DELETE /api/ai/models` (admin, audited); `ai_provider_settings` read/write incl. encrypted API keys (env stays authoritative unless admin override set; master key via env, never invented); breaker thresholds from settings; retired-slug auto-flip + alert persisted; `POST /api/ai/compare` (2–3 providers); snake_case `latency_ms`/`model_checked` aliases on test/health; decide `ai_routing_rules`/`ai_fallback_rules`.
++- **Work:** registry loads/syncs `ai_models` + seven-value status enum; `GET/POST/PATCH/DELETE /api/ai/models` (admin, audited); `ai_provider_settings` read/write incl. encrypted API keys (env stays authoritative unless admin override set; master key via env, never invented); breaker thresholds from settings; retired-slug auto-flip + alert persisted; `POST /api/ai/compare` (2–3 providers); snake_case `latency_ms`/`model_checked` aliases on test/health; decide `ai_routing_rules`/`ai_fallback_rules`; router health-check stage + per-provider fallback model (P1 §4.5 pseudocode, defect 23); explicit "requested X, answered by mock" signal in single mode (defect 21); `CancelledError`-safe half-open trial (defect 22).
+ - **DB:** only if CHECK/enum or new column needed (decided after inspecting 0001). **Frontend:** none (P5).
+ - **Tests:** CRUD authz matrix, audit rows, encryption round-trip, registry reload, compare endpoint parity with analyze multi.
+ 
+@@ -220,14 +227,14 @@ the Admin Panel is split: provider/model administration (P5) lands as soon as it
+ | 3 | `logout` with lowercase `bearer` leaves the token valid | **P1 ✔** |
+ | 4 | "Optional" auth returns 500 when the DB is down | **P1 ✔** |
+ | 5 | Any registered user can delete/poison shared knowledge | **P1 ✔** |
+-| 6 | Unconfigured provider trips the breaker → misleading `circuit_open` | P2 |
+-| 7 | Fallback-to-mock overwrites `mock-v1` display name with "Grok (xAI)" | P2 |
+-| 8 | Duplicate `technical_indicators` rows on every request | P2 |
++| 6 | Unconfigured provider trips the breaker → misleading `circuit_open` | **P2 ✔** |
++| 7 | Fallback-to-mock overwrites `mock-v1` display name with "Grok (xAI)" (and the comparison path wrote the bare provider id — last writer won) | **P2 ✔** (never overwritten on conflict; 0006 repairs damaged rows) |
++| 8 | Duplicate `technical_indicators` rows on every request (reproduced: 132 rows / 22 duplicate groups after 12 calls on 2 symbols; after 0006 + P2 code, still 22 rows after 12 more calls) | **P2 ✔** |
+ | 9 | 20k-row CSV → one 180,000-word chunk | P9 |
+ | 16 | **Knowledge search → HTTP 500 `Out of range float values are not JSON compliant: nan`** (all-zero embedding for text with no ASCII letters/digits → pgvector NaN similarity). Also silently put the degenerate chunk into the analysis prompt context and returned `score: null` from the knowledge tool | **Hotfix H1 ✔** |
+ | 18 | `validate_bars` accepted `high=+inf`, `low=-inf`, `volume`=NaN/+inf (4 of 15 non-finite combinations) — latent with demo data, would produce non-finite indicators/response fields with real vendor data | **Hotfix H1 ✔** |
+ | 17 | `ivfflat` index was created on an empty table (pgvector's own notice: "low recall"); under an index plan a 4-row corpus returns 0 rows with the old *and* new query — pre-existing, unrelated to H1 | P9 |
+-| 10 | Negative stop-loss accepted as a valid setup | P2 |
++| 10 | Negative stop-loss accepted as a valid setup (also: SHORT targets ≤ 0) | **P2 ✔** |
+ | 11 | RAG ignores `model_used`; switching embedding provider corrupts retrieval | P9 |
+ | 12 | Unhandled-error responses lack CORS headers | **P1 ✔** |
+ | 13 | Access-log line loses the request id | **P1 ✔** |
+@@ -236,7 +243,14 @@ the Admin Panel is split: provider/model administration (P5) lands as soon as it
+ | — | Timing side-channel on unknown-email login | **P1 ✔** |
+ | — | `sessions.token_hash` unindexed on the hot path | **P1 ✔** (0005) |
+ | — | Gemma hosted path has no timeout/retry | P4 |
+-| — | `close_pool()` never called; `get_pool` race | P2 |
++| — | `close_pool()` never called; `get_pool` race | **P2 ✔** |
++| 19 | Persisted bars are never refreshed: once 60 exist, `get_or_refresh_bars` returns them forever, so every symbol is permanently "stale" after 2 days; `compute_freshness`'s docstring assumes a refresh path that does not exist. *Found while validating P1/P4 against the code; not in the earlier plan.* | P7 |
++| 20 | `lib/types.ts` omits what the API returns (regime, structure, risk, contradictingEvidence, validationWarnings, knowledgeSources, transport, `latencyMs`, `reasonCode`) and its `source` union lacks `"fallback"`/`"cache"`; the UI renders none of it | P5 |
++| 21 | Single-provider mode silently substitutes mock for an unconfigured provider (only the `provider` field reveals it) | P3 |
++| 22 | `execute_provider`: a cancelled request (`CancelledError`, e.g. client disconnect) during a half-open trial leaves `half_open_in_flight` set, locking the provider out | P3 |
++| 23 | P1 §4.5 router pseudocode steps not implemented: health-check stage and a per-provider **fallback model** (`registry.get_fallback`) before declaring unavailable | P3 |
++| 24 | `native/README.md` documents `-DOXYGEN_ENABLE_CUDA`; the CMake option is `OXYGEN_ENABLE_CUDA` (the documented flag silently does nothing) | P14 |
++| 25 | Root `README.md` and `infra/migrations/README.md` are stale (RAG/breaker "Not built", "3 migrations"/"One migration") | P14 |
+ 
+ ## 5. Progress
+ 
+@@ -244,4 +258,5 @@ the Admin Panel is split: provider/model administration (P5) lands as soon as it
+ |---|---|
+ | P1 | **DONE** — delivered with this document |
+ | H1 — knowledge-search NaN hotfix | **DONE** — requires P1; see `apps/api/app/rag/{tokenize,maintenance}.py` |
+-| P2 – P15 | Pending (resume at **P2**) |
++| P2 — persistence hygiene & operational foundations | **DONE** — requires P1 + H1; migration `0006` |
++| P3 – P15 | Pending (resume at **P3**) |
+diff --git a/infra/migrations/0006_persistence_hygiene.sql b/infra/migrations/0006_persistence_hygiene.sql
+new file mode 100644
+index 0000000..e703964
+--- /dev/null
++++ b/infra/migrations/0006_persistence_hygiene.sql
+@@ -0,0 +1,59 @@
++-- 0006_persistence_hygiene.sql
++-- Phase P2 of the Passage 1 + Passage 4 continuation (persistence hygiene &
++-- operational foundations). No table or column is created or dropped.
++--
++-- 1. technical_indicators had no natural key, so every POST /api/ai/analyze
++--    inserted a fresh copy of the same (instrument, ts, timeframe, indicator)
++--    values. Reproduced against a live database: 22 duplicate groups after a
++--    handful of requests. Existing duplicates are removed (the newest row of
++--    each group is kept) and a UNIQUE index makes the application's upsert
++--    (`ON CONFLICT ... DO UPDATE`) possible. The tool that reads this table
++--    uses DISTINCT ON (indicator_name) ORDER BY ts DESC, so which duplicate
++--    survives does not change what it returns.
++--
++-- 2. ai_models.display_name repair. Two writers disagreed about the name and the
++--    upsert overwrote it on every use: the single-provider path wrote the
++--    REQUESTED provider's label (so a Grok request that fell back to mock
++--    renamed the (mock, mock-v1) row "Grok (xAI)"), and the comparison path
++--    wrote the bare provider id ("grok"). The application no longer overwrites
++--    a name on conflict. This statement repairs rows damaged earlier, and only
++--    those it can recognise with certainty: the mock-v1 row, and any row whose
++--    display_name is just its provider's id.
++--
++-- error_logs: the partial index on the open backlog already exists from 0001
++-- (idx_error_logs_open), so P2 adds none.
++--
++-- Idempotent: re-running changes nothing. There is deliberately no BEGIN/COMMIT
++-- in this file so it can be run inside a caller's transaction (the test suite
++-- does exactly that).
++--
++-- ROLLBACK (the project has no migration runner; run manually if needed):
++--   DROP INDEX IF EXISTS uq_technical_indicators_key;
++--   -- the duplicate-row removal and the display_name repair are data fixes and
++--   -- are not reversible (the removed rows were exact duplicates).
++
++DELETE FROM technical_indicators a
++USING technical_indicators b
++WHERE a.instrument_id  = b.instrument_id
++  AND a.ts             = b.ts
++  AND a.timeframe      = b.timeframe
++  AND a.indicator_name = b.indicator_name
++  AND a.id < b.id;
++
++CREATE UNIQUE INDEX IF NOT EXISTS uq_technical_indicators_key
++  ON technical_indicators (instrument_id, ts, timeframe, indicator_name);
++
++UPDATE ai_models m
++   SET display_name = 'Mock Reasoner (offline)', updated_at = now()
++  FROM ai_providers p
++ WHERE p.id = m.provider_id
++   AND p.name = 'mock'
++   AND m.model_id = 'mock-v1'
++   AND m.display_name <> 'Mock Reasoner (offline)';
++
++UPDATE ai_models m
++   SET display_name = m.model_id, updated_at = now()
++  FROM ai_providers p
++ WHERE p.id = m.provider_id
++   AND m.display_name = p.name
++   AND m.display_name <> m.model_id;
