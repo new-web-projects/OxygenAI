@@ -86,13 +86,13 @@ frontend build):
 
 | Table | Owner subsystem | Operational today? | Plan |
 |---|---|---|---|
-| users, roles, permissions, sessions | Auth | Yes | P1 (+purge P2) |
+| users, roles, permissions, sessions | Auth | Yes | P1; expired-session purge **P2 ✔** |
 | ai_providers, ai_models | Router/registry | Yes (seeded on use) | P3 makes DB the registry's system of record |
 | ai_provider_settings | Provider admin | No | P3/P4 |
 | ai_routing_rules, ai_fallback_rules | Router | No | P3 decides: use for admin-configurable fallback, else document as dormant |
-| ai_health_checks | Router monitoring | No | P2 writes, P12/P13 reads |
+| ai_health_checks | Router monitoring | **Yes — written by provider probes (P2 ✔)** | P12/P13 read it |
 | ai_comparisons, ai_comparison_results | Comparison | Yes | — |
-| market_instruments, market_data, technical_indicators | Market data / engine | Yes (dedupe missing) | P2 (unique+upsert), P7 |
+| market_instruments, market_data, technical_indicators | Market data / engine | Yes. `technical_indicators`: unique key + upsert **P2 ✔** (migration 0006) | `market_data` unique key lands with the P7 adapters — on today's synthetic bars (timestamps anchored to *now*) a unique key could not prevent duplicates; real vendor bars have stable timestamps |
 | trading_signals, feedback | Engine / evaluation | signals yes; feedback no | P12 |
 | knowledge_*, embeddings | RAG | Yes | P9 |
 | conversations | Conversation/WebSocket | **Started in P1** (comparison ownership) | P11 |
@@ -100,12 +100,12 @@ frontend build):
 | memories | Memory | No | P10 |
 | tool_registry, tool_calls | Tools | Yes | P6 |
 | custom_indicator_definitions | Custom indicators | No | P8 |
-| error_logs, audit_logs, usage_logs | Ops | usage partial; error/audit no | P2 |
-| system_settings | System memory | No | P2/P12 |
+| error_logs, audit_logs, usage_logs | Ops | **Yes (P2 ✔)**: usage in single + multi mode; `error_logs` from the 500 handler; `audit_logs` from knowledge upload/delete, tool invoke, CLI role changes | P3 adds models-CRUD/provider-settings audit; P12 adds the read endpoints |
+| system_settings | System memory | No — *not* in P2's work list (the earlier "P2/P12" here was an over-assignment) | P3 (breaker/registry settings) / P12 |
 | feature_flags | Ops | No | Dormant until an owning feature exists |
 | strategies, strategy_versions, backtests, trade_setups, trade_results | Backtesting / paper trading (P2 §18) | No | **Intentionally dormant** — owner subsystem not in this scope |
 | voice_settings | Voice (P2) | No | **Intentionally dormant** |
-| Retention | audit_logs/trade_results indefinite; sessions/memories expire; tick roll-up N/A (no tick data) | — | P2 job |
+| Retention | audit_logs/trade_results indefinite; sessions/memories expire; tick roll-up N/A (no tick data) | **Yes (P2 ✔)** — `db/retention.py`, in-process loop + `app.cli purge-expired` | — |
 
 ### Not specified in the supplied sources (not implemented, not forgotten)
 
@@ -140,7 +140,7 @@ the Admin Panel is split: provider/model administration (P5) lands as soon as it
 - **DB:** `0005_auth_hardening.sql` (indexes only, idempotent). **API:** auth now enforced; ownership on comparison feedback; knowledge RBAC. **Frontend:** login/register/sign-out gate.
 - **Tests / Verification / Completion:** see PHASE1 report in the delivery; 280 backend + 13 client tests; all green.
 
-### P2 — Persistence hygiene & operational foundations
+### P2 — Persistence hygiene & operational foundations — **DONE**
 - **Objective:** fix the correctness/ops defects later phases build on; give G12's operational tables their writers.
 - **P1 §:** 4.5 (health checks persisted), 9 (indexing, retention). **P4:** G12 (b,c,d), G03.
 - **Depends on:** P1.
@@ -148,12 +148,19 @@ the Admin Panel is split: provider/model administration (P5) lands as soon as it
 - **Files:** `db/{indicators_db,audit,errors,health,usage,retention}.py`, `providers/{circuit_breaker,registry}.py` (minimal), `engine/risk_engine.py`/`verify.py` (guard), `main.py` lifespan.
 - **DB:** `0006_*` (unique index on technical_indicators with dedupe of existing rows; partial index `error_logs(status) WHERE status!='CLOSED'`). **API:** none. **Frontend:** none.
 - **Tests:** DB integration for each writer; breaker config-error regression; retention. **Verify:** full suite + mypy. **Complete when:** every item has a failing-before/passing-after test.
+- **Delivered (deviations from the plan above, with reasons):**
+  - *No partial index on `error_logs`* — `idx_error_logs_open` already exists from 0001 (and uses the lowercase `'closed'` the CHECK constraint requires, not the spec's `'CLOSED'`).
+  - *`market_data` unique key deferred to P7* — see the G12 table.
+  - *Breaker fix lives in `providers/{base,registry}.py`* (`ProviderNotConfiguredError`, checked before the breaker is touched), not in `circuit_breaker.py`, which is unchanged.
+  - *Also fixed (negative-price family):* a SHORT's far targets at or below zero are dropped, and the setup is rejected if none remain — same root cause as the negative stop, found while writing its test.
+  - *New files:* `db/{audit,errors,health,retention}.py`, `infra/migrations/0006_persistence_hygiene.sql`, `tests/test_p2_{foundations,persistence}.py`. *Modified:* `db/{client,signals,comparisons,indicators_db}.py`, `providers/{base,registry}.py`, `comparison.py`, `engine/risk_engine.py`, `errors.py`, `main.py`, `cli.py`, `config.py`, `routers/{analyze,providers,knowledge,tools}.py`, three test files whose cleanup now has to clear the (RESTRICT) audit trail, one test that pinned the overwrite-on-conflict display-name defect, READMEs/env example/checklist.
+  - *Every fix was mutation-checked:* reverting it individually makes a named test fail (10/10).
 
 ### P3 — Provider settings, model registry persistence, Models CRUD, named endpoints
 - **Objective:** DB becomes the registry's system of record; admins manage models/providers through the API.
 - **P1 §:** 4.2, 4.5, 9.1, 10. **P4:** G02g, G03 (admin-configurable breaker), G08a/b, G12.
 - **Depends on:** P2 (audit writer).
-- **Work:** registry loads/syncs `ai_models` + seven-value status enum; `GET/POST/PATCH/DELETE /api/ai/models` (admin, audited); `ai_provider_settings` read/write incl. encrypted API keys (env stays authoritative unless admin override set; master key via env, never invented); breaker thresholds from settings; retired-slug auto-flip + alert persisted; `POST /api/ai/compare` (2–3 providers); snake_case `latency_ms`/`model_checked` aliases on test/health; decide `ai_routing_rules`/`ai_fallback_rules`.
+- **Work:** registry loads/syncs `ai_models` + seven-value status enum; `GET/POST/PATCH/DELETE /api/ai/models` (admin, audited); `ai_provider_settings` read/write incl. encrypted API keys (env stays authoritative unless admin override set; master key via env, never invented); breaker thresholds from settings; retired-slug auto-flip + alert persisted; `POST /api/ai/compare` (2–3 providers); snake_case `latency_ms`/`model_checked` aliases on test/health; decide `ai_routing_rules`/`ai_fallback_rules`; router health-check stage + per-provider fallback model (P1 §4.5 pseudocode, defect 23); explicit "requested X, answered by mock" signal in single mode (defect 21); `CancelledError`-safe half-open trial (defect 22).
 - **DB:** only if CHECK/enum or new column needed (decided after inspecting 0001). **Frontend:** none (P5).
 - **Tests:** CRUD authz matrix, audit rows, encryption round-trip, registry reload, compare endpoint parity with analyze multi.
 
@@ -220,14 +227,14 @@ the Admin Panel is split: provider/model administration (P5) lands as soon as it
 | 3 | `logout` with lowercase `bearer` leaves the token valid | **P1 ✔** |
 | 4 | "Optional" auth returns 500 when the DB is down | **P1 ✔** |
 | 5 | Any registered user can delete/poison shared knowledge | **P1 ✔** |
-| 6 | Unconfigured provider trips the breaker → misleading `circuit_open` | P2 |
-| 7 | Fallback-to-mock overwrites `mock-v1` display name with "Grok (xAI)" | P2 |
-| 8 | Duplicate `technical_indicators` rows on every request | P2 |
+| 6 | Unconfigured provider trips the breaker → misleading `circuit_open` | **P2 ✔** |
+| 7 | Fallback-to-mock overwrites `mock-v1` display name with "Grok (xAI)" (and the comparison path wrote the bare provider id — last writer won) | **P2 ✔** (never overwritten on conflict; 0006 repairs damaged rows) |
+| 8 | Duplicate `technical_indicators` rows on every request (reproduced: 132 rows / 22 duplicate groups after 12 calls on 2 symbols; after 0006 + P2 code, still 22 rows after 12 more calls) | **P2 ✔** |
 | 9 | 20k-row CSV → one 180,000-word chunk | P9 |
 | 16 | **Knowledge search → HTTP 500 `Out of range float values are not JSON compliant: nan`** (all-zero embedding for text with no ASCII letters/digits → pgvector NaN similarity). Also silently put the degenerate chunk into the analysis prompt context and returned `score: null` from the knowledge tool | **Hotfix H1 ✔** |
 | 18 | `validate_bars` accepted `high=+inf`, `low=-inf`, `volume`=NaN/+inf (4 of 15 non-finite combinations) — latent with demo data, would produce non-finite indicators/response fields with real vendor data | **Hotfix H1 ✔** |
 | 17 | `ivfflat` index was created on an empty table (pgvector's own notice: "low recall"); under an index plan a 4-row corpus returns 0 rows with the old *and* new query — pre-existing, unrelated to H1 | P9 |
-| 10 | Negative stop-loss accepted as a valid setup | P2 |
+| 10 | Negative stop-loss accepted as a valid setup (also: SHORT targets ≤ 0) | **P2 ✔** |
 | 11 | RAG ignores `model_used`; switching embedding provider corrupts retrieval | P9 |
 | 12 | Unhandled-error responses lack CORS headers | **P1 ✔** |
 | 13 | Access-log line loses the request id | **P1 ✔** |
@@ -236,7 +243,14 @@ the Admin Panel is split: provider/model administration (P5) lands as soon as it
 | — | Timing side-channel on unknown-email login | **P1 ✔** |
 | — | `sessions.token_hash` unindexed on the hot path | **P1 ✔** (0005) |
 | — | Gemma hosted path has no timeout/retry | P4 |
-| — | `close_pool()` never called; `get_pool` race | P2 |
+| — | `close_pool()` never called; `get_pool` race | **P2 ✔** |
+| 19 | Persisted bars are never refreshed: once 60 exist, `get_or_refresh_bars` returns them forever, so every symbol is permanently "stale" after 2 days; `compute_freshness`'s docstring assumes a refresh path that does not exist. *Found while validating P1/P4 against the code; not in the earlier plan.* | P7 |
+| 20 | `lib/types.ts` omits what the API returns (regime, structure, risk, contradictingEvidence, validationWarnings, knowledgeSources, transport, `latencyMs`, `reasonCode`) and its `source` union lacks `"fallback"`/`"cache"`; the UI renders none of it | P5 |
+| 21 | Single-provider mode silently substitutes mock for an unconfigured provider (only the `provider` field reveals it) | P3 |
+| 22 | `execute_provider`: a cancelled request (`CancelledError`, e.g. client disconnect) during a half-open trial leaves `half_open_in_flight` set, locking the provider out | P3 |
+| 23 | P1 §4.5 router pseudocode steps not implemented: health-check stage and a per-provider **fallback model** (`registry.get_fallback`) before declaring unavailable | P3 |
+| 24 | `native/README.md` documents `-DOXYGEN_ENABLE_CUDA`; the CMake option is `OXYGEN_ENABLE_CUDA` (the documented flag silently does nothing) | P14 |
+| 25 | Root `README.md` and `infra/migrations/README.md` are stale (RAG/breaker "Not built", "3 migrations"/"One migration") | P14 |
 
 ## 5. Progress
 
@@ -244,4 +258,5 @@ the Admin Panel is split: provider/model administration (P5) lands as soon as it
 |---|---|
 | P1 | **DONE** — delivered with this document |
 | H1 — knowledge-search NaN hotfix | **DONE** — requires P1; see `apps/api/app/rag/{tokenize,maintenance}.py` |
-| P2 – P15 | Pending (resume at **P2**) |
+| P2 — persistence hygiene & operational foundations | **DONE** — requires P1 + H1; migration `0006` |
+| P3 – P15 | Pending (resume at **P3**) |

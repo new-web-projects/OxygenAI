@@ -15,7 +15,7 @@ test/health) · `default` 120/min.
 
 | Method · Path | Request → Response | Authn / Authz | Validation & errors | Persistence · deps | Status · Tests |
 |---|---|---|---|---|---|
-| GET `/health` | — → `{status, service, databaseConfigured, authConfigured, authRequired, nativeLayerAvailable}` | none | — | — | Done · smoke-run against real uvicorn; automated test planned (P2) |
+| GET `/health` | — → `{status, service, databaseConfigured, authConfigured, authRequired, nativeLayerAvailable}` | none | — | — | Done · smoke-run against real uvicorn; automated test added in P2 (`test_p2_foundations.py`) |
 | POST `/api/auth/register` | `RegisterRequest{email, password 12–256}` → `TokenResponse{accessToken, tokenType, expiresIn, user}` | none · `auth` bucket | 400 invalid **or email already registered** · 503 auth not configured | `users`, `sessions` (IP validated) | Done · integration ✔ |
 | POST `/api/auth/login` | `LoginRequest` → `TokenResponse` | none · `auth` bucket | 401 identical for unknown/wrong/inactive; constant-time | `sessions` | Done · integration ✔, timing-decoy ✔ |
 | POST `/api/auth/logout` | — → `{ok}` | JWT (scheme case-insensitive) | idempotent | deletes `sessions` row | Done · integration ✔ (3 scheme casings) |
@@ -25,14 +25,14 @@ test/health) · `default` 120/min.
 | GET `/api/ai/providers` | — → provider list | **none (public)** — reveals which providers are configured; tighten decision → P12 | — | registry | Done · no HTTP test (P12) |
 | POST `/api/ai/route` | `RouteRequest{mode?, provider?, providers?, allowFallback}` → `RouteResponse{mode, decisions[]}` | JWT (any role) · `admin` bucket | 400 | registry + breaker (no execution) | Done · integration ✔ |
 | GET `/api/ai/tools` | — → tool list | JWT + **admin** | 401/403 | `tool_registry` | Done · registry-level tests (HTTP test → P6) |
-| POST `/api/ai/tools/{name}/invoke` | tool input → tool output | JWT + **admin** | 404 unknown tool. Tool failures are **HTTP 200** with the outcome in the body: `{tool, status: ok\|error\|timeout, output, error, latencyMs, available}`; runs as `provider_id="custom"` for permission checks | `tool_calls` | Done · registry-level ✔ (HTTP test → P6) |
-| POST `/api/ai/{provider_id}/test` | — → `HealthResponse{ok, latencyMs, modelChecked, detail, transport}` | JWT + **admin** · `admin` bucket | 404 unknown provider | provider call | Done* · admin gating ✔. *P4 §6.2 wants `{ok, latency_ms, model_checked}` → snake_case alias in P3 |
-| GET `/api/ai/{provider_id}/health` | — → `HealthResponse` | JWT + **admin** · `admin` bucket | as above | provider call; `ai_health_checks` write → P2 | Done* · same note |
-| POST `/api/knowledge/upload` | `KnowledgeUploadRequest{title, content, sourceType}` → `{documentId, chunkCount, embeddingModel, skippedChunks}` | JWT + **admin** | 400 invalid **or nothing indexable** (e.g. only punctuation/emoji; the document is stored as `failed`) · 403 | `knowledge_documents/chunks`, `embeddings` (never a zero vector) | Done · authz ✔, H1 regression ✔ |
-| POST `/api/knowledge/upload/file` | multipart PDF/TXT/CSV | JWT + **admin** | 400 unsupported · size limit (**reads whole file before checking** → P9) | same | Done · authz ✔ |
+| POST `/api/ai/tools/{name}/invoke` | tool input → tool output | JWT + **admin** | 404 unknown tool. Tool failures are **HTTP 200** with the outcome in the body: `{tool, status: ok\|error\|timeout, output, error, latencyMs, available}`; runs as `provider_id="custom"` for permission checks | `tool_calls`; `audit_logs` row `tool.invoke` (P2 ✔) | Done · registry-level ✔, audit ✔ (HTTP test → P6) |
+| POST `/api/ai/{provider_id}/test` | — → `HealthResponse{ok, latencyMs, modelChecked, detail, transport}` | JWT + **admin** · `admin` bucket | 404 unknown provider | provider call; `ai_health_checks` row (P2 ✔) | Done* · admin gating ✔. *P4 §6.2 wants `{ok, latency_ms, model_checked}` → snake_case alias in P3 |
+| GET `/api/ai/{provider_id}/health` | — → `HealthResponse` | JWT + **admin** · `admin` bucket | as above | provider call; writes an `ai_health_checks` row (P2 ✔, `ok`/`down`) | Done* · same note |
+| POST `/api/knowledge/upload` | `KnowledgeUploadRequest{title, content, sourceType}` → `{documentId, chunkCount, embeddingModel, skippedChunks}` | JWT + **admin** | 400 invalid **or nothing indexable** (e.g. only punctuation/emoji; the document is stored as `failed`) · 403 | `knowledge_documents/chunks`, `embeddings` (never a zero vector); `audit_logs` row `knowledge.upload` (P2 ✔) | Done · authz ✔, H1 regression ✔, audit ✔ |
+| POST `/api/knowledge/upload/file` | multipart PDF/TXT/CSV | JWT + **admin** | 400 unsupported · size limit (**reads whole file before checking** → P9) | same; `audit_logs` row `knowledge.upload` (P2 ✔) | Done · authz ✔, audit ✔ |
 | POST `/api/knowledge/search` | `KnowledgeSearchRequest{query, topK}` → `KnowledgeChunkResponse[]` (`score` is a finite number, enforced by the schema) | JWT (any role) | 400 · a query with no letters/digits returns `[]` (200) | pgvector; rows with undefined similarity are never returned | Done · authz ✔, H1 regression ✔ |
 | GET `/api/knowledge/documents` | → documents | JWT (any role) | — | — | Done · authz ✔ |
-| DELETE `/api/knowledge/documents/{id}` | — | JWT + **admin** | 404 | cascades chunks/embeddings | Done · authz ✔ |
+| DELETE `/api/knowledge/documents/{id}` | — | JWT + **admin** | 404 | cascades chunks/embeddings; `audit_logs` row `knowledge.delete` (P2 ✔) | Done · authz ✔, audit ✔ |
 
 **Spec ambiguity recorded (not silently resolved):** P4 §6.2 lists "409 market data unavailable →
 engine returns NO_VALID_SETUP, not an HTTP error". Those two halves conflict. The baseline raises
