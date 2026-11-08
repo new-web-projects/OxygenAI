@@ -20,7 +20,9 @@ unavailable · 429 rate limited · 503 provider unavailable.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import traceback
 import uuid
 from collections.abc import Sequence
 from typing import Any
@@ -193,6 +195,7 @@ def install_error_handlers(app: FastAPI, allowed_origins: Sequence[str] | None =
         logger.exception(
             "unhandled error", extra={"error_id": error_id, "path": str(request.url.path)}
         )
+        await _persist_unhandled(request, exc, error_id)
         # The traceback goes to the log, never to the client.
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -203,6 +206,53 @@ def install_error_handlers(app: FastAPI, allowed_origins: Sequence[str] | None =
             ),
             headers=_cross_origin_headers(request, allowed_origins),
         )
+
+
+def _user_id_from_bearer(request: Request) -> str | None:
+    """
+    Best-effort caller identity for the error row: the `sub` of a validly signed,
+    unexpired bearer token (signature/expiry only, no database hit — the same
+    approach the rate limiter takes). None for anything else.
+    """
+    try:
+        from .security.jwt import decode_access_token
+
+        scheme, _, token = request.headers.get("authorization", "").partition(" ")
+        if scheme.lower() != "bearer" or not token.strip():
+            return None
+        return decode_access_token(token.strip()).user_id
+    except Exception:  # noqa: BLE001 — identity is a nicety, never load-bearing
+        return None
+
+
+async def _persist_unhandled(request: Request, exc: Exception, error_id: str) -> None:
+    """
+    Writes the `error_logs` row whose `error_id` is the id the client was told to
+    quote (Passage 4 §5.2). Bounded to two seconds and fully guarded: the 500
+    response must go out whether or not the database is healthy — an error
+    handler that can itself fail or hang would hide the original error.
+    """
+    try:
+        from .db.client import is_db_configured
+
+        if not is_db_configured():
+            return
+        from .db.errors import record_error
+
+        await asyncio.wait_for(
+            record_error(
+                error_id=error_id,
+                error_type=type(exc).__name__,
+                message=str(exc) or type(exc).__name__,
+                stack="".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+                route=f"{request.method} {request.url.path}",
+                user_id=_user_id_from_bearer(request),
+                severity="high",
+            ),
+            timeout=2.0,
+        )
+    except Exception as err:  # noqa: BLE001
+        logger.warning("could not persist unhandled error", extra={"error_id": error_id, "error": str(err)})
 
 
 def _safe_details(errors: Any) -> Any:

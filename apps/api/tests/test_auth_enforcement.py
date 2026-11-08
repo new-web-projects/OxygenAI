@@ -99,6 +99,9 @@ async def accounts(pool):
         await pool.execute(
             "DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE email = $1)", email
         )
+        await pool.execute(
+            "DELETE FROM audit_logs WHERE actor_id IN (SELECT id FROM users WHERE email = $1)", email
+        )
         await pool.execute("DELETE FROM users WHERE email = $1", email)
 
 
@@ -147,6 +150,9 @@ async def test_hostile_forwarded_for_cannot_break_registration_or_login(
     finally:
         await pool.execute(
             "DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE email = $1)", email
+        )
+        await pool.execute(
+            "DELETE FROM audit_logs WHERE actor_id IN (SELECT id FROM users WHERE email = $1)", email
         )
         await pool.execute("DELETE FROM users WHERE email = $1", email)
 
@@ -278,4 +284,7 @@ async def test_cli_create_admin_yields_an_account_that_can_log_in_as_admin(clien
 
         p = await get_pool()
         await p.execute("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE email = $1)", email)
+        await p.execute(
+            "DELETE FROM audit_logs WHERE actor_id IN (SELECT id FROM users WHERE email = $1)", email
+        )
         await p.execute("DELETE FROM users WHERE email = $1", email)

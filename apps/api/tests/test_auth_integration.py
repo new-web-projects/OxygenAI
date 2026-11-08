@@ -71,6 +71,9 @@ async def _cleanup(pool, email: str) -> None:
     await pool.execute(
         "DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE email = $1)", email
     )
+    await pool.execute(
+        "DELETE FROM audit_logs WHERE actor_id IN (SELECT id FROM users WHERE email = $1)", email
+    )
     await pool.execute("DELETE FROM users WHERE email = $1", email)
 
 

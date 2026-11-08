@@ -16,8 +16,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 
+from ..db.audit import record_audit
 from ..errors import NotFoundError
-from ..security.dependencies import require_role
+from ..security.dependencies import AuthenticatedUser, require_role
 from ..tools.registry import get_tool_registry
 from ..tools.schemas import ToolContext
 
@@ -45,7 +46,9 @@ async def list_tools() -> list[dict]:
 
 
 @router.post("/{name}/invoke")
-async def invoke_tool(name: str, input_data: dict) -> dict:
+async def invoke_tool(
+    name: str, input_data: dict, user: AuthenticatedUser = Depends(require_role("admin"))
+) -> dict:
     """
     Manual invocation for admin debugging/verification — goes through
     the exact same `execute()` governance path a provider would use,
@@ -57,6 +60,12 @@ async def invoke_tool(name: str, input_data: dict) -> dict:
     if registry.get(name) is None:
         raise NotFoundError(f"Unknown tool: '{name}'")
     outcome = await registry.execute(name, input_data, ToolContext(provider_id="custom"))
+    await record_audit(
+        actor_id=user.id,
+        action="tool.invoke",
+        resource=f"tool:{name}",
+        after={"status": outcome.status, "available": outcome.available},
+    )
     return {
         "tool": outcome.tool_name,
         "status": outcome.status,

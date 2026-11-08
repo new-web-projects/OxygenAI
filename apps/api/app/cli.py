@@ -9,6 +9,7 @@ unreachable on a fresh install short of hand-written SQL.
 
     python -m app.cli create-admin --email you@example.com
     python -m app.cli set-role --email you@example.com --role admin
+    python -m app.cli purge-expired
 
 The password is read from an interactive prompt (or, for scripted use,
 one line on stdin with --password-stdin). It is never accepted as a
@@ -41,6 +42,7 @@ def _read_password(from_stdin: bool) -> str:
 
 
 async def _create_admin(email: str, password: str) -> str:
+    from .db.audit import record_audit
     from .db.client import close_pool
     from .db.users import create_user, get_user_by_email, set_user_role
     from .security.passwords import hash_password
@@ -50,22 +52,61 @@ async def _create_admin(email: str, password: str) -> str:
         existing = await get_user_by_email(email)
         if existing is not None:
             await set_user_role(email, "admin")
+            await record_audit(
+                actor_id=None,
+                action="user.role_set",
+                resource=f"user:{existing.id}",
+                before={"role": existing.role_name},
+                after={"role": "admin", "via": "cli"},
+            )
             return f"User {email} already existed — role set to admin (password unchanged)."
-        await create_user(email, hash_password(password), role_name="admin")
+        created = await create_user(email, hash_password(password), role_name="admin")
+        await record_audit(
+            actor_id=None,
+            action="user.create_admin",
+            resource=f"user:{created.id}",
+            after={"role": "admin", "via": "cli"},
+        )
         return f"Admin account created for {email}."
     finally:
         await close_pool()
 
 
 async def _set_role(email: str, role: str) -> str:
+    from .db.audit import record_audit
     from .db.client import close_pool
-    from .db.users import set_user_role
+    from .db.users import get_user_by_email, set_user_role
 
+    email = email.strip().lower()
     try:
-        ok = await set_user_role(email.strip().lower(), role)
+        before = await get_user_by_email(email)
+        ok = await set_user_role(email, role)
+        if ok and before is not None:
+            await record_audit(
+                actor_id=None,
+                action="user.role_set",
+                resource=f"user:{before.id}",
+                before={"role": before.role_name},
+                after={"role": role, "via": "cli"},
+            )
     finally:
         await close_pool()
     return f"{email} is now '{role}'." if ok else f"No such user '{email}' or role '{role}' — nothing changed."
+
+
+async def _purge_expired() -> str:
+    from .db.client import close_pool
+    from .db.retention import run_retention_once
+
+    try:
+        report = await run_retention_once()
+    finally:
+        await close_pool()
+    suffix = f" ({report.errors} purge step(s) failed — see the log)" if report.errors else ""
+    return (
+        f"Deleted {report.sessions_deleted} expired session(s) and "
+        f"{report.memories_deleted} expired memory row(s).{suffix}"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -81,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
     role.add_argument("--email", required=True)
     role.add_argument("--role", required=True, choices=["admin", "user"])
 
+    sub.add_parser("purge-expired", help="Delete expired sessions and expired short-lived memories")
+
     args = parser.parse_args(argv)
 
     from .db.client import is_db_configured
@@ -91,6 +134,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "create-admin":
         message = asyncio.run(_create_admin(args.email, _read_password(args.password_stdin)))
+    elif args.command == "purge-expired":
+        message = asyncio.run(_purge_expired())
     else:
         message = asyncio.run(_set_role(args.email, args.role))
     print(message)

@@ -200,6 +200,12 @@ class Settings:
     # Passage 1 §5: the native layer is always present as a boundary, but
     # a missing/unbuilt binary degrades performance, never correctness.
     native_enabled: bool = field(default_factory=lambda: _env_bool("NATIVE_ENABLED", True))
+    # How often the in-process retention job purges expired sessions/memories
+    # (db/retention.py). 0 or negative disables the loop; `python -m app.cli
+    # purge-expired` still works on demand.
+    retention_interval_seconds: float = field(
+        default_factory=lambda: _env_float("RETENTION_INTERVAL_SECONDS", 3600.0)
+    )
 
     circuit_breaker: CircuitBreakerSettings = field(default_factory=CircuitBreakerSettings)
     risk: RiskSettings = field(default_factory=RiskSettings)

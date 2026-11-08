@@ -6,6 +6,10 @@ normalized shape — `indicator_name`, `value jsonb` — rather than one row
 per bundle), and the Technical Indicator tool (`tools/market_tools.py`)
 reads it back.
 
+Idempotent per (instrument, ts, timeframe, indicator) since migration 0006:
+re-analysing the same bars updates the stored value in place instead of
+appending a duplicate row on every request.
+
 This is what makes that tool's contract literal rather than aspirational
 — Passage 4 §3.5 (G05) specifies it as "Read-only access to
 already-computed indicator values (never computes new ones itself)",
@@ -73,6 +77,8 @@ async def persist_indicator_bundle(
         """
         INSERT INTO technical_indicators (instrument_id, ts, timeframe, indicator_name, value)
         VALUES ($1, $2, $3, $4, $5::jsonb)
+        ON CONFLICT (instrument_id, ts, timeframe, indicator_name)
+        DO UPDATE SET value = EXCLUDED.value
         """,
         [(instrument_id, _parse_ts(ts), timeframe, name, json.dumps(value)) for name, value in rows],
     )

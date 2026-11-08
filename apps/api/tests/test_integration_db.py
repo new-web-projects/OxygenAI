@@ -123,7 +123,7 @@ async def test_get_or_seed_model_upserts_without_duplicating(pool):
     Requires the 0002 migration (unique constraint on provider_id,
     model_id) — this is exactly the regression that migration exists to
     prevent: without it, this test would insert a second model row on
-    the second call instead of updating the first.
+    the second call instead of reusing the first.
     """
     from app.db.signals import get_or_seed_model
 
@@ -137,7 +137,9 @@ async def test_get_or_seed_model_upserts_without_duplicating(pool):
         row = await pool.fetchrow(
             "SELECT display_name FROM ai_models WHERE id = $1", first.model_db_id
         )
-        assert row["display_name"] == "Display Two"  # the update side of the upsert took effect
+        # Since P2 an existing row's name is NOT overwritten on conflict (the
+        # old "last writer wins" upsert let a fallback rename mock-v1 "Grok (xAI)").
+        assert row["display_name"] == "Display One"
     finally:
         await pool.execute(
             "DELETE FROM ai_models WHERE provider_id IN "

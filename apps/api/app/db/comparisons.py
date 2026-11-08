@@ -41,7 +41,7 @@ async def save_comparison(
 
     for provider_id in provider_ids:
         seeded = await get_or_seed_model(
-            provider_id, model_id_by_provider.get(provider_id, "unknown"), provider_id
+            provider_id, model_id_by_provider.get(provider_id, "unknown")
         )
         await pool.execute(
             """

@@ -32,7 +32,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-from .providers.base import AnalysisContext
+from .providers.base import AnalysisContext, ProviderNotConfiguredError
 from .providers.circuit_breaker import CircuitBreakerOpen
 from .providers.registry import execute_provider
 from .schemas import (
@@ -80,6 +80,10 @@ def _classify_failure(provider_id: str, err: BaseException) -> ComparisonSlotUna
             reason=str(err),
             reasonCode="circuit_open",
             retryAfterSeconds=err.retry_after,
+        )
+    if isinstance(err, ProviderNotConfiguredError):
+        return ComparisonSlotUnavailable(
+            providerId=provider_id, reason=str(err), reasonCode="not_configured"
         )
     if isinstance(err, KeyError):
         return ComparisonSlotUnavailable(

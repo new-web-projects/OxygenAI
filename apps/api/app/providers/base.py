@@ -31,6 +31,22 @@ from ..schemas import IndicatorBundle
 SourceTag = Literal["mock", "hosted_api", "local_model", "cache", "fallback"]
 
 
+class ProviderNotConfiguredError(RuntimeError):
+    """
+    The provider has no usable credentials/endpoint. This is a configuration
+    state, not a provider failure: it must never be counted by the circuit
+    breaker (before P2 it was, so a few comparisons that merely included an
+    unconfigured Grok reported it as `circuit_open` instead of
+    `not_configured`, hiding the real, fixable cause).
+    """
+
+    def __init__(self, provider_id: str, missing: list[str]) -> None:
+        self.provider_id = provider_id
+        self.missing = list(missing)
+        detail = ", ".join(self.missing) if self.missing else "required configuration"
+        super().__init__(f"'{provider_id}' is not configured. Missing: {detail}")
+
+
 @dataclass
 class AnalysisContext:
     symbol: str

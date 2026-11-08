@@ -189,15 +189,27 @@ async def analyze(body: AnalyzeRequest, user: AuthenticatedUser | None = Depends
                 model_id_by_provider: dict[str, str] = {}
                 for slot in results:
                     model_id_by_provider[slot.providerId] = configured_model_id(slot.providerId)
-                    if slot.outcome == "ok" and slot.analysis.status == "SETUP_FOUND":
-                        seeded = await get_or_seed_model(
-                            slot.providerId, model_id_by_provider[slot.providerId], slot.providerId
-                        )
-                        signal_id_by_provider[slot.providerId] = await save_signal(
-                            instrument_id, seeded.model_db_id, slot.analysis
-                        )
-                    else:
+                    if slot.outcome != "ok":
                         signal_id_by_provider[slot.providerId] = None
+                        continue
+                    seeded = await get_or_seed_model(slot.providerId, slot.analysis.model)
+                    signal_id_by_provider[slot.providerId] = (
+                        await save_signal(instrument_id, seeded.model_db_id, slot.analysis)
+                        if slot.analysis.status == "SETUP_FOUND"
+                        else None
+                    )
+                    # Usage is attributed per participating provider that actually
+                    # answered — single mode always did this; multi mode wrote
+                    # nothing to usage_logs before P2. Its own try/except: a
+                    # failed usage row must not cost the comparison its persistence.
+                    if user is not None:
+                        try:
+                            await record_usage(user.id, seeded.provider_id, seeded.model_db_id)
+                        except Exception as err:  # noqa: BLE001
+                            logger.warning(
+                                "Failed to record usage (comparison continues)",
+                                extra={"provider": slot.providerId, "error": str(err)},
+                            )
                 # An authenticated user's comparison hangs off one of
                 # their conversations, which is what lets the feedback
                 # endpoint restrict rating/preference to its owner.
@@ -274,9 +286,10 @@ async def analyze(body: AnalyzeRequest, user: AuthenticatedUser | None = Depends
 
     if persisted and instrument_id:
         try:
-            seeded = await get_or_seed_model(
-                result.provider_id, result.model_id, provider.display_name
-            )
+            # Named for the provider/model that ACTUALLY answered
+            # (result.*), not the one requested: after a fallback these differ,
+            # and the requested provider's label used to overwrite the mock row.
+            seeded = await get_or_seed_model(result.provider_id, result.model_id)
             if analysis.status == "SETUP_FOUND":
                 await save_signal(instrument_id, seeded.model_db_id, analysis)
             if user is not None:

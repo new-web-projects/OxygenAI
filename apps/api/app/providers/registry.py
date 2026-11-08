@@ -25,7 +25,13 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from ..observability import get_logger
-from .base import AIProvider, AnalysisContext, HealthResult, ProviderReasoning
+from .base import (
+    AIProvider,
+    AnalysisContext,
+    HealthResult,
+    ProviderNotConfiguredError,
+    ProviderReasoning,
+)
 from .circuit_breaker import CircuitBreakerOpen, get_circuit_breakers
 from .custom_ai_provider import custom_ai_provider
 from .gemma_provider import gemma_provider
@@ -211,11 +217,34 @@ async def execute_provider(
 
     `allow_fallback=False` is the comparison path: a failure must surface
     as that provider's own failure, not be papered over with mock.
+
+    A provider that is not configured is neither called nor recorded against
+    the breaker — "no key set" is a configuration state, not an outage. With
+    `allow_fallback` it degrades to mock exactly like any other unavailability;
+    without it, `ProviderNotConfiguredError` carries the real, specific reason.
     """
     breakers = get_circuit_breakers()
     provider = get_provider_strict(provider_id)
     model_id = configured_model_id(provider_id)
     started = time.perf_counter()
+
+    if not provider.is_configured():
+        missing = provider.missing_configuration()
+        if not allow_fallback:
+            raise ProviderNotConfiguredError(provider_id, missing)
+        logger.warning(
+            "falling back to mock; provider not configured",
+            extra={"provider": provider_id, "missing": missing},
+        )
+        reasoning = await mock_provider.reason(context)
+        return ExecutionResult(
+            provider_id="mock",
+            model_id="mock-v1",
+            source_tag="fallback",
+            reasoning=reasoning,
+            latency_ms=round((time.perf_counter() - started) * 1000, 2),
+            fell_back=True,
+        )
 
     try:
         await breakers.ensure_closed(provider_id)

@@ -260,9 +260,45 @@ def assess(
     """
     stop_loss = compute_stop_loss(entry, atr, direction, settings.atr_stop_multiple)
     risk_per_unit = abs(entry - stop_loss)
+
+    # A price cannot be zero or negative. With a volatile instrument the
+    # ATR-based stop of a LONG can land there (entry 10, ATR 8, 1.5x -> -2), and
+    # every other check passed it: "below entry" is true of -2. Reproduced
+    # before this guard: such a setup came back SETUP_FOUND with a negative stop.
+    if stop_loss <= 0:
+        return RiskAssessment(
+            direction=direction,
+            entry=entry,
+            stop_loss=stop_loss,
+            targets=[],
+            risk_per_unit=risk_per_unit,
+            reward_per_unit=0.0,
+            risk_reward=0.0,
+            position=PositionSize(
+                0, 0.0, 0.0, 0.0, settings.sizing_method, "Stop-loss is not a positive price"
+            ),
+            passes_min_rr=False,
+            passes_max_risk=False,
+            target_basis="none (stop-loss is not a positive price)",
+            rejected_reason=(
+                f"The ATR-based stop ({stop_loss:.2f}) would sit at or below zero — the stop "
+                "distance is too large relative to price to define a valid setup"
+            ),
+        )
+
     targets, target_basis = select_targets(
         entry, risk_per_unit, direction, settings, structural_level
     )
+
+    # The same applies to targets: a SHORT's 3R/4R target can be at or below
+    # zero on a volatile instrument, and "below entry" accepted it. A target
+    # price that cannot be reached is dropped; if none remain the setup is
+    # rejected rather than returned with an impossible first target.
+    positive_targets = [t for t in targets if t > 0]
+    if targets and len(positive_targets) != len(targets):
+        target_basis = f"{target_basis}; targets at or below zero dropped"
+    had_targets = bool(targets)
+    targets = positive_targets
 
     if not targets:
         return RiskAssessment(
@@ -277,7 +313,11 @@ def assess(
             passes_min_rr=False,
             passes_max_risk=False,
             target_basis=target_basis,
-            rejected_reason="Risk distance is zero — no target can be placed",
+            rejected_reason=(
+                "Every target price would be at or below zero — no reachable target exists"
+                if had_targets
+                else "Risk distance is zero — no target can be placed"
+            ),
         )
 
     reward_per_unit = abs(targets[0] - entry)

@@ -81,13 +81,34 @@ bearer token (Passage 4 §6.2). Setup, once per environment:
 python -c "import secrets; print(secrets.token_urlsafe(48))"   # -> JWT_SECRET=
 # DATABASE_URL=postgresql://...   (sessions live in Postgres)
 
-# 2. Apply every migration in order (0005 adds the session indexes)
+# 2. Apply every migration in order (0005 adds the session indexes; 0006 de-duplicates and
+#    constrains technical_indicators and repairs ai_models display names — idempotent)
 for f in ../../infra/migrations/000*.sql; do psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"; done
 
 # 3. Create the first admin — registration only ever yields the `user` role
 python -m app.cli create-admin --email you@example.com      # prompts for the password
 python -m app.cli set-role --email someone@example.com --role admin
 ```
+
+Operational behaviour added in P2 (Passage 1 §9, Passage 4 §5.2–§5.3):
+
+- **Retention.** Expired `sessions` rows and expired short-lived `memories` rows are
+  deleted by `app/db/retention.py` — every `RETENTION_INTERVAL_SECONDS` (default
+  3600, `0` disables) inside the API process, or on demand with
+  `python -m app.cli purge-expired`. `audit_logs` and `trade_results` are never
+  purged; long-term memory (`expires_at IS NULL`) is never purged.
+- **Audit trail.** Knowledge upload/delete, manual tool invocations and CLI role
+  changes write `audit_logs` rows (`db/audit.py`). Writes are best-effort and
+  never fail the action they describe. Note `audit_logs.actor_id` is
+  `ON DELETE RESTRICT` by specification, so an account that has an audit trail
+  cannot be hard-deleted.
+- **Error Center feed.** An unhandled exception returns `errorId`; the same id is
+  the `error_id` of a durable `error_logs` row (type, message, stack, route, user).
+- **Provider health history.** `POST /api/ai/{id}/test` and `GET /api/ai/{id}/health`
+  each append an `ai_health_checks` row (`ok` / `down`).
+- **Circuit breaker.** A provider that is simply *not configured* is no longer
+  counted as a failure, so it reports `not_configured` instead of drifting to
+  `circuit_open`.
 
 Roles: `admin` can upload/delete knowledge documents, call provider
 `/test` and `/health`, and use the tool endpoints; any signed-in user can

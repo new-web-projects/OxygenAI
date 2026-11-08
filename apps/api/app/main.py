@@ -46,7 +46,9 @@ from .config import load_env_files
 
 _loaded_env_files = load_env_files()
 
-from contextlib import asynccontextmanager
+import asyncio  # noqa: E402
+import contextlib  # noqa: E402
+from contextlib import asynccontextmanager  # noqa: E402
 
 from fastapi import FastAPI  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
@@ -83,6 +85,16 @@ async def _lifespan(app: FastAPI):
             "authenticated endpoint will return 401. Set JWT_SECRET (see apps/api/.env.example)."
         )
 
+    # Retention (db/retention.py): purge expired sessions/memories on a timer.
+    # Not started without a database or with RETENTION_INTERVAL_SECONDS <= 0.
+    from .db.client import is_db_configured
+    from .db.retention import retention_loop
+
+    retention_task: asyncio.Task | None = None
+    retention_interval = get_settings().retention_interval_seconds
+    if retention_interval > 0 and is_db_configured():
+        retention_task = asyncio.create_task(retention_loop(retention_interval))
+
     logger.info(
         "oxygen-ai api starting",
         extra={
@@ -94,9 +106,21 @@ async def _lifespan(app: FastAPI):
             "nativeLayerAvailable": native_status.available,
             "nativeLayerDetail": native_status.reason,
             "toolsRegistered": len(tool_registry.all()),
+            "retentionIntervalSeconds": retention_interval if retention_task else None,
         },
     )
-    yield
+    try:
+        yield
+    finally:
+        if retention_task is not None:
+            retention_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await retention_task
+        # Release the asyncpg pool's connections instead of leaving them to
+        # process exit (P2: `close_pool()` previously had no caller in the server).
+        from .db.client import close_pool
+
+        await close_pool()
 
 
 app = FastAPI(title="Oxygen AI API Gateway", version="0.3.0", lifespan=_lifespan)

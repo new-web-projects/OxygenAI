@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 
+from ..db.health import record_health_check
 from ..errors import NotFoundError
 from ..providers.registry import (
     describe_route,
@@ -95,6 +96,11 @@ async def test_provider(provider_id: str) -> HealthResponse:
     from ..providers.registry import get_provider_strict
 
     result = await get_provider_strict(provider_id).health_check()
+    # Passage 1 §9.1: probe history is persisted for the monitoring dashboard.
+    # Best-effort — the probe result below is returned either way.
+    await record_health_check(
+        provider_id, result.model_checked, result.ok, result.latency_ms, result.detail
+    )
     return HealthResponse(
         ok=result.ok,
         latencyMs=result.latency_ms,

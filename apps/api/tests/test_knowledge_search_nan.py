@@ -80,6 +80,9 @@ async def admin(client, pool):
     )
     yield {"Authorization": f"Bearer {registered.json()['accessToken']}"}
     await pool.execute("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE email = $1)", email)
+    await pool.execute(
+        "DELETE FROM audit_logs WHERE actor_id IN (SELECT id FROM users WHERE email = $1)", email
+    )
     await pool.execute("DELETE FROM users WHERE email = $1", email)
 
 

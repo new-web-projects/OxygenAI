@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile
 
+from ..db.audit import record_audit
 from ..errors import NotFoundError, ValidationError
 from ..rag.chunking import UnsupportedFileTypeError, extract_text
 from ..rag.pipeline import NoIndexableContentError, ingest_text, retrieve
@@ -43,6 +44,12 @@ async def upload_text(
         result = await ingest_text(body.title, body.content, body.sourceType, uploaded_by=user.id)
     except NoIndexableContentError as err:
         raise ValidationError(str(err)) from err
+    await record_audit(
+        actor_id=user.id,
+        action="knowledge.upload",
+        resource=f"knowledge_document:{result.document_id}",
+        after={"title": body.title, "sourceType": body.sourceType, "chunkCount": result.chunk_count},
+    )
     return {
         "documentId": result.document_id,
         "chunkCount": result.chunk_count,
@@ -71,6 +78,17 @@ async def upload_file(
         result = await ingest_text(title, text, sourceType, uploaded_by=user.id)
     except NoIndexableContentError as err:
         raise ValidationError(str(err)) from err
+    await record_audit(
+        actor_id=user.id,
+        action="knowledge.upload",
+        resource=f"knowledge_document:{result.document_id}",
+        after={
+            "title": title,
+            "sourceType": sourceType,
+            "filename": file.filename,
+            "chunkCount": result.chunk_count,
+        },
+    )
     return {
         "documentId": result.document_id,
         "chunkCount": result.chunk_count,
@@ -116,4 +134,7 @@ async def delete_knowledge_document(
     deleted = await delete_document(document_id)
     if not deleted:
         raise NotFoundError(f"No knowledge document with id '{document_id}'")
+    await record_audit(
+        actor_id=user.id, action="knowledge.delete", resource=f"knowledge_document:{document_id}"
+    )
     return {"ok": True}
