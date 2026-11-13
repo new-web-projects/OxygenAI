@@ -206,6 +206,17 @@ class Settings:
     retention_interval_seconds: float = field(
         default_factory=lambda: _env_float("RETENTION_INTERVAL_SECONDS", 3600.0)
     )
+    # How often the process re-reads what admins manage in Postgres (model registry, provider
+    # settings, circuit-breaker thresholds). A change made on THIS instance is applied at once;
+    # other instances pick it up within this interval. 0 or negative disables the refresh.
+    runtime_config_refresh_seconds: float = field(
+        default_factory=lambda: _env_float("RUNTIME_CONFIG_REFRESH_SECONDS", 30.0)
+    )
+    # Periodic poll of the vendors' model lists (Passage 4 §3.2 / G02g). 0 disables it; the
+    # catch-a-4xx path is always on, and an admin can run the poll on demand.
+    model_availability_interval_seconds: float = field(
+        default_factory=lambda: _env_float("MODEL_AVAILABILITY_INTERVAL_SECONDS", 21600.0)
+    )
 
     circuit_breaker: CircuitBreakerSettings = field(default_factory=CircuitBreakerSettings)
     risk: RiskSettings = field(default_factory=RiskSettings)

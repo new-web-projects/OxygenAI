@@ -58,9 +58,20 @@ from ..observability import get_logger
 from ..providers.base import AnalysisContext
 from ..providers.circuit_breaker import CircuitBreakerOpen
 from ..providers.model_registry import configured_model_id
-from ..providers.registry import execute_provider, resolve_provider
+from ..providers.registry import (
+    execute_provider,
+    provider_unavailability_reason,
+    resolve_provider,
+)
 from ..rag.pipeline import retrieve as retrieve_knowledge
-from ..schemas import AnalyzeRequest, ComparisonResponse, ComparisonSlotOk, TradeAnalysis, now_iso
+from ..schemas import (
+    AnalyzeRequest,
+    CompareRequest,
+    ComparisonResponse,
+    ComparisonSlotOk,
+    TradeAnalysis,
+    now_iso,
+)
 from ..security.dependencies import AuthenticatedUser, get_analysis_user
 from ..utils import compute_freshness
 from ..verify import build_trade_analysis
@@ -99,6 +110,38 @@ async def get_or_refresh_bars(symbol: str):
 
 @router.post("/api/ai/analyze")
 async def analyze(body: AnalyzeRequest, user: AuthenticatedUser | None = Depends(get_analysis_user)):
+    return await _run_analysis(body, user)
+
+
+@router.post("/api/ai/compare")
+async def compare(
+    body: CompareRequest, user: AuthenticatedUser | None = Depends(get_analysis_user)
+) -> ComparisonResponse:
+    """
+    Passage 1 §10: "POST /api/ai/compare — Updated to accept 2 or 3 provider_id values instead of
+    an implicit pair; reads/writes the corrected ai_comparisons + ai_comparison_results shape."
+
+    A separately specified, named endpoint, so it exists as one — but it is the same code path as
+    `POST /api/ai/analyze` with `mode: "multi"` (same engine run, same providers, same scoring,
+    same persistence, same auth and rate-limit bucket), so the two cannot drift apart.
+    """
+    request = AnalyzeRequest(
+        symbol=body.symbol,
+        mode="multi",
+        providers=body.providers,
+        timeframe=body.timeframe,
+        accountEquity=body.accountEquity,
+        maxRiskPerTradePct=body.maxRiskPerTradePct,
+        useKnowledge=body.useKnowledge,
+    )
+    result = await _run_analysis(request, user)
+    assert isinstance(result, ComparisonResponse)
+    return result
+
+
+async def _run_analysis(
+    body: AnalyzeRequest, user: AuthenticatedUser | None
+) -> TradeAnalysis | ComparisonResponse:
     symbol = body.symbol.upper()
     bars, instrument_id, persisted = await get_or_refresh_bars(symbol)
 
@@ -246,7 +289,9 @@ async def analyze(body: AnalyzeRequest, user: AuthenticatedUser | None = Depends
         )
 
     # ---- Single-provider mode ----
-    provider = resolve_provider(body.single_provider_id())
+    requested_id = body.single_provider_id()
+    substitution_reason = provider_unavailability_reason(requested_id)
+    provider = resolve_provider(requested_id)
     context = AnalysisContext(
         symbol=symbol,
         indicators=engine_output.indicators,
@@ -267,6 +312,20 @@ async def analyze(body: AnalyzeRequest, user: AuthenticatedUser | None = Depends
     except Exception as err:  # noqa: BLE001
         raise ProviderUnavailableError(f"Provider call failed: {err}") from err
 
+    # Tell the caller when someone other than the requested provider answered (P3): before this,
+    # an unconfigured/failed Grok came back as a normal-looking mock result and only comparing the
+    # `provider` field to what was asked revealed it.
+    warnings = list(engine_output.warnings)
+    substituted = result.provider_id != requested_id
+    if substituted:
+        why = result.fallback_reason or substitution_reason or "it was unavailable"
+        warnings.append(
+            f"Requested provider '{requested_id}' was not used: {why}. "
+            f"This analysis was produced by '{result.provider_id}' instead."
+        )
+    if result.model_note:
+        warnings.append(result.model_note)
+
     analysis: TradeAnalysis = build_trade_analysis(
         engine_output.indicators,
         result.reasoning,
@@ -280,9 +339,11 @@ async def analyze(body: AnalyzeRequest, user: AuthenticatedUser | None = Depends
         regime=engine_output.regime,
         structure=engine_output.structure,
         transport=result.source_tag,  # type: ignore[arg-type]
-        engine_warnings=engine_output.warnings,
+        engine_warnings=warnings,
         knowledge_sources=knowledge_sources,
     )
+    if substituted:
+        analysis = analysis.model_copy(update={"requestedProvider": requested_id})
 
     if persisted and instrument_id:
         try:

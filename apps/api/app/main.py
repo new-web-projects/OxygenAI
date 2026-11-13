@@ -57,7 +57,7 @@ from .config import get_settings  # noqa: E402
 from .errors import install_error_handlers  # noqa: E402
 from .observability import RequestContextMiddleware, configure_logging, get_logger  # noqa: E402
 from .rate_limit import RateLimitMiddleware  # noqa: E402
-from .routers import analyze, auth, comparisons, knowledge, providers, tools  # noqa: E402
+from .routers import analyze, auth, comparisons, knowledge, models, providers, tools  # noqa: E402
 
 settings = get_settings()
 configure_logging(level=settings.log_level, json_output=settings.log_json)
@@ -85,15 +85,32 @@ async def _lifespan(app: FastAPI):
             "authenticated endpoint will return 401. Set JWT_SECRET (see apps/api/.env.example)."
         )
 
-    # Retention (db/retention.py): purge expired sessions/memories on a timer.
-    # Not started without a database or with RETENTION_INTERVAL_SECONDS <= 0.
     from .db.client import is_db_configured
     from .db.retention import retention_loop
+    from .providers.availability import availability_loop
+    from .providers.runtime_config import reload_runtime_config, runtime_config_loop
 
-    retention_task: asyncio.Task | None = None
-    retention_interval = get_settings().retention_interval_seconds
-    if retention_interval > 0 and is_db_configured():
-        retention_task = asyncio.create_task(retention_loop(retention_interval))
+    # What the database controls (model registry, provider settings, breaker thresholds) is loaded
+    # into memory before the first request, seeding the model catalogue into an empty/older
+    # database. A failure is reported and logged, never fatal: the process serves from the
+    # built-in catalogue and environment defaults until the next refresh succeeds.
+    runtime_report = await reload_runtime_config(seed=True) if is_db_configured() else None
+
+    # Background jobs — each only with a database, and each disabled by setting its interval to 0:
+    #   retention         purge expired sessions/memories             (db/retention.py)
+    #   runtime-config    re-read admin-managed configuration         (providers/runtime_config.py)
+    #   model-availability poll the vendors' model lists (G02g)       (providers/availability.py)
+    jobs: dict[str, asyncio.Task] = {}
+    cfg = get_settings()
+    if is_db_configured():
+        if cfg.retention_interval_seconds > 0:
+            jobs["retention"] = asyncio.create_task(retention_loop(cfg.retention_interval_seconds))
+        if cfg.runtime_config_refresh_seconds > 0:
+            jobs["runtime-config"] = asyncio.create_task(runtime_config_loop(cfg.runtime_config_refresh_seconds))
+        if cfg.model_availability_interval_seconds > 0:
+            jobs["model-availability"] = asyncio.create_task(
+                availability_loop(cfg.model_availability_interval_seconds)
+            )
 
     logger.info(
         "oxygen-ai api starting",
@@ -106,16 +123,18 @@ async def _lifespan(app: FastAPI):
             "nativeLayerAvailable": native_status.available,
             "nativeLayerDetail": native_status.reason,
             "toolsRegistered": len(tool_registry.all()),
-            "retentionIntervalSeconds": retention_interval if retention_task else None,
+            "backgroundJobs": sorted(jobs),
+            "runtimeConfig": runtime_report,
         },
     )
     try:
         yield
     finally:
-        if retention_task is not None:
-            retention_task.cancel()
+        for task in jobs.values():
+            task.cancel()
+        for task in jobs.values():
             with contextlib.suppress(asyncio.CancelledError):
-                await retention_task
+                await task
         # Release the asyncpg pool's connections instead of leaving them to
         # process exit (P2: `close_pool()` previously had no caller in the server).
         from .db.client import close_pool
@@ -159,5 +178,6 @@ app.include_router(auth.router)
 app.include_router(analyze.router)
 app.include_router(comparisons.router)
 app.include_router(providers.router)
+app.include_router(models.router)
 app.include_router(tools.router)
 app.include_router(knowledge.router)

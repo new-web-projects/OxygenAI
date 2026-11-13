@@ -88,6 +88,13 @@ class RateLimitedError(ApiError):
     code = "rate_limited"
 
 
+class ConflictError(ApiError):
+    """The request is valid but conflicts with the current state (duplicate model, model in use)."""
+
+    status_code = status.HTTP_409_CONFLICT
+    code = "conflict"
+
+
 class MarketDataUnavailableError(ApiError):
     """Passage 4 §6.2: 409 — the engine returns NO_VALID_SETUP rather than an HTTP error."""
 

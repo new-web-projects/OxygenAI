@@ -39,7 +39,9 @@ class MockProvider:
             transport="local_model",
         )
 
-    async def reason(self, context: AnalysisContext) -> ProviderReasoning:
+    async def reason(
+        self, context: AnalysisContext, model_id: str | None = None
+    ) -> ProviderReasoning:
         indicators = context.indicators
         regime = (context.regime or {}).get("regime", "unknown")
         structure = context.structure or {}

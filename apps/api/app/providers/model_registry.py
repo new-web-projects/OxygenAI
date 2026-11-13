@@ -19,9 +19,16 @@ Two concrete requirements implemented here that did not exist before:
 2. Status automation hook (G02g). Passage 4 asks for "an admin job that
    periodically calls the models endpoint (or catches a 4xx 'model not
    found') and flips status automatically, with an alert, rather than
-   relying on manual upkeep." `mark_model_retired()` is the catch-a-4xx
-   half, wired into the providers; the periodic-poll half is exposed as
-   an admin endpoint since this deployment has no scheduler yet.
+   relying on manual upkeep." `mark_model_retired()` is the in-memory half
+   of the catch-a-4xx path; `providers/lifecycle.py` wraps it with the
+   database write and the persisted alert, and `providers/availability.py`
+   is the periodic models-endpoint poll (plus an admin endpoint to run it now).
+
+3. Database as system of record (P3). Once `load_rows()` has been called
+   (at startup and on every admin write, `providers/runtime_config.py`) the
+   entries come from `ai_models`; this module's catalogue is then only the
+   seed that `sync_catalogue()` offers to an empty or older database. Before a
+   database is configured the catalogue is used as-is, exactly as before.
 
    `grok-code-fast-1` (G02e) is listed as explicitly non-routable for
    trading analysis rather than omitted, so a future config change
@@ -35,8 +42,8 @@ named, typed, or exposed as "Gemini".
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
-from typing import Literal
+from dataclasses import dataclass, field, replace
+from typing import Any, Literal
 
 from ..observability import get_logger
 
@@ -45,6 +52,15 @@ logger = get_logger("providers.registry")
 ModelStatus = Literal[
     "active", "disabled", "deprecated", "retired", "local", "hosted", "fallback"
 ]
+
+# Which statuses the router may actually call. Single definition, imported by
+# db/models.py so the registry and the database constraints cannot drift.
+#   active | hosted | local  — callable; may be a provider's default
+#   fallback                 — callable only as the provider's fallback model
+#   deprecated               — still resolvable if explicitly selected, never auto-selected
+#   disabled | retired       — never called
+DEFAULT_ELIGIBLE: tuple[str, ...] = ("active", "hosted", "local")
+FALLBACK_ELIGIBLE: tuple[str, ...] = ("active", "hosted", "local", "fallback")
 
 # Passage 1 §4.5 / §9.1: the expanded seven-value enum, explicit rather
 # than inferred from other columns.
@@ -77,6 +93,8 @@ class ModelEntry:
     # Models that exist but must never serve trading analysis (G02e).
     routable_for_analysis: bool = True
     notes: str = ""
+    # ai_models.id when this entry was loaded from the database.
+    db_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -182,8 +200,46 @@ class ModelRegistry:
 
     def __init__(self) -> None:
         self._entries: dict[tuple[str, str], ModelEntry] = {}
+        self.loaded_from_db = False
+        self._load_catalogue()
+
+    def _load_catalogue(self) -> None:
+        self._entries = {}
         for entry in _GROK_MODELS + _GEMMA_MODELS + _CUSTOM_MODELS + _MOCK_MODELS:
-            self._entries[(entry.provider_id, entry.model_id)] = entry
+            # Copies: a registry instance must never mutate the module-level seed lists.
+            self._entries[(entry.provider_id, entry.model_id)] = replace(entry)
+
+    def catalogue_entries(self) -> list[ModelEntry]:
+        """The built-in seed catalogue (never the live state)."""
+        return [replace(e) for e in _GROK_MODELS + _GEMMA_MODELS + _CUSTOM_MODELS + _MOCK_MODELS]
+
+    def load_rows(self, rows: list[Any]) -> None:
+        """
+        Replace the in-memory state with the database's (`db.models.ModelRow` objects). Done in
+        one assignment so a concurrent reader sees the old state or the new one, never a mixture.
+        """
+        entries: dict[tuple[str, str], ModelEntry] = {}
+        for r in rows:
+            cfg = r.config or {}
+            entries[(r.provider, r.model_id)] = ModelEntry(
+                provider_id=r.provider,
+                model_id=r.model_id,
+                display_name=r.display_name,
+                status=r.status,
+                context_window=r.context_window,
+                input_modalities=list(r.input_modalities),
+                output_modalities=list(r.output_modalities),
+                is_default=r.is_default,
+                is_fallback=r.is_fallback,
+                online_capable=r.online_capable,
+                offline_capable=r.offline_capable,
+                redirects_to=cfg.get("redirectsTo"),
+                routable_for_analysis=bool(cfg.get("routableForAnalysis", True)),
+                notes=str(cfg.get("notes") or cfg.get("retiredReason") or ""),
+                db_id=r.id,
+            )
+        self._entries = entries
+        self.loaded_from_db = True
 
     def all(self, provider_id: str | None = None) -> list[ModelEntry]:
         values = list(self._entries.values())
@@ -196,15 +252,30 @@ class ModelRegistry:
 
     def default_model_id(self, provider_id: str) -> str | None:
         for entry in self._entries.values():
-            if entry.provider_id == provider_id and entry.is_default:
+            if (
+                entry.provider_id == provider_id
+                and entry.is_default
+                and entry.status in DEFAULT_ELIGIBLE
+                and entry.routable_for_analysis
+            ):
                 return entry.model_id
         return None
 
     def fallback_model_id(self, provider_id: str) -> str | None:
         for entry in self._entries.values():
-            if entry.provider_id == provider_id and entry.is_fallback:
+            if (
+                entry.provider_id == provider_id
+                and entry.is_fallback
+                and entry.status in FALLBACK_ELIGIBLE
+                and entry.routable_for_analysis
+            ):
                 return entry.model_id
         return None
+
+    def fallback_for(self, provider_id: str, *, excluding: str) -> str | None:
+        """The provider's fallback model, unless it is the very model being replaced."""
+        candidate = self.fallback_model_id(provider_id)
+        return candidate if candidate and candidate != excluding else None
 
     def resolve_model_slug(self, provider_id: str, model_id: str) -> tuple[str, str | None]:
         """
@@ -258,6 +329,7 @@ class ModelRegistry:
         """
         entry = self.get(provider_id, model_id)
         fallback = self.fallback_model_id(provider_id) or self.default_model_id(provider_id)
+        was_default = bool(entry and entry.is_default)
         if entry is None:
             entry = ModelEntry(
                 provider_id=provider_id,
@@ -271,8 +343,23 @@ class ModelRegistry:
         else:
             entry.status = "retired"
             entry.notes = reason
+            entry.is_default = False
+            entry.is_fallback = False
             if entry.redirects_to is None and fallback and fallback != model_id:
                 entry.redirects_to = fallback
+        if was_default:
+            # Same rule the database applies (db/models.py::_repair_defaults): the provider's
+            # fallback takes over as default, and the fallback slot is left empty.
+            for candidate in self._entries.values():
+                if (
+                    candidate.provider_id == provider_id
+                    and candidate.is_fallback
+                    and candidate.status in FALLBACK_ELIGIBLE
+                ):
+                    candidate.is_default, candidate.is_fallback = True, False
+                    if candidate.status == "fallback":
+                        candidate.status = "active"  # a default is no longer "callable only as fallback"
+                    break
         logger.warning(
             "model marked retired by the registry-automation hook",
             extra={"provider": provider_id, "model": model_id, "reason": reason},
@@ -282,12 +369,31 @@ class ModelRegistry:
 
 _registry: ModelRegistry | None = None
 
+_MODEL_ENV = {"grok": "GROK_MODEL_ID", "gemma": "GEMMA_MODEL_ID", "custom": "CUSTOM_AI_MODEL_ID"}
+
 
 def get_model_registry() -> ModelRegistry:
     global _registry
     if _registry is None:
         _registry = ModelRegistry()
     return _registry
+
+
+def reset_model_registry_for_tests() -> None:
+    global _registry
+    _registry = None
+
+
+def model_selection_source(provider_id: str) -> str:
+    """
+    Where the provider's current model comes from: an environment variable (which
+    wins whenever it is set — operator-level pinning) or the registry's default. Surfaced
+    on GET /api/ai/providers so an admin can see why changing the default has no effect.
+    """
+    env_key = _MODEL_ENV.get(provider_id)
+    if env_key and os.environ.get(env_key, "").strip():
+        return "environment"
+    return "registry"
 
 
 def configured_model_id(provider_id: str) -> str:
@@ -305,10 +411,12 @@ def configured_model_id(provider_id: str) -> str:
     requested = os.environ.get(env_key, "").strip() if env_key else ""
     if not requested:
         requested = registry.default_model_id(provider_id) or "unset"
-        if provider_id == "custom":
-            # Custom AI has no vendor catalogue — its model id is
-            # whatever the owner configured, and "unset" is honest.
-            return os.environ.get("CUSTOM_AI_MODEL_ID", "unset").strip() or "unset"
+        if provider_id == "custom" and requested in ("unset", "custom-configured"):
+            # Custom AI has no vendor catalogue — its model id is whatever the
+            # owner configured (here: neither the env var nor an admin-created
+            # registry entry), and "unset" is honest. "custom-configured" is only
+            # the catalogue's display placeholder, never a real model id.
+            return "unset"
     effective, note = registry.resolve_model_slug(provider_id, requested)
     if note:
         logger.warning(

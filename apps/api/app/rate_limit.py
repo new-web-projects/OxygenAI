@@ -80,11 +80,13 @@ def _limit_for_path(path: str, settings: RateLimitSettings) -> tuple[str, int]:
     """Returns (bucket_name, requests_per_minute) for a request path."""
     if path in ("/api/auth/login", "/api/auth/register"):
         return "auth", settings.auth_per_minute
-    if path.startswith("/api/ai/analyze"):
+    if path.startswith("/api/ai/analyze") or path.startswith("/api/ai/compare"):
         return "analyze", settings.analyze_per_minute
     if (
         path.startswith("/api/ai/models")
         or path.startswith("/api/ai/route")
+        or path.startswith("/api/ai/circuit-breaker")
+        or path.startswith("/api/ai/providers/")  # administration; the bare list stays public
         or _PROVIDER_PROBE.match(path)
     ):
         return "admin", settings.admin_per_minute

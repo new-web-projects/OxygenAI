@@ -116,7 +116,7 @@ async def test_a_real_provider_failure_still_trips_the_breaker(monkeypatch):
 
     monkeypatch.setenv("XAI_API_KEY", "test-key-not-real")
 
-    async def boom(self, context):  # noqa: ANN001
+    async def boom(self, context, model_id=None):  # noqa: ANN001
         raise RuntimeError("upstream 503")
 
     monkeypatch.setattr(GrokProvider, "reason", boom)

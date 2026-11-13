@@ -456,7 +456,7 @@ def custom_provider_online(monkeypatch):
     monkeypatch.setenv("CUSTOM_AI_MODEL_ID", "zzp2-custom-model")
     monkeypatch.delenv("CUSTOM_AI_API_KEY", raising=False)
 
-    async def reason(self, context):  # noqa: ANN001
+    async def reason(self, context, model_id=None):  # noqa: ANN001
         return ProviderReasoning(direction=None, confidence=None, reasoning_summary="declined", supporting_evidence=[])
 
     monkeypatch.setattr(CustomAIProvider, "reason", reason)
@@ -503,7 +503,7 @@ async def test_a_fallback_never_renames_the_mock_model_row(client, accounts, poo
 
     monkeypatch.setenv("XAI_API_KEY", "zzp2-not-a-real-key")
 
-    async def broken(self, context):  # noqa: ANN001
+    async def broken(self, context, model_id=None):  # noqa: ANN001
         raise RuntimeError("upstream unavailable")
 
     monkeypatch.setattr(GrokProvider, "reason", broken)

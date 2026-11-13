@@ -47,6 +47,26 @@ class ProviderNotConfiguredError(RuntimeError):
         super().__init__(f"'{provider_id}' is not configured. Missing: {detail}")
 
 
+class ProviderDisabledError(RuntimeError):
+    """An administrator disabled the provider (`ai_providers.enabled = false`). Like a missing
+    configuration it is a state, not a failure, and never feeds the circuit breaker."""
+
+    def __init__(self, provider_id: str) -> None:
+        self.provider_id = provider_id
+        super().__init__(f"'{provider_id}' has been disabled by an administrator")
+
+
+class ProviderNoModelError(RuntimeError):
+    """The registry has no callable model for the provider (all retired/disabled, or none set)."""
+
+    def __init__(self, provider_id: str) -> None:
+        self.provider_id = provider_id
+        super().__init__(
+            f"'{provider_id}' has no usable model in the registry "
+            "(every model is retired or disabled, or none is configured)"
+        )
+
+
 @dataclass
 class AnalysisContext:
     symbol: str
@@ -95,6 +115,11 @@ class AIProvider(Protocol):
 
     def missing_configuration(self) -> list[str]: ...
 
-    async def reason(self, context: AnalysisContext) -> ProviderReasoning: ...
+    # `model_id` is passed ONLY when the router substitutes the provider's fallback model
+    # (providers/registry.py); a normal call is `reason(context)` and the provider picks its
+    # own configured model.
+    async def reason(
+        self, context: AnalysisContext, model_id: str | None = None
+    ) -> ProviderReasoning: ...
 
     async def health_check(self) -> HealthResult: ...

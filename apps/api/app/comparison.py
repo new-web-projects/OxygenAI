@@ -32,7 +32,12 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-from .providers.base import AnalysisContext, ProviderNotConfiguredError
+from .providers.base import (
+    AnalysisContext,
+    ProviderDisabledError,
+    ProviderNoModelError,
+    ProviderNotConfiguredError,
+)
 from .providers.circuit_breaker import CircuitBreakerOpen
 from .providers.registry import execute_provider
 from .schemas import (
@@ -85,6 +90,10 @@ def _classify_failure(provider_id: str, err: BaseException) -> ComparisonSlotUna
         return ComparisonSlotUnavailable(
             providerId=provider_id, reason=str(err), reasonCode="not_configured"
         )
+    if isinstance(err, ProviderDisabledError):
+        return ComparisonSlotUnavailable(providerId=provider_id, reason=str(err), reasonCode="disabled")
+    if isinstance(err, ProviderNoModelError):
+        return ComparisonSlotUnavailable(providerId=provider_id, reason=str(err), reasonCode="no_model")
     if isinstance(err, KeyError):
         return ComparisonSlotUnavailable(
             providerId=provider_id, reason=str(err), reasonCode="unknown_provider"
@@ -137,6 +146,7 @@ async def _run_one(
         regime=regime_info,
         structure=structure_info,
         transport=result.source_tag,  # type: ignore[arg-type]
+        engine_warnings=[result.model_note] if result.model_note else None,
         knowledge_sources=knowledge_sources,
     )
     slot = ComparisonSlotOk(

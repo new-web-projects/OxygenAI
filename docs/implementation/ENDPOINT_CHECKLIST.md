@@ -11,7 +11,7 @@ Rate-limit buckets (`app/rate_limit.py`, per user when authenticated, else per v
 client IP): `auth` 10/min · `analyze` 30/min · `admin` 60/min (models, route, provider
 test/health) · `default` 120/min.
 
-## A. Implemented (18 routes)
+## A. Implemented (18 routes in P1/H1/P2, +15 in P3 — see A2)
 
 | Method · Path | Request → Response | Authn / Authz | Validation & errors | Persistence · deps | Status · Tests |
 |---|---|---|---|---|---|
@@ -26,8 +26,8 @@ test/health) · `default` 120/min.
 | POST `/api/ai/route` | `RouteRequest{mode?, provider?, providers?, allowFallback}` → `RouteResponse{mode, decisions[]}` | JWT (any role) · `admin` bucket | 400 | registry + breaker (no execution) | Done · integration ✔ |
 | GET `/api/ai/tools` | — → tool list | JWT + **admin** | 401/403 | `tool_registry` | Done · registry-level tests (HTTP test → P6) |
 | POST `/api/ai/tools/{name}/invoke` | tool input → tool output | JWT + **admin** | 404 unknown tool. Tool failures are **HTTP 200** with the outcome in the body: `{tool, status: ok\|error\|timeout, output, error, latencyMs, available}`; runs as `provider_id="custom"` for permission checks | `tool_calls`; `audit_logs` row `tool.invoke` (P2 ✔) | Done · registry-level ✔, audit ✔ (HTTP test → P6) |
-| POST `/api/ai/{provider_id}/test` | — → `HealthResponse{ok, latencyMs, modelChecked, detail, transport}` | JWT + **admin** · `admin` bucket | 404 unknown provider | provider call; `ai_health_checks` row (P2 ✔) | Done* · admin gating ✔. *P4 §6.2 wants `{ok, latency_ms, model_checked}` → snake_case alias in P3 |
-| GET `/api/ai/{provider_id}/health` | — → `HealthResponse` | JWT + **admin** · `admin` bucket | as above | provider call; writes an `ai_health_checks` row (P2 ✔, `ok`/`down`) | Done* · same note |
+| POST `/api/ai/{provider_id}/test` | — → `HealthResponse{ok, latencyMs, modelChecked, latency_ms, model_checked, detail, transport}` (both spellings, always equal) | JWT + **admin** · `admin` bucket | 404 unknown provider | provider call; `ai_health_checks` row (P2 ✔) | Done · admin gating ✔; P4 §6.2's `{ok, latency_ms, model_checked}` ✔ (P3); a probe also feeds the router's per-model health (P3) |
+| GET `/api/ai/{provider_id}/health` | — → `HealthResponse` | JWT + **admin** · `admin` bucket | as above | provider call; writes an `ai_health_checks` row (P2 ✔, `ok`/`down`) | Done · same; hosted+local Gemma health detail → P4 |
 | POST `/api/knowledge/upload` | `KnowledgeUploadRequest{title, content, sourceType}` → `{documentId, chunkCount, embeddingModel, skippedChunks}` | JWT + **admin** | 400 invalid **or nothing indexable** (e.g. only punctuation/emoji; the document is stored as `failed`) · 403 | `knowledge_documents/chunks`, `embeddings` (never a zero vector); `audit_logs` row `knowledge.upload` (P2 ✔) | Done · authz ✔, H1 regression ✔, audit ✔ |
 | POST `/api/knowledge/upload/file` | multipart PDF/TXT/CSV | JWT + **admin** | 400 unsupported · size limit (**reads whole file before checking** → P9) | same; `audit_logs` row `knowledge.upload` (P2 ✔) | Done · authz ✔, audit ✔ |
 | POST `/api/knowledge/search` | `KnowledgeSearchRequest{query, topK}` → `KnowledgeChunkResponse[]` (`score` is a finite number, enforced by the schema) | JWT (any role) | 400 · a query with no letters/digits returns `[]` (200) | pgvector; rows with undefined similarity are never returned | Done · authz ✔, H1 regression ✔ |
@@ -40,15 +40,33 @@ HTTP 409 when the engine cannot run at all (too few / invalid bars) and returns 
 `NO_VALID_SETUP` when the engine ran but verification failed. Kept as-is; to be revisited in P7,
 when real market-data adapters make "stale vs unavailable" a first-class distinction.
 
+## A2. Implemented in P3 (admin-only unless stated; every write → `audit_logs`)
+
+| Method · Path | Request → response | Auth · bucket | Errors | Persistence | Status |
+|---|---|---|---|---|---|
+| GET `/api/ai/models[?provider=]` | → `ModelResponse[]` | admin · `admin` | 400 unknown provider | `ai_models` | Done · authz matrix ✔ |
+| POST `/api/ai/models` | `ModelCreateRequest` → **201** `ModelResponse` | admin | 400 validation / unknown provider · 409 duplicate | `ai_models`; audit `model.create`; registry reloaded | Done · tests ✔ |
+| GET `/api/ai/models/{id}` | → `ModelResponse` | admin | 404 (incl. non-uuid) | — | Done |
+| PATCH `/api/ai/models/{id}` | partial `ModelUpdateRequest` (`config` is **merged**) → `ModelResponse` | admin | 400 empty / null / contradiction · 404 · 409 concurrent default change | audit `model.update` (before + after) | Done · tests ✔ |
+| DELETE `/api/ai/models/{id}` | → `{ok, id}` | admin | 404 · **409 if the model has history** (lists the referencing tables; retire it instead) | audit `model.delete` | Done · tests ✔ |
+| POST `/api/ai/models/sync-catalogue[?force=true]` | → `{offered[], force}` | admin | — | `ai_models`, `system_settings.model_catalogue_seeded`; audit | Done |
+| POST `/api/ai/models/availability-check` | → per-provider `{checked, modelsOffered, retired[], skippedReason}` | admin | — | retirements → `ai_models` + `error_logs` alert + `audit_logs` | Done · **mock-tested only** (no vendor list endpoint reachable) |
+| PATCH `/api/ai/providers/{id}` | `{enabled?, priority?}` | admin | 400 · 404 | `ai_providers`; audit `provider.update` | Done · tests ✔ |
+| GET `/api/ai/providers/{id}/settings` | → effective values **and where each comes from**; never the key | admin | 404 · 400 (`mock`) | — | Done · tests ✔ |
+| PATCH `/api/ai/providers/{id}/settings` | `{apiKey?, baseUrl?, timeoutMs?, retryCount?, region?}` — absent = untouched, `null` = clear | admin | 400/422 · 404 · **503 `not_configured` without `SETTINGS_ENCRYPTION_KEY`** | `ai_provider_settings` (key encrypted); audit **without** the secret | Done · tests ✔ |
+| GET `/api/ai/circuit-breaker` | → thresholds + live per-provider state | admin | — | `system_settings` | Done |
+| PUT `/api/ai/circuit-breaker/settings` | `BreakerSettingsRequest` (omitted = env default) | admin | 400/422 | `system_settings['circuit_breaker']`; applied live; audit | Done · tests ✔ |
+| DELETE `/api/ai/circuit-breaker/settings` | → effective view | admin | — | removes the override; audit | Done |
+| POST `/api/ai/circuit-breaker/{id}/reset` | → `{providerId, state}` | admin | 404 | audit | Done |
+| POST `/api/ai/compare` | `CompareRequest{symbol, providers[2–3] (alias `provider_ids`), …}` → `ComparisonResponse` | JWT (`AUTH_REQUIRED`) · `analyze` | 400/422 · 401 | **same code path as analyze `mode:"multi"`** | Done · parity test ✔ |
+
 ## B. Required by Passage 1/4 but not yet implemented
 
 | Method · Path | Source | Spec detail | Phase |
 |---|---|---|---|
-| GET/POST/PATCH/DELETE `/api/ai/models` | P1 §10, P4 §6.2 | CRUD over `ai_models`, admin RBAC, **every write → `audit_logs`**, 7-value status enum | P3 |
-| POST `/api/ai/compare` | P1 §10 | accepts 2–3 `provider_id`; writes `ai_comparisons` + `ai_comparison_results` | P3 |
-| POST `/api/ai/gemma/test`, GET `/api/ai/gemma/health` | P1 §10 | generic routes already serve the *path*; add `{ok, latency_ms, model_checked}` and hosted+local health backed by `ai_health_checks` | P3/P4 |
+| GET `/api/ai/gemma/health` (hosted **and** local-runtime health) | P1 §10 | `{ok, latency_ms, model_checked}` ✔ and `ai_health_checks` ✔ (P2/P3); reporting hosted and local transports separately needs the P4 runtime config | P4 |
 | Custom AI test/health | P4 §6.3 category | same generic routes; local-runtime detail | P4 |
-| Provider settings read/write | P1 §4.4.1 | the 14 local-runtime admin fields, timeouts, retries, fallback model | P3/P4 |
+| Provider settings — the 14 local-runtime fields | P1 §4.4.1 | model path, runtime, host, port, quantization, GPU/CPU, context, offline toggle, resource display… (API key, base URL, timeout, retries, fallback model are done — P3) | P4 |
 | Market Data (quotes, history, instruments) | P4 §6.3 | via adapter abstraction | P7 |
 | Indicators (list/compute; custom-indicator CRUD + test) | P4 §6.3, G01b | constrained expression tree; backtest-before-enable | P8 |
 | Memory (user-scoped get/put/delete/export) | P1 §8 | explicit delete/export for long-term + session | P10 |
@@ -77,11 +95,11 @@ contracts can be added against a real schema.
 |---|---|
 | Auth | ✔ |
 | Users | P12 |
-| AI | ✔ (analyze) · P3 (compare) |
-| Grok | ✔ generic test/health · P3 alias |
+| AI | ✔ (analyze, compare) |
+| Grok | ✔ generic test/health + snake_case (P3) |
 | Custom AI | generic test/health ✔ · P4 |
 | AI Provider Routing | ✔ `/route` |
-| AI Model Management | P3 |
+| AI Model Management | ✔ (P3) |
 | Market Data | P7 |
 | Indicators | P8 |
 | Trading Signals | P12 |

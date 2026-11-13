@@ -30,9 +30,11 @@ from typing import Literal
 
 from ..observability import get_logger
 from .base import AnalysisContext, HealthResult, ProviderReasoning
+from .lifecycle import is_model_not_found, retire_model
 from .model_registry import configured_model_id
 from .normalize import parse_reasoning_payload
 from .prompt import build_prompt
+from .provider_settings import effective_api_key, effective_base_url, effective_policy
 from .transport import (
     ProviderTransportError,
     TransportPolicy,
@@ -64,18 +66,24 @@ class GemmaProvider:
     def local_base_url(self) -> str:
         # Ollama's default. llama.cpp server, LiteRT-LM `serve` and vLLM
         # all expose the same OpenAI-compatible surface on their own port.
-        return os.environ.get("GEMMA_LOCAL_BASE_URL", "http://localhost:11434/v1").rstrip("/")
+        # An admin's `base_url` override (ai_provider_settings) applies to the local runtime:
+        # the hosted transport has no URL to override (Google's SDK owns it).
+        return effective_base_url("gemma", "GEMMA_LOCAL_BASE_URL", "http://localhost:11434/v1")
+
+    def _api_key(self) -> str:
+        # Admin override (ai_provider_settings) > GOOGLE_AI_API_KEY.
+        return effective_api_key("gemma", "GOOGLE_AI_API_KEY")
 
     def is_configured(self) -> bool:
         if self.transport() == "local_model":
             # A local runtime needs no API key - that is the point of it.
             return bool(self.local_base_url())
-        return bool(os.environ.get("GOOGLE_AI_API_KEY"))
+        return bool(self._api_key())
 
     def missing_configuration(self) -> list[str]:
         if self.transport() == "local_model":
             return [] if self.local_base_url() else ["GEMMA_LOCAL_BASE_URL"]
-        return [] if os.environ.get("GOOGLE_AI_API_KEY") else ["GOOGLE_AI_API_KEY"]
+        return [] if self._api_key() else ["GOOGLE_AI_API_KEY"]
 
     def _model_id(self) -> str:
         return configured_model_id("gemma")
@@ -91,6 +99,7 @@ class GemmaProvider:
                 "temperature": 0.2,
             },
             provider_id="Gemma 4 (local runtime)",
+            policy=effective_policy("gemma"),
         )
         return extract_chat_content(body, "Gemma 4 (local runtime)")
 
@@ -103,7 +112,7 @@ class GemmaProvider:
         provider instead of breaking the whole API's import graph - the
         same fail-safe principle the native layer uses.
         """
-        api_key = os.environ.get("GOOGLE_AI_API_KEY")
+        api_key = self._api_key()
         if not api_key:
             raise RuntimeError("GOOGLE_AI_API_KEY is not set")
         try:
@@ -114,16 +123,27 @@ class GemmaProvider:
             ) from err
 
         client = genai.Client(api_key=api_key)
-        response = await client.aio.models.generate_content(
-            model=model_id, contents=build_prompt(context)
-        )
+        try:
+            response = await client.aio.models.generate_content(
+                model=model_id, contents=build_prompt(context)
+            )
+        except Exception as err:  # noqa: BLE001
+            # G02g applies "identically to Gemma's model list" (Passage 4 §3.2). The SDK raises
+            # its own exception types, so classify on the status code it carries (when it has
+            # one) and the text, which must name this very model.
+            status = getattr(err, "code", None) or getattr(err, "status_code", None)
+            if is_model_not_found(status if isinstance(status, int) else None, str(err), model_id):
+                await retire_model("gemma", model_id, f"Google rejected the model: {str(err)[:200]}", detected_by="runtime")
+            raise
         text = response.text or ""
         if not text.strip():
             raise RuntimeError("Gemma 4 returned an empty response")
         return text
 
-    async def reason(self, context: AnalysisContext) -> ProviderReasoning:
-        model_id = self._model_id()
+    async def reason(
+        self, context: AnalysisContext, model_id: str | None = None
+    ) -> ProviderReasoning:
+        model_id = model_id or self._model_id()
         transport = self.transport()
 
         if transport == "local_model":
@@ -181,7 +201,7 @@ class GemmaProvider:
                 transport="local_model",
             )
 
-        if not os.environ.get("GOOGLE_AI_API_KEY"):
+        if not self._api_key():
             return HealthResult(
                 ok=False,
                 latency_ms=None,
@@ -193,7 +213,7 @@ class GemmaProvider:
         try:
             from google import genai  # type: ignore[import-not-found]
 
-            client = genai.Client(api_key=os.environ["GOOGLE_AI_API_KEY"])
+            client = genai.Client(api_key=self._api_key())
             await client.aio.models.generate_content(model=model_id, contents="ping")
         except Exception as err:  # noqa: BLE001
             return HealthResult(
@@ -211,6 +231,28 @@ class GemmaProvider:
             detail="Credentials verified against the hosted Gemma transport",
             transport="hosted_api",
         )
+
+
+    async def list_available_models(self) -> set[str] | None:
+        """
+        Model ids the hosted transport can serve for this key — the periodic half of G02g for
+        Gemma. None = "could not tell" (local transport, no key, SDK shape differs, network).
+        Not live-verified: it needs a real Google AI key (see docs/implementation/PLAN.md, P3).
+        """
+        if self.transport() != "hosted_api" or not self._api_key():
+            return None
+        try:
+            from google import genai  # type: ignore[import-not-found]
+
+            client = genai.Client(api_key=self._api_key())
+            names: set[str] = set()
+            async for model in await client.aio.models.list():
+                name = getattr(model, "name", None)
+                if isinstance(name, str) and name:
+                    names.add(name.split("/")[-1])
+            return names or None
+        except Exception:  # noqa: BLE001 — inconclusive, never "nothing available"
+            return None
 
 
 gemma_provider = GemmaProvider()

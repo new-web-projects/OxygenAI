@@ -10,6 +10,7 @@ unreachable on a fresh install short of hand-written SQL.
     python -m app.cli create-admin --email you@example.com
     python -m app.cli set-role --email you@example.com --role admin
     python -m app.cli purge-expired
+    python -m app.cli generate-settings-key
 
 The password is read from an interactive prompt (or, for scripted use,
 one line on stdin with --password-stdin). It is never accepted as a
@@ -123,8 +124,20 @@ def main(argv: list[str] | None = None) -> int:
     role.add_argument("--role", required=True, choices=["admin", "user"])
 
     sub.add_parser("purge-expired", help="Delete expired sessions and expired short-lived memories")
+    sub.add_parser(
+        "generate-settings-key",
+        help="Print a new SETTINGS_ENCRYPTION_KEY (needs no database; the key is not stored anywhere)",
+    )
 
     args = parser.parse_args(argv)
+
+    if args.command == "generate-settings-key":
+        # Before the DATABASE_URL check: generating a key needs nothing but the library, and the
+        # key must be created *before* the API can store an encrypted provider API key.
+        from .security.secret_store import generate_key
+
+        print(generate_key())
+        return 0
 
     from .db.client import is_db_configured
 

@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 # JSON has no NaN or Infinity. A float field typed this way rejects them at
 # the model boundary with a precise validation error instead of surfacing
@@ -176,6 +176,10 @@ class TradeAnalysis(BaseModel):
     # Passage 4 §3.6: the active-model badge distinguishes hosted from
     # local-runtime responses per column.
     transport: Optional[Literal["hosted_api", "local_model", "mock", "cache", "fallback"]] = None
+    # Set (single-provider mode) when a different provider answered than the one the caller
+    # requested — e.g. "grok" requested, "mock" answered because Grok is not configured or failed.
+    # `provider`/`source` already said so, but only for a client that knew to compare them.
+    requestedProvider: Optional[str] = None
     validationWarnings: list[str] = Field(default_factory=list)
 
 
@@ -210,7 +214,7 @@ class ComparisonSlotUnavailable(BaseModel):
     # Distinguishes "no key configured" from "circuit open" from "the
     # call failed" — the UI shows different affordances for each.
     reasonCode: Literal[
-        "not_configured", "circuit_open", "call_failed", "unknown_provider"
+        "not_configured", "circuit_open", "call_failed", "unknown_provider", "disabled", "no_model"
     ] = "call_failed"
     retryAfterSeconds: Optional[float] = None
 
@@ -326,8 +330,19 @@ class HealthResponse(BaseModel):
     ok: bool
     latencyMs: Optional[float] = None
     modelChecked: Optional[str] = None
+    # Passage 4 §6.2 writes the contract as `{ ok, latency_ms, model_checked }`. The camelCase
+    # pair is what this API's other responses use; the snake_case pair is the specified shape.
+    # Both are always present and always equal.
+    latency_ms: Optional[float] = None
+    model_checked: Optional[str] = None
     detail: str
     transport: str = "none"
+
+    @model_validator(mode="after")
+    def _mirror_snake_case(self) -> "HealthResponse":
+        self.latency_ms = self.latencyMs
+        self.model_checked = self.modelChecked
+        return self
 
 
 class ModelCreateRequest(BaseModel):
@@ -338,6 +353,8 @@ class ModelCreateRequest(BaseModel):
         "active", "disabled", "deprecated", "retired", "local", "hosted", "fallback"
     ] = "active"
     contextWindow: Optional[int] = Field(default=None, ge=0)
+    inputModalities: Optional[list[str]] = Field(default=None, max_length=10)
+    outputModalities: Optional[list[str]] = Field(default=None, max_length=10)
     isDefault: bool = False
     isFallback: bool = False
     onlineCapable: bool = True
@@ -351,11 +368,90 @@ class ModelUpdateRequest(BaseModel):
         Literal["active", "disabled", "deprecated", "retired", "local", "hosted", "fallback"]
     ] = None
     contextWindow: Optional[int] = Field(default=None, ge=0)
+    inputModalities: Optional[list[str]] = Field(default=None, max_length=10)
+    outputModalities: Optional[list[str]] = Field(default=None, max_length=10)
     isDefault: Optional[bool] = None
     isFallback: Optional[bool] = None
     onlineCapable: Optional[bool] = None
     offlineCapable: Optional[bool] = None
     config: Optional[dict[str, Any]] = None
+
+
+class ModelResponse(BaseModel):
+    id: str
+    providerId: str
+    modelId: str
+    displayName: str
+    status: Literal["active", "disabled", "deprecated", "retired", "local", "hosted", "fallback"]
+    contextWindow: Optional[int] = None
+    inputModalities: list[str]
+    outputModalities: list[str]
+    isDefault: bool
+    isFallback: bool
+    onlineCapable: bool
+    offlineCapable: bool
+    config: dict[str, Any]
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+
+
+class ProviderPatchRequest(BaseModel):
+    """PATCH /api/ai/providers/{id} — administrative flags on `ai_providers`."""
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: Optional[bool] = None
+    priority: Optional[int] = Field(default=None, ge=0, le=1000)
+
+
+class ProviderSettingsPatchRequest(BaseModel):
+    """
+    PATCH /api/ai/providers/{id}/settings. A field that is ABSENT is left alone; an explicit JSON
+    `null` clears the override (the environment / default applies again). `apiKey` is write-only.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    apiKey: Optional[str] = Field(default=None, min_length=8, max_length=4096)
+    baseUrl: Optional[str] = Field(default=None, max_length=500)
+    timeoutMs: Optional[int] = Field(default=None, ge=100, le=300_000)
+    retryCount: Optional[int] = Field(default=None, ge=0, le=10)
+    region: Optional[str] = Field(default=None, max_length=64)
+
+
+class BreakerLimits(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    failureThreshold: Optional[int] = Field(default=None, ge=1, le=100)
+    windowSeconds: Optional[float] = Field(default=None, ge=1, le=3600)
+    cooldownSeconds: Optional[float] = Field(default=None, ge=1, le=3600)
+
+
+class BreakerSettingsRequest(BreakerLimits):
+    """
+    PUT /api/ai/circuit-breaker/settings — replaces the stored thresholds. Anything omitted falls
+    back to the environment default (CB_*), so `{}` means "defaults". `providers` overrides single
+    providers (Passage 4 §3.3: "admin-configurable ... applies identically across all three
+    providers"; per-provider values are an addition for an unreliable vendor).
+    """
+
+    providers: Optional[dict[str, BreakerLimits]] = None
+
+
+class CompareRequest(BaseModel):
+    """
+    POST /api/ai/compare — Passage 1 §10: "Updated to accept 2 or 3 provider_id values". Same
+    engine, providers and persistence as `POST /api/ai/analyze` with `mode: "multi"`.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+    symbol: str = Field(min_length=1, max_length=20)
+    providers: list[str] = Field(
+        min_length=2,
+        max_length=3,
+        validation_alias=AliasChoices("providers", "provider_ids", "providerIds"),
+    )
+    timeframe: Literal["1d"] = "1d"
+    accountEquity: Optional[float] = Field(default=None, gt=0)
+    maxRiskPerTradePct: Optional[float] = Field(default=None, gt=0, le=100)
+    useKnowledge: bool = True
 
 
 # ---------------------------------------------------------------------------

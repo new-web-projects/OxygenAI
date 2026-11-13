@@ -182,13 +182,33 @@ class CircuitBreakerRegistry:
 
     def __init__(self, settings: CircuitBreakerSettings | None = None) -> None:
         self._settings = settings or get_settings().circuit_breaker
+        # Per-provider overrides (admin-configured, `system_settings['circuit_breaker']`).
+        self._per_provider: dict[str, CircuitBreakerSettings] = {}
         self._breakers: dict[str, _ProviderBreaker] = {}
         self._lock = asyncio.Lock()
+
+    def settings_for(self, provider_id: str) -> CircuitBreakerSettings:
+        return self._per_provider.get(provider_id, self._settings)
+
+    def apply_settings(
+        self,
+        default: CircuitBreakerSettings,
+        per_provider: dict[str, CircuitBreakerSettings] | None = None,
+    ) -> None:
+        """
+        Passage 4 §3.3 (G03): "5 failures / 60 seconds, admin-configurable". Applies new
+        thresholds live: existing breakers keep their state (open stays open, recorded failures
+        stay recorded) and are judged against the new numbers from now on.
+        """
+        self._settings = default
+        self._per_provider = dict(per_provider or {})
+        for provider_id, breaker in self._breakers.items():
+            breaker.settings = self.settings_for(provider_id)
 
     def _get(self, provider_id: str) -> _ProviderBreaker:
         breaker = self._breakers.get(provider_id)
         if breaker is None:
-            breaker = _ProviderBreaker(provider_id=provider_id, settings=self._settings)
+            breaker = _ProviderBreaker(provider_id=provider_id, settings=self.settings_for(provider_id))
             self._breakers[provider_id] = breaker
         return breaker
 
@@ -204,6 +224,19 @@ class CircuitBreakerRegistry:
                 )
             if breaker.state == "half_open":
                 breaker.half_open_in_flight = True
+
+    async def release_trial(self, provider_id: str) -> None:
+        """
+        Give back a half-open trial slot WITHOUT recording a success or a failure. For a call that
+        ended for a reason that says nothing about the provider's health — chiefly the request being
+        cancelled (client disconnect, timeout upstream of us). Without this the slot stays taken and
+        the provider is locked out until the process restarts: `is_open` keeps answering "a trial is
+        in flight". A no-op unless the breaker is half-open.
+        """
+        async with self._lock:
+            breaker = self._breakers.get(provider_id)
+            if breaker is not None and breaker.state == "half_open":
+                breaker.half_open_in_flight = False
 
     async def record_success(self, provider_id: str) -> None:
         async with self._lock:

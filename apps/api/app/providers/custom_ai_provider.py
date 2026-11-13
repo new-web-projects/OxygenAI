@@ -35,8 +35,10 @@ import time
 
 from ..observability import get_logger
 from .base import AnalysisContext, HealthResult, ProviderReasoning
+from .model_registry import get_model_registry
 from .normalize import parse_reasoning_payload
 from .prompt import build_prompt
+from .provider_settings import effective_api_key, effective_base_url, effective_policy
 from .transport import TransportPolicy, extract_chat_content, post_json
 
 logger = get_logger("providers.custom")
@@ -53,13 +55,20 @@ class CustomAIProvider:
     # ---- configuration -------------------------------------------------
 
     def base_url(self) -> str:
-        return os.environ.get("CUSTOM_AI_BASE_URL", "").strip().rstrip("/")
+        # Admin override (ai_provider_settings) > CUSTOM_AI_BASE_URL.
+        return effective_base_url("custom", "CUSTOM_AI_BASE_URL", "")
 
     def model_id(self) -> str:
-        return os.environ.get("CUSTOM_AI_MODEL_ID", "").strip()
+        """The owner's model: CUSTOM_AI_MODEL_ID, else the registry's default for Custom AI
+        (an admin-created `ai_models` row) — never the catalogue's display placeholder."""
+        configured = os.environ.get("CUSTOM_AI_MODEL_ID", "").strip()
+        if configured:
+            return configured
+        from_registry = get_model_registry().default_model_id("custom")
+        return "" if from_registry in (None, "custom-configured") else str(from_registry)
 
     def api_key(self) -> str:
-        return os.environ.get("CUSTOM_AI_API_KEY", "").strip()
+        return effective_api_key("custom", "CUSTOM_AI_API_KEY")
 
     def is_local(self) -> bool:
         """
@@ -107,7 +116,9 @@ class CustomAIProvider:
 
     # ---- inference -----------------------------------------------------
 
-    async def complete(self, prompt: str, *, temperature: float = 0.2) -> str:
+    async def complete(
+        self, prompt: str, *, temperature: float = 0.2, model_id: str | None = None
+    ) -> str:
         """
         Raw completion. Public because the agent orchestrator
         (app/agent/orchestrator.py) drives multi-turn tool-calling
@@ -122,16 +133,19 @@ class CustomAIProvider:
             f"{self.base_url()}/chat/completions",
             headers=self._headers(),
             payload={
-                "model": self.model_id(),
+                "model": model_id or self.model_id(),
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": temperature,
             },
             provider_id="Custom AI",
+            policy=effective_policy("custom"),
         )
         return extract_chat_content(body, "Custom AI")
 
-    async def reason(self, context: AnalysisContext) -> ProviderReasoning:
-        content = await self.complete(build_prompt(context))
+    async def reason(
+        self, context: AnalysisContext, model_id: str | None = None
+    ) -> ProviderReasoning:
+        content = await self.complete(build_prompt(context), model_id=model_id)
         parsed = parse_reasoning_payload(content)
         return ProviderReasoning(
             direction=parsed["direction"],

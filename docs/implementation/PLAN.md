@@ -39,7 +39,7 @@ frontend build):
 | Custom-indicator evaluator | **Not built** (table only) | → **P8** |
 | Local/offline runtimes | Gemma local *transport* only | Runtime catalog, admin config, availability, Custom AI keyless local → **P4** |
 | Admin Panel UI | **Not built** | → **P5 + P13** |
-| Models CRUD / named endpoints | **Not built** | → **P3, P12** |
+| Models CRUD / named endpoints | **Built (P3)**: models CRUD, `/compare`, provider settings, breaker admin | remaining named categories → **P12** |
 
 ### Passage 1 section status
 
@@ -51,10 +51,10 @@ frontend build):
 | §3 | Market Data Abstraction | Missing | P7 |
 | §4.1 | Custom AI as orchestrating agent | Provider only; `agent/orchestrator.py` referenced in docstrings but absent | P6 |
 | §4.1 / G01b | Admin-authored custom indicators (constrained expression tree) | Missing | P8 |
-| §4.2 / G02 | Grok slugs, redirects, Responses/Agent-Tools API, registry automation | Slug handling built; DB flip + alert partial; Responses API absent | P3, P6 |
+| §4.2 / G02 | Grok slugs, redirects, Responses/Agent-Tools API, registry automation | Slug handling built; **DB flip + persisted alert ✔ (P3)** — runtime catch + periodic poll (poll mock-tested only); Responses API absent | P6 |
 | §4.3 | Gemma 4 identity vs transport | Built | — |
 | §4.4 / §4.4.1 | Offline runtimes, admin fields, controlled fallback, `local_model` tag | Transport only | P4 |
-| §4.5 / G03 / G11 | Router, breaker (5/60s, **admin-configurable**), fallback, `ai_health_checks` persisted | Built; configurability + persistence missing | P2, P3 |
+| §4.5 / G03 / G11 | Router, breaker (5/60s, **admin-configurable**), fallback, `ai_health_checks` persisted | Built; **configurability ✔ (P3, `system_settings`, per-provider, live)**; persistence ✔ (P2); health stage + fallback model ✔ (P3) | — |
 | §4.6 / G04 / G09 / G10 | Comparison, scoring axes, placeholders, footer actions, model badge | Built; "Save → History" missing; "Why they disagree" is Post-MVP (P3 §27) | P12/P13 |
 | §4.7 | Reasoning pipeline | Built | — |
 | §4.8 / G05 | Tool registry governed, provider-agnostic | Registry built; not wired to providers | P6 |
@@ -63,23 +63,23 @@ frontend build):
 | §7 | RAG pipeline + source tags | Built; hardening | P9 |
 | §8 | Six memory layers + delete/export | 1 of 6 | P10 |
 | §9 / G12 | Schema, relationships, indexing, retention | Schema complete (0001–0005); operational usage partial | P2, P10, P12 |
-| §10 / G08 / G13 | Named endpoints, 19 categories, contract shape | 18 routes of the required set | P3, P12 (see ENDPOINT_CHECKLIST.md) |
+| §10 / G08 / G13 | Named endpoints, 19 categories, contract shape | 33 routes (18 + 15 in P3) of the required set | P12 (see ENDPOINT_CHECKLIST.md) |
 
 ### Passage 4 G01–G16
 
 | ID | Status in baseline | Action | Phase |
 |---|---|---|---|
 | G01 | a: table is documentation; b: mechanism missing | Docs for (a); implement evaluator for (b) | P14 / P8 |
-| G02 | Mostly built | Responses API path; DB-backed registry flip + alert | P6 / P3 |
-| G03 | Built (5/60s) | Make admin-configurable | P3 |
+| G02 | Built except the Responses API path | Responses API path | P6 |
+| G03 | **Done (P3)**: 5/60 s default, admin-configurable globally and per provider, applied live | — | — |
 | G04, G10, G11 | Built | Re-verify in final audit | P15 |
 | G05 | Registry built, governance partial | Roles/modes, orchestration | P6 |
 | G06 | Built | Re-verify | P15 |
 | G07 | Rationale only needs documenting | Docs | P14 |
-| G08 | `/route` built; models CRUD, compare missing | Implement | P3 |
+| G08 | **Done (P3)**: `/route`, models CRUD (admin, audited), `/compare`, snake_case probe fields | — | — |
 | G09 | Built except "Save → History" | History list + save | P12/P13 |
 | G12 | Schema ✔; see table below | Per-table ownership | P2/P10/P12 |
-| G13 | 18 of the required endpoints | Full reconciliation | P3, P12 |
+| G13 | 33 of the required endpoints | Full reconciliation | P12 |
 | G14, G15, G16 | Missing documentation | Docs only, no runtime change | P14 |
 
 ### G12 — table ownership (not "make every count non-zero")
@@ -87,9 +87,9 @@ frontend build):
 | Table | Owner subsystem | Operational today? | Plan |
 |---|---|---|---|
 | users, roles, permissions, sessions | Auth | Yes | P1; expired-session purge **P2 ✔** |
-| ai_providers, ai_models | Router/registry | Yes (seeded on use) | P3 makes DB the registry's system of record |
-| ai_provider_settings | Provider admin | No | P3/P4 |
-| ai_routing_rules, ai_fallback_rules | Router | No | P3 decides: use for admin-configurable fallback, else document as dormant |
+| ai_providers, ai_models | Router/registry | **Yes (P3 ✔)** — the database is the registry's system of record: loaded at startup + every `RUNTIME_CONFIG_REFRESH_SECONDS` + on every admin write; catalogue seeded once (`system_settings.model_catalogue_seeded`) | P12/P13 read-side dashboards |
+| ai_provider_settings | Provider admin | **Yes (P3 ✔)** — API key (encrypted), base URL, timeout, retries, region; admin override > environment | P4 adds the local-runtime fields (the table has no jsonb column: P4 decides between one in 0008 or `ai_models.config`) |
+| ai_routing_rules, ai_fallback_rules | Router | **No — decided dormant in P3** (see P3 "Decisions") | revisit only if Passage 2's admin routing spec defines their semantics |
 | ai_health_checks | Router monitoring | **Yes — written by provider probes (P2 ✔)** | P12/P13 read it |
 | ai_comparisons, ai_comparison_results | Comparison | Yes | — |
 | market_instruments, market_data, technical_indicators | Market data / engine | Yes. `technical_indicators`: unique key + upsert **P2 ✔** (migration 0006) | `market_data` unique key lands with the P7 adapters — on today's synthetic bars (timestamps anchored to *now*) a unique key could not prevent duplicates; real vendor bars have stable timestamps |
@@ -101,7 +101,7 @@ frontend build):
 | tool_registry, tool_calls | Tools | Yes | P6 |
 | custom_indicator_definitions | Custom indicators | No | P8 |
 | error_logs, audit_logs, usage_logs | Ops | **Yes (P2 ✔)**: usage in single + multi mode; `error_logs` from the 500 handler; `audit_logs` from knowledge upload/delete, tool invoke, CLI role changes | P3 adds models-CRUD/provider-settings audit; P12 adds the read endpoints |
-| system_settings | System memory | No — *not* in P2's work list (the earlier "P2/P12" here was an over-assignment) | P3 (breaker/registry settings) / P12 |
+| system_settings | System memory | **Yes (P3 ✔)** — `circuit_breaker`, `model_catalogue_seeded`; history = the audit trail | P12 generic settings endpoints |
 | feature_flags | Ops | No | Dormant until an owning feature exists |
 | strategies, strategy_versions, backtests, trade_setups, trade_results | Backtesting / paper trading (P2 §18) | No | **Intentionally dormant** — owner subsystem not in this scope |
 | voice_settings | Voice (P2) | No | **Intentionally dormant** |
@@ -156,13 +156,25 @@ the Admin Panel is split: provider/model administration (P5) lands as soon as it
   - *New files:* `db/{audit,errors,health,retention}.py`, `infra/migrations/0006_persistence_hygiene.sql`, `tests/test_p2_{foundations,persistence}.py`. *Modified:* `db/{client,signals,comparisons,indicators_db}.py`, `providers/{base,registry}.py`, `comparison.py`, `engine/risk_engine.py`, `errors.py`, `main.py`, `cli.py`, `config.py`, `routers/{analyze,providers,knowledge,tools}.py`, three test files whose cleanup now has to clear the (RESTRICT) audit trail, one test that pinned the overwrite-on-conflict display-name defect, READMEs/env example/checklist.
   - *Every fix was mutation-checked:* reverting it individually makes a named test fail (10/10).
 
-### P3 — Provider settings, model registry persistence, Models CRUD, named endpoints
+### P3 — Provider settings, model registry persistence, Models CRUD, named endpoints — **DONE**
 - **Objective:** DB becomes the registry's system of record; admins manage models/providers through the API.
 - **P1 §:** 4.2, 4.5, 9.1, 10. **P4:** G02g, G03 (admin-configurable breaker), G08a/b, G12.
 - **Depends on:** P2 (audit writer).
 - **Work:** registry loads/syncs `ai_models` + seven-value status enum; `GET/POST/PATCH/DELETE /api/ai/models` (admin, audited); `ai_provider_settings` read/write incl. encrypted API keys (env stays authoritative unless admin override set; master key via env, never invented); breaker thresholds from settings; retired-slug auto-flip + alert persisted; `POST /api/ai/compare` (2–3 providers); snake_case `latency_ms`/`model_checked` aliases on test/health; decide `ai_routing_rules`/`ai_fallback_rules`; router health-check stage + per-provider fallback model (P1 §4.5 pseudocode, defect 23); explicit "requested X, answered by mock" signal in single mode (defect 21); `CancelledError`-safe half-open trial (defect 22).
-- **DB:** only if CHECK/enum or new column needed (decided after inspecting 0001). **Frontend:** none (P5).
+- **DB:** only if CHECK/enum or new column needed (decided after inspecting 0001) — **result: migration `0007`, no new table/column** (the 7-value status CHECK already existed in 0001). **Frontend:** none (P5).
 - **Tests:** CRUD authz matrix, audit rows, encryption round-trip, registry reload, compare endpoint parity with analyze multi.
+- **Delivered:** migration `0007_provider_registry.sql`; `security/secret_store.py`; `db/{models,provider_settings,system_settings}.py`; `providers/{provider_settings,model_health,lifecycle,runtime_config,availability}.py`; `routers/models.py`; registry/breaker/provider changes; `POST /api/ai/compare`; **15 new routes**; `cryptography==44.0.0`; CLI `generate-settings-key`; three new background jobs. 156 new tests (78 unit · 32 DB-layer · 46 HTTP); every fix mutation-checked (18/18).
+- **Decisions (and why):**
+  - *Model selection precedence:* an environment variable (`GROK_MODEL_ID`…) **still wins when set**; otherwise the registry's default. It is the same rule as for settings ("environment first, admin override on top"), keeps every `.env`-only deployment unchanged, and is shown to admins as `modelSelectionSource` on `GET /api/ai/providers` so a no-op default change is explained, not mysterious.
+  - *Statuses:* `active|hosted|local` may be a provider's default; `fallback` only the fallback; `deprecated` is resolvable but never auto-selected; `disabled|retired` are never called. A `fallback` model that is made (or promoted to) the default becomes `active`, because the database forbids a default with status `fallback`.
+  - *Retiring/deleting a default promotes the fallback* (and leaves the fallback slot empty) rather than leaving the provider with no model; a provider with no fallback is left without a default and reports `no_model`.
+  - *Deleting a model with history is refused (409):* every FK to `ai_models` is `ON DELETE SET NULL`, so a delete would silently strip attribution from the evaluation dataset. Retire it instead. A test asserts the list of referencing tables against `pg_constraint`, so a future migration cannot add an FK unnoticed.
+  - *Router health stage is remembered, not probed:* a per-request "ping" would double the calls and token cost of every hosted provider. A model is unhealthy after 2 consecutive failures or a failed admin probe (120 s TTL). **Deviation from P1 §4.5's pseudocode:** with no healthy fallback model the default is *still attempted* (the pseudocode returns "unavailable"); a remembered flag with no recovery probe would lock the model out, and the circuit breaker already provides the cooldown-and-trial mechanism. The substitution is reported in `validationWarnings`.
+  - *Disabled provider / no usable model are states, like "not configured":* never counted by the breaker; `reasonCode` `disabled` / `no_model`.
+  - *G02g, both halves:* the catch-a-4xx path is always on, with a deliberately conservative classifier (a 404 from a mistyped base URL, a 400 about another parameter, or a network error containing the word "model" must not retire anything — the old heuristic retired a model on *any* 400/404 mentioning "model"). The periodic poll retires only models the router *uses*, ignores an unreadable/empty list, and ignores a list that shares no model with the registry. Default 6 h, `MODEL_AVAILABILITY_INTERVAL_SECONDS=0` disables, and `POST /api/ai/models/availability-check` runs it now.
+  - *`ai_routing_rules` / `ai_fallback_rules` stay dormant:* the router's mode→providers mapping is explicit in each request (P1 §4.5), neither Passage 1 nor 4 defines rule semantics, evaluation order or a UI for them, and cross-provider fallback would undermine a comparison column's identity. Their natural consumer is the Admin Panel's routing screen (Passage 2, not part of the supplied sources).
+  - *`region` is stored but consumed by nothing* — it is reserved for the Vertex AI initialisation P1 §4.3.1 mentions; not wired to anything just to make the column look used. A Gemma `baseUrl` override applies to the **local runtime** URL (the hosted transport has none); Grok's must be `https` (the key is sent there).
+- **Not live-verified (external dependency):** both vendors' model-list endpoints (`GET {xAI}/models`, the Google SDK `models.list`) and a real xAI/Google key were unavailable; the poll's decisions are tested against fake lists, the two list readers against an httpx mock transport / their no-credential paths. Code complete, integration path complete, live verification blocked.
 
 ### P4 — Local/offline runtimes (Custom AI + Gemma 4)
 - **Objective:** real local operation, not just a transport.
@@ -246,11 +258,14 @@ the Admin Panel is split: provider/model administration (P5) lands as soon as it
 | — | `close_pool()` never called; `get_pool` race | **P2 ✔** |
 | 19 | Persisted bars are never refreshed: once 60 exist, `get_or_refresh_bars` returns them forever, so every symbol is permanently "stale" after 2 days; `compute_freshness`'s docstring assumes a refresh path that does not exist. *Found while validating P1/P4 against the code; not in the earlier plan.* | P7 |
 | 20 | `lib/types.ts` omits what the API returns (regime, structure, risk, contradictingEvidence, validationWarnings, knowledgeSources, transport, `latencyMs`, `reasonCode`) and its `source` union lacks `"fallback"`/`"cache"`; the UI renders none of it | P5 |
-| 21 | Single-provider mode silently substitutes mock for an unconfigured provider (only the `provider` field reveals it) | P3 |
-| 22 | `execute_provider`: a cancelled request (`CancelledError`, e.g. client disconnect) during a half-open trial leaves `half_open_in_flight` set, locking the provider out | P3 |
-| 23 | P1 §4.5 router pseudocode steps not implemented: health-check stage and a per-provider **fallback model** (`registry.get_fallback`) before declaring unavailable | P3 |
+| 21 | Single-provider mode silently substitutes mock for an unconfigured provider (only the `provider` field reveals it) | **P3 ✔** (`requestedProvider` + a warning naming the reason) |
+| 22 | `execute_provider`: a cancelled request (`CancelledError`, e.g. client disconnect) during a half-open trial leaves `half_open_in_flight` set, locking the provider out | **P3 ✔** (`release_trial`) |
+| 23 | P1 §4.5 router pseudocode steps not implemented: health-check stage and a per-provider **fallback model** (`registry.get_fallback`) before declaring unavailable | **P3 ✔** (see P3 "Decisions" for the one deliberate deviation) |
 | 24 | `native/README.md` documents `-DOXYGEN_ENABLE_CUDA`; the CMake option is `OXYGEN_ENABLE_CUDA` (the documented flag silently does nothing) | P14 |
 | 25 | Root `README.md` and `infra/migrations/README.md` are stale (RAG/breaker "Not built", "3 migrations"/"One migration") | P14 |
+| 26 | `GrokProvider._maybe_mark_retired` flipped a model to `retired` on *any* 400/404 whose text contained "model" — e.g. a mistyped base URL would have retired a working model once the flip was persisted | **P3 ✔** (conservative classifier) |
+| 27 | `ai_health_checks` and `error_logs` have no retention (P2's purge covers sessions/memories only); every admin probe appends a row | P12 (with the monitoring reads) |
+| 28 | `GemmaProvider.list_available_models` (Google SDK `models.list`) and the SDK's exception shape are unverified against a real key | P4/P6 live check |
 
 ## 5. Progress
 
@@ -259,4 +274,5 @@ the Admin Panel is split: provider/model administration (P5) lands as soon as it
 | P1 | **DONE** — delivered with this document |
 | H1 — knowledge-search NaN hotfix | **DONE** — requires P1; see `apps/api/app/rag/{tokenize,maintenance}.py` |
 | P2 — persistence hygiene & operational foundations | **DONE** — requires P1 + H1; migration `0006` |
-| P3 – P15 | Pending (resume at **P3**) |
+| P3 — provider settings, model registry persistence, Models CRUD, named endpoints | **DONE** — requires P2; migration `0007`, `cryptography` dependency |
+| P4 – P15 | Pending (resume at **P4**) |

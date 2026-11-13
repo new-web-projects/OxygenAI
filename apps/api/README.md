@@ -82,7 +82,9 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"   # -> JWT_SECRET=
 # DATABASE_URL=postgresql://...   (sessions live in Postgres)
 
 # 2. Apply every migration in order (0005 adds the session indexes; 0006 de-duplicates and
-#    constrains technical_indicators and repairs ai_models display names — idempotent)
+#    constrains technical_indicators and repairs ai_models display names; 0007 makes the model
+#    registry database-backed — one default/fallback per provider, one settings row per provider.
+#    All idempotent.)
 for f in ../../infra/migrations/000*.sql; do psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"; done
 
 # 3. Create the first admin — registration only ever yields the `user` role
@@ -109,6 +111,36 @@ Operational behaviour added in P2 (Passage 1 §9, Passage 4 §5.2–§5.3):
 - **Circuit breaker.** A provider that is simply *not configured* is no longer
   counted as a failure, so it reports `not_configured` instead of drifting to
   `circuit_open`.
+
+Administration added in P3 (all admin-only, all audited — see `docs/implementation/ENDPOINT_CHECKLIST.md` §A2):
+
+- **Model registry is the database's.** `ai_models` is the system of record: loaded at startup
+  (the built-in catalogue is offered to an empty/older database once), re-read every
+  `RUNTIME_CONFIG_REFRESH_SECONDS` (default 30; a change made on this instance applies at once) and on
+  every admin write. `GET/POST/PATCH/DELETE /api/ai/models` manage it. A model with history cannot be
+  deleted (retire it); retiring or deleting a provider's default promotes its fallback.
+  **Model selection precedence:** an environment variable (`GROK_MODEL_ID`, `GEMMA_MODEL_ID`,
+  `CUSTOM_AI_MODEL_ID`) wins whenever it is set, otherwise the registry's default —
+  `GET /api/ai/providers` reports which (`modelSelectionSource`).
+- **Provider settings.** `PATCH /api/ai/providers/{id}/settings` stores an API-key override (encrypted at
+  rest with `SETTINGS_ENCRYPTION_KEY`), base URL, timeout, retries, region. Effective value = admin
+  override > environment variable > default. The key is write-only: no response, log or audit row ever
+  contains it. Without `SETTINGS_ENCRYPTION_KEY` the API refuses (503) rather than store plaintext, and the
+  providers keep using their environment variables. Generate a key once with
+  `python -m app.cli generate-settings-key` (it is not stored anywhere; comma-separate keys to rotate).
+- **Provider enable/disable.** `PATCH /api/ai/providers/{id}` — a disabled provider reports
+  `disabled` (never counted by the breaker) and single-provider requests are answered by mock *with the
+  substitution stated* (`requestedProvider` + a warning).
+- **Circuit-breaker thresholds** (`PUT/DELETE /api/ai/circuit-breaker/settings`, global and per provider,
+  applied live) and a manual reset (`POST /api/ai/circuit-breaker/{id}/reset`).
+- **Router health stage.** After two consecutive failures of a provider's default model (or a failed admin
+  probe) its fallback model answers for 2 minutes; the answer says so in `validationWarnings`.
+- **Retired-model automation (G02g).** A vendor "model not found" retires the model in memory *and* in
+  `ai_models` and raises an `error_logs` alert; a periodic poll of the vendors' model lists
+  (`MODEL_AVAILABILITY_INTERVAL_SECONDS`, default 6 h, `0` disables; `POST /api/ai/models/availability-check`
+  runs it now) retires models the router uses that are no longer offered. The poll is mock-tested only.
+- **`POST /api/ai/compare`** — Passage 1's named endpoint, the same code path as `POST /api/ai/analyze`
+  with `mode: "multi"`.
 
 Roles: `admin` can upload/delete knowledge documents, call provider
 `/test` and `/health`, and use the tool endpoints; any signed-in user can
